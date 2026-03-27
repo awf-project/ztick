@@ -1,0 +1,14 @@
+name: example
+version: "1.0.0"
+description: Example workflow created by awf init
+
+states:
+  initial: greet
+
+  greet:
+    type: step
+    command: echo "Hello from AWF!"
+    on_success: done
+
+  done:
+    type: terminal

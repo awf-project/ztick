@@ -1,0 +1,104 @@
+const std = @import("std");
+const domain = @import("../domain.zig");
+const JobStorage = @import("job_storage.zig").JobStorage;
+const RuleStorage = @import("rule_storage.zig").RuleStorage;
+
+const Instruction = domain.instruction.Instruction;
+const Job = domain.job.Job;
+const Rule = domain.rule.Rule;
+const Request = domain.query.Request;
+const Response = domain.query.Response;
+
+pub const QueryHandler = struct {
+    job_storage: *JobStorage,
+    rule_storage: *RuleStorage,
+
+    pub fn init(job_storage: *JobStorage, rule_storage: *RuleStorage) QueryHandler {
+        return .{
+            .job_storage = job_storage,
+            .rule_storage = rule_storage,
+        };
+    }
+
+    pub fn handle(self: *QueryHandler, request: Request) !Response {
+        const success = switch (request.instruction) {
+            .set => |args| blk: {
+                const job = Job{
+                    .identifier = args.identifier,
+                    .execution = args.execution,
+                    .status = .planned,
+                };
+                self.job_storage.set(job) catch break :blk false;
+                break :blk true;
+            },
+            .rule_set => |args| blk: {
+                const rule = Rule{
+                    .identifier = args.identifier,
+                    .pattern = args.pattern,
+                    .runner = args.runner,
+                };
+                self.rule_storage.set(rule) catch break :blk false;
+                break :blk true;
+            },
+        };
+
+        return Response{ .request = request, .success = success };
+    }
+};
+
+test "handle set instruction stores job and returns success" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(&job_storage, &rule_storage);
+
+    const request = Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
+    };
+
+    const response = try handler.handle(request);
+    try std.testing.expect(response.success);
+    try std.testing.expectEqual(request.client, response.request.client);
+
+    const job = job_storage.get("job.1");
+    try std.testing.expect(job != null);
+    try std.testing.expectEqual(@as(i64, 1595586600_000000000), job.?.execution);
+}
+
+test "handle rule_set instruction stores rule and returns success" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(&job_storage, &rule_storage);
+
+    const request = Request{
+        .client = 2,
+        .identifier = "req-2",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.1",
+            .pattern = "job.",
+            .runner = .{ .shell = .{ .command = "echo" } },
+        } },
+    };
+
+    const response = try handler.handle(request);
+    try std.testing.expect(response.success);
+
+    const rule = rule_storage.get("rule.1");
+    try std.testing.expect(rule != null);
+    try std.testing.expectEqualStrings("job.", rule.?.pattern);
+}
