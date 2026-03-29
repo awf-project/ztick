@@ -12,6 +12,7 @@ pub const Request = struct {
 pub const Response = struct {
     request: Request,
     success: bool,
+    body: ?[]const u8 = null,
 };
 
 test "query request stores client identifier and instruction" {
@@ -34,4 +35,25 @@ test "query response links request and reports success" {
     const resp = Response{ .request = req, .success = true };
     try std.testing.expect(resp.success);
     try std.testing.expectEqual(@as(Client, 1), resp.request.client);
+}
+
+test "query response body defaults to null" {
+    const req = Request{
+        .client = 2,
+        .identifier = "req-2",
+        .instruction = .{ .set = .{ .identifier = "job.2", .execution = 0 } },
+    };
+    const resp = Response{ .request = req, .success = true };
+    try std.testing.expectEqual(@as(?[]const u8, null), resp.body);
+}
+
+test "query response body carries job data for get responses" {
+    const req = Request{
+        .client = 3,
+        .identifier = "req-3",
+        .instruction = .{ .get = .{ .identifier = "job.3" } },
+    };
+    const resp = Response{ .request = req, .success = true, .body = "planned 1595586600000000000" };
+    try std.testing.expect(resp.success);
+    try std.testing.expectEqualStrings("planned 1595586600000000000", resp.body.?);
 }

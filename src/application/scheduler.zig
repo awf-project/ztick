@@ -84,7 +84,7 @@ pub const Scheduler = struct {
     }
 
     pub fn handle_query(self: *Scheduler, request: Request) !Response {
-        var handler = QueryHandler.init(&self.job_storage, &self.rule_storage);
+        var handler = QueryHandler.init(self.allocator, &self.job_storage, &self.rule_storage);
         const response = try handler.handle(request);
 
         if (response.success) {
@@ -110,6 +110,7 @@ pub const Scheduler = struct {
                 .pattern = args.pattern,
                 .runner = args.runner,
             } },
+            .get => return,
         };
 
         const encoded = try persistence.encoder.encode(self.allocator, entry);
@@ -295,6 +296,102 @@ test "load and handle_query round-trip through logfile" {
         try std.testing.expectEqualStrings("job.", rule.?.pattern);
         try std.testing.expectEqualStrings("echo hello", rule.?.runner.shell.command);
     }
+}
+
+test "handle_query with get instruction returns success with body for existing job" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1595586600_000000000, .status = .planned });
+
+    const request = Request{
+        .client = 1,
+        .identifier = "req-get-1",
+        .instruction = .{ .get = .{ .identifier = "job.1" } },
+    };
+
+    const response = try scheduler.handle_query(request);
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expectEqualStrings("planned 1595586600000000000", response.body.?);
+}
+
+test "handle_query with get instruction returns failure for missing job" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    const request = Request{
+        .client = 2,
+        .identifier = "req-get-2",
+        .instruction = .{ .get = .{ .identifier = "job.missing" } },
+    };
+
+    const response = try scheduler.handle_query(request);
+    try std.testing.expect(!response.success);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.body);
+}
+
+test "handle_query with get instruction does not persist to logfile" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    const tmp_path = "/tmp/ztick-test-scheduler-get-no-persist.log";
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        file.close();
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
+    });
+
+    const size_after_set = blk: {
+        const file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        const stat = try file.stat();
+        break :blk stat.size;
+    };
+    try std.testing.expect(size_after_set > 0);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-get",
+        .instruction = .{ .get = .{ .identifier = "job.1" } },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    const size_after_get = blk: {
+        const file = try std.fs.cwd().openFile(tmp_path, .{});
+        defer file.close();
+        const stat = try file.stat();
+        break :blk stat.size;
+    };
+
+    try std.testing.expectEqual(size_after_set, size_after_get);
 }
 
 test "double load deinits previous arena without leak" {

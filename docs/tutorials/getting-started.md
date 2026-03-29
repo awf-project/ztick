@@ -106,7 +106,33 @@ You can also use nanosecond timestamps:
 echo 'r3 SET example.job.2 1711612800000000000' | socat - TCP:localhost:5678
 ```
 
-## Step 6: Verify Persistence
+## Step 6: Check Job State
+
+Use the `GET` command to verify a job was created and see its current state:
+
+```bash
+echo 'r4 GET example.job.1' | socat - TCP:localhost:5678
+```
+
+Response:
+```
+r4 OK planned 1743199200000000000
+```
+
+The response shows the job's status (`planned`) and its execution timestamp in nanoseconds.
+
+Try querying a job that doesn't exist:
+
+```bash
+echo 'r5 GET no.such.job' | socat - TCP:localhost:5678
+```
+
+Response:
+```
+r5 ERROR
+```
+
+## Step 7: Verify Persistence
 
 Stop ztick (Ctrl+C) and check the logfile:
 
@@ -124,7 +150,7 @@ zig build run -- -c config.toml
 
 Your jobs and rules are restored from the logfile. Send the same commands again to verify they still work.
 
-## Step 7: Batch Commands
+## Step 8: Batch Commands
 
 Send multiple commands at once:
 
@@ -154,6 +180,7 @@ Every command follows this format:
 | Command | Description | Example |
 |---------|-------------|---------|
 | `SET` | Create/update a job | `r1 SET job.name 2026-04-01 12:00:00` |
+| `GET` | Retrieve job state | `r1 GET job.name` |
 | `RULE SET` | Create/update a rule | `r1 RULE SET rule.name job. shell "/bin/cmd --flag"` |
 
 See [Protocol Reference](../reference/protocol.md) for full details.

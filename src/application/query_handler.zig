@@ -10,11 +10,13 @@ const Request = domain.query.Request;
 const Response = domain.query.Response;
 
 pub const QueryHandler = struct {
+    allocator: std.mem.Allocator,
     job_storage: *JobStorage,
     rule_storage: *RuleStorage,
 
-    pub fn init(job_storage: *JobStorage, rule_storage: *RuleStorage) QueryHandler {
+    pub fn init(allocator: std.mem.Allocator, job_storage: *JobStorage, rule_storage: *RuleStorage) QueryHandler {
         return .{
+            .allocator = allocator,
             .job_storage = job_storage,
             .rule_storage = rule_storage,
         };
@@ -40,6 +42,11 @@ pub const QueryHandler = struct {
                 self.rule_storage.set(rule) catch break :blk false;
                 break :blk true;
             },
+            .get => |args| blk: {
+                const job = self.job_storage.get(args.identifier) orelse break :blk false;
+                const body = try std.fmt.allocPrint(self.allocator, "{s} {d}", .{ @tagName(job.status), job.execution });
+                return Response{ .request = request, .success = true, .body = body };
+            },
         };
 
         return Response{ .request = request, .success = success };
@@ -56,7 +63,7 @@ test "handle set instruction stores job and returns success" {
     var rule_storage = RuleStorage.init(allocator);
     defer rule_storage.deinit();
 
-    var handler = QueryHandler.init(&job_storage, &rule_storage);
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
 
     const request = Request{
         .client = 1,
@@ -83,7 +90,7 @@ test "handle rule_set instruction stores rule and returns success" {
     var rule_storage = RuleStorage.init(allocator);
     defer rule_storage.deinit();
 
-    var handler = QueryHandler.init(&job_storage, &rule_storage);
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
 
     const request = Request{
         .client = 2,
@@ -101,4 +108,55 @@ test "handle rule_set instruction stores rule and returns success" {
     const rule = rule_storage.get("rule.1");
     try std.testing.expect(rule != null);
     try std.testing.expectEqualStrings("job.", rule.?.pattern);
+}
+
+test "handle get instruction returns success with status and execution timestamp for existing job" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    try job_storage.set(.{ .identifier = "job.1", .execution = 1595586600_000000000, .status = .planned });
+
+    const request = Request{
+        .client = 3,
+        .identifier = "req-3",
+        .instruction = .{ .get = .{ .identifier = "job.1" } },
+    };
+
+    const response = try handler.handle(request);
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expectEqualStrings("planned 1595586600000000000", response.body.?);
+}
+
+test "handle get instruction returns failure for missing job" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    const request = Request{
+        .client = 4,
+        .identifier = "req-4",
+        .instruction = .{ .get = .{ .identifier = "job.missing" } },
+    };
+
+    const response = try handler.handle(request);
+    try std.testing.expect(!response.success);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.body);
 }

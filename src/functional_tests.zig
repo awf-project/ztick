@@ -260,6 +260,50 @@ test "parsed protocol command drives scheduler via query" {
     try std.testing.expectEqual(JobStatus.triggered, scheduler.job_storage.get("app.proto.job.1").?.status);
 }
 
+test "get existing job returns planned status with execution timestamp" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set",
+        .instruction = .{ .set = .{ .identifier = "app.job.get.1", .execution = 1595586600000000000 } },
+    });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-get",
+        .instruction = .{ .get = .{ .identifier = "app.job.get.1" } },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expectEqualStrings("planned 1595586600000000000", response.body.?);
+}
+
+test "get nonexistent job returns failure with null body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-get-missing",
+        .instruction = .{ .get = .{ .identifier = "no.such.job" } },
+    });
+
+    try std.testing.expect(!response.success);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.body);
+}
+
 test "execution failure marks triggered job as failed" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

@@ -146,10 +146,31 @@ r2 OK
 r3 OK
 ```
 
+## Checking Job State
+
+Use the `GET` command to retrieve a job's current state:
+
+```bash
+echo 'r1 GET backup.daily' | socat - TCP:localhost:5678
+```
+
+Response for an existing job:
+```
+r1 OK planned 1743303600000000000
+```
+
+The response includes the job's status (`planned`, `triggered`, `executed`, `failed`) and execution timestamp in nanoseconds.
+
+If the job doesn't exist:
+```
+r1 ERROR
+```
+
+GET is read-only — it does not affect persistence.
+
 ## Limitations
 
 The following operations are **not yet implemented**:
-- `GET` — Query a job's current state
 - `REMOVE` — Delete a job
 - `QUERY` — List jobs matching a pattern
 

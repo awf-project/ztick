@@ -107,6 +107,7 @@ pub const TcpServer = struct {
         for (self.threads.items) |thread| {
             thread.join();
         }
+        self.threads.clearAndFree(self.allocator);
     }
 };
 
@@ -135,7 +136,6 @@ fn handle_connection(
 
         filled += n;
 
-        // Parse all complete lines in the buffer
         var consumed: usize = 0;
         while (true) {
             const data = buf[consumed..filled];
@@ -154,10 +154,13 @@ fn handle_connection(
 
             consumed = filled - result.remaining.len;
 
-            if (build_instruction(result)) |instr| {
-                // Transfer ownership: command and instruction args are now
-                // owned by the request. Free only the unused parsed args.
-                free_unused_args(allocator, result, instr);
+            if (build_instruction(allocator, result) catch {
+                result.deinit(allocator);
+                return;
+            }) |instr| {
+                // Instruction owns duped strings; free all parsed args uniformly.
+                for (result.args) |arg| allocator.free(arg);
+                allocator.free(result.args);
 
                 const request = query.Request{
                     .client = client_id,
@@ -174,16 +177,16 @@ fn handle_connection(
 
                 // Wait for response and write back to client
                 if (response_channel.receive()) |resp| {
-                    write_response(stream, resp) catch {};
+                    write_response(allocator, stream, resp) catch {};
                     // Free only the request_id (result.command) — not stored by scheduler.
                     // Instruction strings (job id, pattern, runner args) are now owned
                     // by the scheduler's storage and must not be freed here.
                     allocator.free(resp.request.identifier);
+                    if (resp.body) |body| allocator.free(body);
                 } else {
                     return; // channel closed
                 }
             } else {
-                // No instruction matched — free all parsed data
                 result.deinit(allocator);
             }
         }
@@ -199,10 +202,16 @@ fn handle_connection(
     }
 }
 
-fn build_instruction(result: parser.ParseResult) ?instruction.Instruction {
-    if (result.args.len >= 2 and std.mem.eql(u8, result.args[0], "SET")) {
+fn build_instruction(allocator: std.mem.Allocator, result: parser.ParseResult) error{OutOfMemory}!?instruction.Instruction {
+    if (result.args.len >= 2 and std.mem.eql(u8, result.args[0], "GET")) {
+        const id = try allocator.dupe(u8, result.args[1]);
+        return .{ .get = .{ .identifier = id } };
+    }
+
+    if (result.args.len >= 3 and std.mem.eql(u8, result.args[0], "SET")) {
+        const id = try allocator.dupe(u8, result.args[1]);
         return .{ .set = .{
-            .identifier = result.args[1],
+            .identifier = id,
             .execution = parse_timestamp(result.args[2..]),
         } };
     }
@@ -213,20 +222,34 @@ fn build_instruction(result: parser.ParseResult) ?instruction.Instruction {
     {
         const runner_type = result.args[4..];
         if (runner_type.len >= 2 and std.mem.eql(u8, runner_type[0], "shell")) {
+            const id = try allocator.dupe(u8, result.args[2]);
+            errdefer allocator.free(id);
+            const pattern = try allocator.dupe(u8, result.args[3]);
+            errdefer allocator.free(pattern);
+            const command = try allocator.dupe(u8, runner_type[1]);
             return .{ .rule_set = .{
-                .identifier = result.args[2],
-                .pattern = result.args[3],
-                .runner = .{ .shell = .{ .command = runner_type[1] } },
+                .identifier = id,
+                .pattern = pattern,
+                .runner = .{ .shell = .{ .command = command } },
             } };
         }
         if (runner_type.len >= 4 and std.mem.eql(u8, runner_type[0], "amqp")) {
+            const id = try allocator.dupe(u8, result.args[2]);
+            errdefer allocator.free(id);
+            const pattern = try allocator.dupe(u8, result.args[3]);
+            errdefer allocator.free(pattern);
+            const dsn = try allocator.dupe(u8, runner_type[1]);
+            errdefer allocator.free(dsn);
+            const exchange = try allocator.dupe(u8, runner_type[2]);
+            errdefer allocator.free(exchange);
+            const routing_key = try allocator.dupe(u8, runner_type[3]);
             return .{ .rule_set = .{
-                .identifier = result.args[2],
-                .pattern = result.args[3],
+                .identifier = id,
+                .pattern = pattern,
                 .runner = .{ .amqp = .{
-                    .dsn = runner_type[1],
-                    .exchange = runner_type[2],
-                    .routing_key = runner_type[3],
+                    .dsn = dsn,
+                    .exchange = exchange,
+                    .routing_key = routing_key,
                 } },
             } };
         }
@@ -295,43 +318,6 @@ fn is_leap_year(year: u16) bool {
     return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
 }
 
-/// Free parsed args that are NOT referenced by the instruction.
-/// The instruction borrows some arg slices (identifier, pattern, command, etc.)
-/// but the args array itself and unused args must be freed.
-fn free_unused_args(allocator: std.mem.Allocator, result: parser.ParseResult, instr: instruction.Instruction) void {
-    // Free individual arg strings that are not borrowed by the instruction
-    for (result.args) |arg| {
-        if (is_borrowed_by_instruction(arg, instr)) continue;
-        allocator.free(arg);
-    }
-    // Free the args array itself (but not command — it's transferred)
-    allocator.free(result.args);
-}
-
-fn is_borrowed_by_instruction(arg: []const u8, instr: instruction.Instruction) bool {
-    switch (instr) {
-        .set => |s| {
-            if (arg.ptr == s.identifier.ptr) return true;
-        },
-        .rule_set => |r| {
-            if (arg.ptr == r.identifier.ptr) return true;
-            if (arg.ptr == r.pattern.ptr) return true;
-            switch (r.runner) {
-                .shell => |sh| {
-                    if (arg.ptr == sh.command.ptr) return true;
-                },
-                .amqp => |a| {
-                    if (arg.ptr == a.dsn.ptr) return true;
-                    if (arg.ptr == a.exchange.ptr) return true;
-                    if (arg.ptr == a.routing_key.ptr) return true;
-                },
-            }
-        },
-    }
-    return false;
-}
-
-/// Free all heap-allocated strings owned by an instruction.
 fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Instruction) void {
     switch (instr) {
         .set => |s| {
@@ -349,13 +335,19 @@ fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Ins
                 },
             }
         },
+        .get => |g| {
+            allocator.free(g.identifier);
+        },
     }
 }
 
-fn write_response(stream: std.net.Stream, resp: query.Response) !void {
+fn write_response(allocator: std.mem.Allocator, stream: std.net.Stream, resp: query.Response) !void {
     const status = if (resp.success) "OK" else "ERROR";
-    var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "{s} {s}\n", .{ resp.request.identifier, status }) catch return;
+    const msg = if (resp.body) |body|
+        try std.fmt.allocPrint(allocator, "{s} {s} {s}\n", .{ resp.request.identifier, status, body })
+    else
+        try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ resp.request.identifier, status });
+    defer allocator.free(msg);
     _ = try stream.write(msg);
 }
 
@@ -419,4 +411,66 @@ test "tcp server init stores address" {
     var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running);
     defer server.deinit();
     try std.testing.expectEqualStrings("127.0.0.1:5678", server.address);
+}
+
+test "build_instruction parses GET command with identifier" {
+    var args = [_][]u8{ @constCast("GET"), @constCast("job.1") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .get => |g| try std.testing.expectEqualStrings("job.1", g.identifier),
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction returns null for GET without identifier" {
+    var args = [_][]u8{@constCast("GET")};
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "free_instruction_strings frees GET identifier without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "job.1");
+    const instr = instruction.Instruction{ .get = .{ .identifier = id } };
+    free_instruction_strings(allocator, instr);
+}
+
+test "write_response appends body when response body is non-null" {
+    var fds: [2]i32 = undefined;
+    const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds);
+    try std.testing.expectEqual(@as(usize, 0), rc);
+    const read_fd: std.posix.socket_t = @intCast(fds[0]);
+    const write_fd: std.posix.socket_t = @intCast(fds[1]);
+    defer std.posix.close(read_fd);
+
+    const write_stream = std.net.Stream{ .handle = write_fd };
+
+    const req = query.Request{
+        .client = 0,
+        .identifier = "req1",
+        .instruction = .{ .get = .{ .identifier = "job.1" } },
+    };
+    const resp = query.Response{
+        .request = req,
+        .success = true,
+        .body = "planned 1595586600000000000",
+    };
+
+    try write_response(std.testing.allocator, write_stream, resp);
+    write_stream.close();
+
+    var buf: [512]u8 = undefined;
+    const n = try std.posix.read(read_fd, &buf);
+    try std.testing.expectEqualStrings("req1 OK planned 1595586600000000000\n", buf[0..n]);
 }
