@@ -193,10 +193,25 @@ echo 'r1 QUERY ""' | socat - TCP:localhost:5678
 QUERY is read-only — it does not generate persistence entries.
 
 
-## Limitations
+## Removing a Job
 
-The following operations are **not yet implemented**:
-- `REMOVE` — Delete a job
+Use the `REMOVE` command to delete a scheduled job:
+
+```bash
+echo 'r1 REMOVE backup.daily' | socat - TCP:localhost:5678
+```
+
+Response:
+```
+r1 OK
+```
+
+If the job doesn't exist:
+```
+r1 ERROR
+```
+
+REMOVE persists the deletion to the logfile — the job stays removed across server restarts and background compression.
 
 ## Tips
 

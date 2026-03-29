@@ -76,6 +76,21 @@ pub const JobStorage = struct {
         return result.toOwnedSlice(allocator);
     }
 
+    pub fn delete(self: *JobStorage, identifier: []const u8) bool {
+        if (!self.jobs.remove(identifier)) return false;
+
+        var i: usize = 0;
+        while (i < self.to_execute.items.len) {
+            if (std.mem.eql(u8, self.to_execute.items[i].identifier, identifier)) {
+                _ = self.to_execute.orderedRemove(i);
+                break;
+            }
+            i += 1;
+        }
+
+        return true;
+    }
+
     pub fn get_by_status(self: *const JobStorage, status: JobStatus, allocator: std.mem.Allocator) ![]Job {
         var result = std.ArrayListUnmanaged(Job){};
         errdefer result.deinit(allocator);
@@ -193,6 +208,49 @@ test "get_by_prefix with empty prefix returns all jobs" {
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 3), result.len);
+}
+
+test "delete returns true and removes existing job" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var storage = JobStorage.init(allocator);
+    defer storage.deinit();
+
+    try storage.set(Job{ .identifier = "job.1", .execution = 1595586600_000000000, .status = .planned });
+
+    const deleted = storage.delete("job.1");
+    try std.testing.expect(deleted);
+    try std.testing.expect(storage.get("job.1") == null);
+}
+
+test "delete removes job from to_execute list" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var storage = JobStorage.init(allocator);
+    defer storage.deinit();
+
+    const future: i64 = 9_000_000_000_000_000_000;
+    try storage.set(Job{ .identifier = "job.queued", .execution = future, .status = .planned });
+    try std.testing.expectEqual(@as(usize, 1), storage.to_execute.items.len);
+
+    _ = storage.delete("job.queued");
+    try std.testing.expectEqual(@as(usize, 0), storage.to_execute.items.len);
+}
+
+test "delete returns false for nonexistent job" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var storage = JobStorage.init(allocator);
+    defer storage.deinit();
+
+    const deleted = storage.delete("nonexistent");
+    try std.testing.expect(!deleted);
 }
 
 test "get_by_status filters by status" {

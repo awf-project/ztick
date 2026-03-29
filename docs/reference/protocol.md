@@ -28,7 +28,7 @@ Every command follows this structure:
 ```
 
 - `request_id` — A client-chosen identifier echoed back in the response (e.g., `req-1`, `cmd-42`)
-- `instruction` — The operation to perform (`SET`, `GET`, `QUERY`, or `RULE SET`)
+- `instruction` — The operation to perform (`SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, or `RULE SET`)
 - `args` — Instruction-specific arguments
 
 ## Response Format
@@ -45,7 +45,7 @@ Every command follows this structure:
 
 The `request_id` matches the one sent in the command, allowing clients to correlate responses.
 
-Write commands (`SET`, `RULE SET`) return a status-only response. Read commands (`GET`) return a response with additional data in the body after the status. List commands (`QUERY`) return multiple lines followed by a terminal `OK` line.
+Write commands (`SET`, `RULE SET`) and delete commands (`REMOVE`, `REMOVERULE`) return a status-only response. Read commands (`GET`) return a response with additional data in the body after the status. List commands (`QUERY`) return multiple lines followed by a terminal `OK` line.
 
 ## Error Handling
 
@@ -56,7 +56,7 @@ Write commands (`SET`, `RULE SET`) return a status-only response. Read commands 
 | Unrecognized command | Silently ignored, no response sent (see below) |
 | Out of memory | Connection closed |
 
-**Important**: Only `SET`, `GET`, `QUERY`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
+**Important**: Only `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
 
 ## Commands
 
@@ -167,6 +167,64 @@ echo 'req-4 QUERY' | socat - TCP:localhost:5678
 
 **Notes**: QUERY is a read-only command — it does not generate any persistence log entry. Results are returned in unspecified order (hashmap iteration order).
 
+### REMOVE
+
+Delete a scheduled job.
+
+**Syntax**:
+```
+<request_id> REMOVE <job_identifier>
+```
+
+**Parameters**:
+- `job_identifier` (string): The job identifier to delete (e.g., `backup.daily`)
+
+**Response**:
+- Success: `<request_id> OK\n`
+- Not found: `<request_id> ERROR\n`
+
+**Examples**:
+```bash
+# Remove an existing job
+echo 'req-7 REMOVE backup.daily' | socat - TCP:localhost:5678
+# Response: req-7 OK
+
+# Remove a nonexistent job
+echo 'req-8 REMOVE no.such.job' | socat - TCP:localhost:5678
+# Response: req-8 ERROR
+```
+
+**Notes**: REMOVE persists the deletion to the append-only logfile. The removal survives server restarts and background log compression.
+
+### REMOVERULE
+
+Delete an execution rule.
+
+**Syntax**:
+```
+<request_id> REMOVERULE <rule_identifier>
+```
+
+**Parameters**:
+- `rule_identifier` (string): The rule identifier to delete (e.g., `rule.backup`)
+
+**Response**:
+- Success: `<request_id> OK\n`
+- Not found: `<request_id> ERROR\n`
+
+**Examples**:
+```bash
+# Remove an existing rule
+echo 'req-9 REMOVERULE rule.backup' | socat - TCP:localhost:5678
+# Response: req-9 OK
+
+# Remove a nonexistent rule
+echo 'req-10 REMOVERULE no.such.rule' | socat - TCP:localhost:5678
+# Response: req-10 ERROR
+```
+
+**Notes**: REMOVERULE persists the deletion to the append-only logfile. The removal survives server restarts and background log compression. Removing a rule does not cancel pending jobs that were previously matched by the rule.
+
 ### RULE SET
 
 Create or update a rule that matches jobs by prefix and assigns a runner.
@@ -221,8 +279,6 @@ Escaping inside quoted strings:
 ## Unimplemented Commands
 
 The following commands are **not yet implemented**. The server silently ignores them — no response is sent and the connection remains open:
-- `REMOVE` — Delete a job
-- `REMOVERULE` — Delete a rule
 - `LISTRULES` — List all rules
 
 ## Examples
@@ -251,6 +307,14 @@ echo 'r5 QUERY backup.' | socat - TCP:localhost:5678
 # r5 backup.daily planned 1743303600000000000
 # r5 backup.weekly planned 1711872000000000000
 # r5 OK
+
+# Remove the weekly backup job
+echo 'r6 REMOVE backup.weekly' | socat - TCP:localhost:5678
+# r6 OK
+
+# Remove the backup rule
+echo 'r7 REMOVERULE rule.backup' | socat - TCP:localhost:5678
+# r7 OK
 ```
 
 ### Batch Operations

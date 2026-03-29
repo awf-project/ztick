@@ -28,14 +28,14 @@ framerate = 1                     # Evaluations per second
 ### Protocol
 
 ```
-SET <id> <timestamp>              # Create job
-GET <id>                          # Retrieve job
-QUERY <pattern>                   # List matching jobs
-REMOVE <id>                       # Delete job
+SET <id> <timestamp>                    # Create job
+GET <id>                                # Retrieve job
+QUERY <pattern>                         # List matching jobs
+REMOVE <id>                             # Delete job
 
-SETRULE <pat> <runner> <config>   # Create rule
-REMOVERULE <pattern>              # Delete rule
-LISTRULES                         # List all rules
+RULE SET <id> <pattern> <runner>        # Create rule
+REMOVERULE <id>                         # Delete rule
+LISTRULES                               # List all rules (not yet implemented)
 ```
 
 ### Data Types

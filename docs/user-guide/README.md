@@ -4,15 +4,17 @@ Task-oriented how-to guides for common ztick operations.
 
 ## Topics
 
-- **[Creating Jobs](creating-jobs.md)** — Define and schedule jobs
+- **[Creating Jobs](creating-jobs.md)** — Define, schedule, and manage jobs
   - Basic job creation with `SET`
   - Job lifecycle and states
+  - Removing jobs with `REMOVE`
   - Batch operations
 
 - **[Writing Rules](writing-rules.md)** — Match jobs and specify actions
-  - Pattern matching and priority (weight)
-  - Runner types (Shell, HTTP, AMQP)
-  - Rule management and best practices
+  - Pattern matching and priority (longest match wins)
+  - Runner types (Shell, HTTP/AMQP)
+  - Rule management and removal with `REMOVERULE`
+  - Best practices
 
 - **[Configuration](configuration.md)** — Customize behavior
   - Logging levels
@@ -31,7 +33,7 @@ echo 'SET my.job 1234567890' | nc localhost 5678
 ### Create a Rule
 
 ```bash
-echo 'SETRULE my.job.* SHELL /bin/echo done' | nc localhost 5678
+echo 'RULE SET my.job.* SHELL /bin/echo done' | nc localhost 5678
 ```
 
 ### View a Job
@@ -46,6 +48,18 @@ echo 'GET my.job' | nc localhost 5678
 echo 'req-1 QUERY my.' | nc localhost 5678
 ```
 
+### Remove a Job
+
+```bash
+echo 'req-1 REMOVE my.job' | nc localhost 5678
+```
+
+### Remove a Rule
+
+```bash
+echo 'req-1 REMOVERULE my.rule' | nc localhost 5678
+```
+
 ### List Rules
 
 ```bash
@@ -58,7 +72,7 @@ echo 'LISTRULES' | nc localhost 5678
 
 1. Create a rule:
    ```bash
-   echo 'SETRULE backup.daily SHELL /usr/bin/backup.sh' | nc localhost 5678
+   echo 'RULE SET backup.daily SHELL /usr/bin/backup.sh' | nc localhost 5678
    ```
 
 2. Create jobs for each day:
@@ -74,13 +88,13 @@ Use rule weights to prioritize:
 
 ```bash
 # Low priority catch-all
-echo 'SETRULE * SHELL /bin/log-event 1' | nc localhost 5678
+echo 'RULE SET * SHELL /bin/log-event 1' | nc localhost 5678
 
 # High priority critical jobs
-echo 'SETRULE critical.* SHELL /bin/alert-admin 100' | nc localhost 5678
+echo 'RULE SET critical.* SHELL /bin/alert-admin 100' | nc localhost 5678
 
 # Medium priority
-echo 'SETRULE important.* SHELL /bin/notify 50' | nc localhost 5678
+echo 'RULE SET important.* SHELL /bin/notify 50' | nc localhost 5678
 ```
 
 ### Migrate from Another Scheduler

@@ -77,6 +77,8 @@ pub const Scheduler = struct {
             switch (entry) {
                 .job => |job| try self.job_storage.set(job),
                 .rule => |rule| try self.rule_storage.set(rule),
+                .job_removal => |removal| _ = self.job_storage.delete(removal.identifier),
+                .rule_removal => |removal| _ = self.rule_storage.delete(removal.identifier),
             }
         }
     }
@@ -107,6 +109,8 @@ pub const Scheduler = struct {
                 .pattern = args.pattern,
                 .runner = args.runner,
             } },
+            .remove => |args| .{ .job_removal = .{ .identifier = args.identifier } },
+            .remove_rule => |args| .{ .rule_removal = .{ .identifier = args.identifier } },
             .get, .query => return,
         };
 
@@ -504,6 +508,127 @@ test "double load deinits previous arena without leak" {
         const job = scheduler.job_storage.get("job.1");
         try std.testing.expect(job != null);
         try std.testing.expectEqual(@as(i64, 1000), job.?.execution);
+    }
+}
+
+test "handle_query with remove instruction persists to logfile" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    const tmp_path = "/tmp/ztick-test-scheduler-remove-persist.log";
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        file.close();
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
+    });
+    const size_after_set = try get_file_size(tmp_path);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-remove",
+        .instruction = .{ .remove = .{ .identifier = "job.1" } },
+    });
+
+    try std.testing.expect(try get_file_size(tmp_path) > size_after_set);
+}
+
+test "remove job round-trip through logfile" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    const tmp_path = "/tmp/ztick-test-scheduler-remove-roundtrip.log";
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        file.close();
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var scheduler = Scheduler.init(allocator);
+        defer scheduler.deinit();
+        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+
+        _ = try scheduler.handle_query(Request{
+            .client = 1,
+            .identifier = "req-set",
+            .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
+        });
+        _ = try scheduler.handle_query(Request{
+            .client = 2,
+            .identifier = "req-remove",
+            .instruction = .{ .remove = .{ .identifier = "job.1" } },
+        });
+    }
+
+    {
+        var scheduler = Scheduler.init(allocator);
+        defer scheduler.deinit();
+        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+
+        try std.testing.expectEqual(@as(?Job, null), scheduler.job_storage.get("job.1"));
+    }
+}
+
+test "remove_rule round-trip through logfile" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    const tmp_path = "/tmp/ztick-test-scheduler-removerule-roundtrip.log";
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        file.close();
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        var scheduler = Scheduler.init(allocator);
+        defer scheduler.deinit();
+        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+
+        _ = try scheduler.handle_query(Request{
+            .client = 1,
+            .identifier = "req-rule-set",
+            .instruction = .{ .rule_set = .{
+                .identifier = "rule.1",
+                .pattern = "job.",
+                .runner = .{ .shell = .{ .command = "echo hello" } },
+            } },
+        });
+        _ = try scheduler.handle_query(Request{
+            .client = 2,
+            .identifier = "req-removerule",
+            .instruction = .{ .remove_rule = .{ .identifier = "rule.1" } },
+        });
+    }
+
+    {
+        var scheduler = Scheduler.init(allocator);
+        defer scheduler.deinit();
+        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+
+        try std.testing.expectEqual(@as(?Rule, null), scheduler.rule_storage.get("rule.1"));
     }
 }
 

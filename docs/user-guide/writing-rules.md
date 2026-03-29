@@ -124,11 +124,30 @@ When each job's execution time arrives:
 - `backup.daily` and `backup.weekly` trigger `/usr/bin/backup.sh`
 - `report.monthly` triggers `/usr/bin/generate-report.sh`
 
+## Removing a Rule
+
+Use the `REMOVERULE` command to delete a rule:
+
+```bash
+echo 'r1 REMOVERULE rule.backup' | socat - TCP:localhost:5678
+```
+
+Response:
+```
+r1 OK
+```
+
+If the rule doesn't exist:
+```
+r1 ERROR
+```
+
+REMOVERULE persists the deletion to the logfile — the rule stays removed across server restarts and background compression. Removing a rule does **not** cancel pending jobs that were previously matched by it.
+
 ## Limitations
 
 The following operations are **not yet implemented**:
 - `LISTRULES` — List all rules
-- `REMOVERULE` — Delete a rule
 
 ## Best Practices
 

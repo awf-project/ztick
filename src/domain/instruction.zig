@@ -17,6 +17,12 @@ pub const Instruction = union(enum) {
     query: struct {
         pattern: []const u8,
     },
+    remove: struct {
+        identifier: []const u8,
+    },
+    remove_rule: struct {
+        identifier: []const u8,
+    },
 };
 
 test "set instruction stores identifier and execution timestamp" {
@@ -54,4 +60,16 @@ test "query instruction accepts empty pattern" {
     const instr = Instruction{ .query = .{ .pattern = "" } };
     try std.testing.expectEqualStrings("", instr.query.pattern);
     try std.testing.expectEqual(std.meta.Tag(Instruction).query, std.meta.activeTag(instr));
+}
+
+test "remove instruction stores identifier" {
+    const instr = Instruction{ .remove = .{ .identifier = "backup-daily" } };
+    try std.testing.expectEqualStrings("backup-daily", instr.remove.identifier);
+    try std.testing.expectEqual(std.meta.Tag(Instruction).remove, std.meta.activeTag(instr));
+}
+
+test "remove_rule instruction stores identifier" {
+    const instr = Instruction{ .remove_rule = .{ .identifier = "notify-slack" } };
+    try std.testing.expectEqualStrings("notify-slack", instr.remove_rule.identifier);
+    try std.testing.expectEqual(std.meta.Tag(Instruction).remove_rule, std.meta.activeTag(instr));
 }

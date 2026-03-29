@@ -8,12 +8,16 @@ pub const DecodeError = error{InvalidData};
 pub const Entry = union(enum) {
     job: domain.job.Job,
     rule: domain.rule.Rule,
+    job_removal: struct { identifier: []const u8 },
+    rule_removal: struct { identifier: []const u8 },
 };
 
 pub fn encode(allocator: std.mem.Allocator, value: Entry) ![]u8 {
     return switch (value) {
         .job => |job| encode_job(allocator, job),
         .rule => |rule| encode_rule(allocator, rule),
+        .job_removal => |r| encode_removal(allocator, 2, r.identifier),
+        .rule_removal => |r| encode_removal(allocator, 3, r.identifier),
     };
 }
 
@@ -104,6 +108,15 @@ fn encode_runner(runner: domain.runner.Runner, buf: []u8) void {
     }
 }
 
+fn encode_removal(allocator: std.mem.Allocator, type_byte: u8, identifier: []const u8) ![]u8 {
+    if (identifier.len > std.math.maxInt(u16)) return error.Overflow;
+    const result = try allocator.alloc(u8, 1 + 2 + identifier.len);
+    result[0] = type_byte;
+    std.mem.writeInt(u16, result[1..3], @intCast(identifier.len), .big);
+    @memcpy(result[3..], identifier);
+    return result;
+}
+
 fn decode_inner(allocator: std.mem.Allocator, data: []const u8) !Entry {
     var pos: usize = 0;
 
@@ -177,6 +190,18 @@ fn decode_inner(allocator: std.mem.Allocator, data: []const u8) !Entry {
                 else => return error.InvalidData,
             }
         },
+        2 => {
+            const id_slice = try read_sized_string(data, &pos);
+            if (pos != data.len) return error.InvalidData;
+            const id_copy = try allocator.dupe(u8, id_slice);
+            return .{ .job_removal = .{ .identifier = id_copy } };
+        },
+        3 => {
+            const id_slice = try read_sized_string(data, &pos);
+            if (pos != data.len) return error.InvalidData;
+            const id_copy = try allocator.dupe(u8, id_slice);
+            return .{ .rule_removal = .{ .identifier = id_copy } };
+        },
         else => return error.InvalidData,
     }
 }
@@ -192,9 +217,10 @@ fn read_sized_string(data: []const u8, pos: *usize) ![]const u8 {
     return s;
 }
 
-/// Free all heap-allocated fields of a decoded Entry, except the identifier.
-/// After calling, only the entry's identifier slice remains valid; the caller is
-/// responsible for freeing it.
+/// Frees heap-allocated fields of a decoded Entry beyond the identifier.
+/// For job and removal entries this is a no-op (job fields are value types;
+/// removal entries contain only an identifier). For rule entries, frees the
+/// pattern and runner strings. The identifier is left for the caller to free.
 pub fn free_entry_fields(entry: Entry, allocator: std.mem.Allocator) void {
     switch (entry) {
         .job => {},
@@ -209,6 +235,8 @@ pub fn free_entry_fields(entry: Entry, allocator: std.mem.Allocator) void {
                 },
             }
         },
+        .job_removal => {},
+        .rule_removal => {},
     }
 }
 
@@ -305,5 +333,36 @@ test "decode error on truncated buffer" {
 
 test "decode error on trailing bytes" {
     const data = [_]u8{ 0, 0, 4, 116, 111, 116, 111, 22, 71, 187, 92, 238, 225, 80, 0, 0, 255 };
+    try std.testing.expectError(DecodeError.InvalidData, decode(std.testing.allocator, &data));
+}
+
+test "encode job removal" {
+    const result = try encode(std.testing.allocator, .{ .job_removal = .{ .identifier = "foo" } });
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 0, 3, 102, 111, 111 }, result);
+}
+
+test "encode rule removal" {
+    const result = try encode(std.testing.allocator, .{ .rule_removal = .{ .identifier = "bar" } });
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 3, 0, 3, 98, 97, 114 }, result);
+}
+
+test "decode job removal" {
+    const data = [_]u8{ 2, 0, 3, 102, 111, 111 };
+    const result = try decode(std.testing.allocator, &data);
+    defer std.testing.allocator.free(result.job_removal.identifier);
+    try std.testing.expectEqualStrings("foo", result.job_removal.identifier);
+}
+
+test "decode rule removal" {
+    const data = [_]u8{ 3, 0, 3, 98, 97, 114 };
+    const result = try decode(std.testing.allocator, &data);
+    defer std.testing.allocator.free(result.rule_removal.identifier);
+    try std.testing.expectEqualStrings("bar", result.rule_removal.identifier);
+}
+
+test "decode error on trailing bytes after job removal" {
+    const data = [_]u8{ 2, 0, 3, 102, 111, 111, 255 };
     try std.testing.expectError(DecodeError.InvalidData, decode(std.testing.allocator, &data));
 }
