@@ -304,6 +304,117 @@ test "get nonexistent job returns failure with null body" {
     try std.testing.expectEqual(@as(?[]const u8, null), response.body);
 }
 
+test "query prefix match returns only matching jobs" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set-1",
+        .instruction = .{ .set = .{ .identifier = "backup.daily", .execution = 1595586600_000000000 } },
+    });
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set-2",
+        .instruction = .{ .set = .{ .identifier = "backup.weekly", .execution = 1595586660_000000000 } },
+    });
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set-3",
+        .instruction = .{ .set = .{ .identifier = "deploy.prod", .execution = 1595586720_000000000 } },
+    });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-query",
+        .instruction = .{ .query = .{ .pattern = "backup." } },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "backup.daily") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "backup.weekly") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "deploy.prod") == null);
+
+    var line_count: usize = 0;
+    var it = std.mem.splitScalar(u8, response.body.?, '\n');
+    while (it.next()) |line| {
+        if (line.len > 0) line_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), line_count);
+}
+
+test "query with empty pattern returns all jobs" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set-1",
+        .instruction = .{ .set = .{ .identifier = "backup.daily", .execution = 1595586600_000000000 } },
+    });
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set-2",
+        .instruction = .{ .set = .{ .identifier = "deploy.prod", .execution = 1595586660_000000000 } },
+    });
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set-3",
+        .instruction = .{ .set = .{ .identifier = "migrate.db", .execution = 1595586720_000000000 } },
+    });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-query",
+        .instruction = .{ .query = .{ .pattern = "" } },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+
+    var line_count: usize = 0;
+    var it = std.mem.splitScalar(u8, response.body.?, '\n');
+    while (it.next()) |line| {
+        if (line.len > 0) line_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), line_count);
+}
+
+test "query no match returns success with null body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set-1",
+        .instruction = .{ .set = .{ .identifier = "backup.daily", .execution = 1595586600_000000000 } },
+    });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-query",
+        .instruction = .{ .query = .{ .pattern = "deploy." } },
+    });
+
+    try std.testing.expect(response.success);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.body);
+}
+
 test "execution failure marks triggered job as failed" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

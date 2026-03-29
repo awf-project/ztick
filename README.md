@@ -2,6 +2,25 @@
 
 A time-based job scheduler written in Zig with hexagonal architecture, explicit memory management, and zero dependencies beyond the Zig standard library.
 
+## Features
+
+### Implemented
+
+- **Core scheduler**: Time-based job execution with TCP control protocol
+- **GET command**: Retrieve individual job state (`GET <job_id>`)
+- **QUERY command**: List jobs matching a prefix pattern (`QUERY <pattern>`)
+- **Rules**: Match jobs by prefix and assign shell/AMQP runners
+- **Persistence**: Append-only logfile with binary encoding and compression
+- **Configuration**: TOML-based settings for logging, listen address, and framerate
+
+### Roadmap
+
+- [ ] DELETE/REMOVE command for job cleanup
+- [ ] LISTRULES command for rule enumeration
+- [ ] AMQP runner implementation (HTTP/webhook support)
+- [ ] Glob pattern matching for rules (currently prefix-only)
+- [ ] Result pagination for large query result sets
+
 ## Quick Start
 
 ### Build

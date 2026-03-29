@@ -43,7 +43,7 @@ echo 'GET my.job' | nc localhost 5678
 ### Query Jobs
 
 ```bash
-echo 'QUERY my.*' | nc localhost 5678
+echo 'req-1 QUERY my.' | nc localhost 5678
 ```
 
 ### List Rules

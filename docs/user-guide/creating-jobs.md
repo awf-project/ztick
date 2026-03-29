@@ -168,11 +168,35 @@ r1 ERROR
 
 GET is read-only — it does not affect persistence.
 
+## Searching Jobs
+
+Use the `QUERY` command to find jobs matching a prefix pattern:
+
+```bash
+# List all jobs starting with "backup."
+echo 'r1 QUERY backup.' | socat - TCP:localhost:5678
+```
+
+Response:
+```
+r1 backup.daily planned 1743303600000000000
+r1 backup.weekly planned 1743390000000000000
+r1 OK
+```
+
+Use an empty pattern to list all jobs:
+
+```bash
+echo 'r1 QUERY ""' | socat - TCP:localhost:5678
+```
+
+QUERY is read-only — it does not generate persistence entries.
+
+
 ## Limitations
 
 The following operations are **not yet implemented**:
 - `REMOVE` — Delete a job
-- `QUERY` — List jobs matching a pattern
 
 ## Tips
 

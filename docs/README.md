@@ -12,7 +12,7 @@ Step-by-step guides for users new to ztick.
 
 Practical how-to guides for common operations.
 
-- **[Creating Jobs](user-guide/creating-jobs.md)** — Define jobs with execution times
+- **[Creating Jobs](user-guide/creating-jobs.md)** — Define jobs with execution times and query by prefix
 - **[Writing Rules](user-guide/writing-rules.md)** — Pattern-match jobs to actions
 - **[Configuration](user-guide/configuration.md)** — Set up logging, listen addresses, and persistence
 

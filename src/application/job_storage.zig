@@ -62,6 +62,20 @@ pub const JobStorage = struct {
         return self.to_execute.items[0..count];
     }
 
+    pub fn get_by_prefix(self: *const JobStorage, prefix: []const u8, allocator: std.mem.Allocator) ![]Job {
+        var result = std.ArrayListUnmanaged(Job){};
+        errdefer result.deinit(allocator);
+
+        var it = self.jobs.valueIterator();
+        while (it.next()) |job| {
+            if (std.mem.startsWith(u8, job.identifier, prefix)) {
+                try result.append(allocator, job.*);
+            }
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
     pub fn get_by_status(self: *const JobStorage, status: JobStatus, allocator: std.mem.Allocator) ![]Job {
         var result = std.ArrayListUnmanaged(Job){};
         errdefer result.deinit(allocator);
@@ -127,6 +141,58 @@ test "get_to_execute returns planned jobs ordered by execution time" {
     try std.testing.expectEqual(@as(usize, 2), result.len);
     try std.testing.expectEqualStrings("job.1", result[0].identifier);
     try std.testing.expectEqualStrings("job.3", result[1].identifier);
+}
+
+test "get_by_prefix returns jobs matching prefix" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var storage = JobStorage.init(allocator);
+    defer storage.deinit();
+
+    try storage.set(Job{ .identifier = "backup.daily", .execution = 1595586600_000000000, .status = .planned });
+    try storage.set(Job{ .identifier = "backup.weekly", .execution = 1595586660_000000000, .status = .planned });
+    try storage.set(Job{ .identifier = "deploy.prod", .execution = 1595586720_000000000, .status = .planned });
+
+    const result = try storage.get_by_prefix("backup.", allocator);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+}
+
+test "get_by_prefix returns empty slice for no match" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var storage = JobStorage.init(allocator);
+    defer storage.deinit();
+
+    try storage.set(Job{ .identifier = "backup.daily", .execution = 1595586600_000000000, .status = .planned });
+
+    const result = try storage.get_by_prefix("nonexistent.", allocator);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "get_by_prefix with empty prefix returns all jobs" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var storage = JobStorage.init(allocator);
+    defer storage.deinit();
+
+    try storage.set(Job{ .identifier = "backup.daily", .execution = 1595586600_000000000, .status = .planned });
+    try storage.set(Job{ .identifier = "deploy.prod", .execution = 1595586660_000000000, .status = .planned });
+    try storage.set(Job{ .identifier = "migrate.db", .execution = 1595586720_000000000, .status = .planned });
+
+    const result = try storage.get_by_prefix("", allocator);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
 }
 
 test "get_by_status filters by status" {
