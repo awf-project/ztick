@@ -28,7 +28,7 @@ Every command follows this structure:
 ```
 
 - `request_id` — A client-chosen identifier echoed back in the response (e.g., `req-1`, `cmd-42`)
-- `instruction` — The operation to perform (`SET`, `GET`, or `RULE SET`)
+- `instruction` — The operation to perform (`SET`, `GET`, `QUERY`, or `RULE SET`)
 - `args` — Instruction-specific arguments
 
 ## Response Format
@@ -45,7 +45,7 @@ Every command follows this structure:
 
 The `request_id` matches the one sent in the command, allowing clients to correlate responses.
 
-Write commands (`SET`, `RULE SET`) return a status-only response. Read commands (`GET`) return a response with additional data in the body after the status.
+Write commands (`SET`, `RULE SET`) return a status-only response. Read commands (`GET`) return a response with additional data in the body after the status. List commands (`QUERY`) return multiple lines followed by a terminal `OK` line.
 
 ## Error Handling
 
@@ -56,7 +56,7 @@ Write commands (`SET`, `RULE SET`) return a status-only response. Read commands 
 | Unrecognized command | Silently ignored, no response sent (see below) |
 | Out of memory | Connection closed |
 
-**Important**: Only `SET`, `GET`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
+**Important**: Only `SET`, `GET`, `QUERY`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
 
 ## Commands
 
@@ -118,6 +118,55 @@ echo 'req-6 GET no.such.job' | socat - TCP:localhost:5678
 
 **Notes**: GET is a read-only command — it does not generate any persistence log entry.
 
+### QUERY
+
+List jobs matching a prefix pattern.
+
+**Syntax**:
+```
+<request_id> QUERY <pattern>
+```
+
+**Parameters**:
+- `pattern` (string): Prefix to match against job identifiers. Use `""` (empty quoted string) to match all jobs.
+
+**Response**:
+- One line per matching job: `<request_id> <job_id> <status> <execution_ns>\n`
+- Terminal line: `<request_id> OK\n`
+- Missing pattern: `<request_id> ERROR\n`
+
+| Field | Description |
+|-------|-------------|
+| `job_id` | The matching job's identifier |
+| `status` | Job status: `planned`, `triggered`, `executed`, or `failed` |
+| `execution_ns` | Execution timestamp in nanoseconds since Unix epoch |
+
+**Examples**:
+```bash
+# Query all jobs with "backup." prefix
+echo 'req-1 QUERY backup.' | socat - TCP:localhost:5678
+# Response:
+# req-1 backup.daily planned 1711612800000000000
+# req-1 backup.weekly planned 1711872000000000000
+# req-1 OK
+
+# Query all jobs (empty pattern)
+echo 'req-2 QUERY ""' | socat - TCP:localhost:5678
+# Response: one line per job, followed by req-2 OK
+
+# Query with no matches
+echo 'req-3 QUERY nonexistent.' | socat - TCP:localhost:5678
+# Response:
+# req-3 OK
+
+# Missing pattern (error)
+echo 'req-4 QUERY' | socat - TCP:localhost:5678
+# Response:
+# req-4 ERROR
+```
+
+**Notes**: QUERY is a read-only command — it does not generate any persistence log entry. Results are returned in unspecified order (hashmap iteration order).
+
 ### RULE SET
 
 Create or update a rule that matches jobs by prefix and assigns a runner.
@@ -172,7 +221,6 @@ Escaping inside quoted strings:
 ## Unimplemented Commands
 
 The following commands are **not yet implemented**. The server silently ignores them — no response is sent and the connection remains open:
-- `QUERY` — List jobs matching a pattern
 - `REMOVE` — Delete a job
 - `REMOVERULE` — Delete a rule
 - `LISTRULES` — List all rules
@@ -197,6 +245,12 @@ echo 'r3 SET backup.weekly 1711872000000000000' | socat - TCP:localhost:5678
 # Retrieve the job's state
 echo 'r4 GET backup.daily' | socat - TCP:localhost:5678
 # r4 OK planned 1743303600000000000
+
+# Query all backup jobs
+echo 'r5 QUERY backup.' | socat - TCP:localhost:5678
+# r5 backup.daily planned 1743303600000000000
+# r5 backup.weekly planned 1711872000000000000
+# r5 OK
 ```
 
 ### Batch Operations
@@ -233,6 +287,12 @@ print(sock.recv(1024).decode())  # r1 OK
 # Schedule a job
 sock.send(b'r2 SET app.task.1 2026-03-30 14:00:00\n')
 print(sock.recv(1024).decode())  # r2 OK
+
+# Query jobs by prefix
+sock.send(b'r3 QUERY app.\n')
+print(sock.recv(4096).decode())
+# r3 app.task.1 planned 1743350400000000000
+# r3 OK
 
 sock.close()
 ```

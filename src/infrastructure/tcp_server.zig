@@ -120,7 +120,6 @@ fn handle_connection(
 ) void {
     defer stream.close();
 
-    // Create a per-connection response channel
     var response_channel = Channel(query.Response).init(allocator, 1) catch return;
     defer response_channel.deinit();
 
@@ -187,11 +186,19 @@ fn handle_connection(
                     return; // channel closed
                 }
             } else {
+                // FR-005: Send ERROR for recognized but malformed commands (e.g. QUERY without pattern)
+                if (result.args.len >= 1 and std.mem.eql(u8, result.args[0], "QUERY")) {
+                    const msg = std.fmt.allocPrint(allocator, "{s} ERROR\n", .{result.command}) catch {
+                        result.deinit(allocator);
+                        return;
+                    };
+                    defer allocator.free(msg);
+                    _ = stream.write(msg) catch {};
+                }
                 result.deinit(allocator);
             }
         }
 
-        // Move unparsed data to the front of the buffer
         if (consumed > 0) {
             const remaining = filled - consumed;
             if (remaining > 0) {
@@ -203,6 +210,12 @@ fn handle_connection(
 }
 
 fn build_instruction(allocator: std.mem.Allocator, result: parser.ParseResult) error{OutOfMemory}!?instruction.Instruction {
+    if (result.args.len >= 1 and std.mem.eql(u8, result.args[0], "QUERY")) {
+        if (result.args.len < 2) return null;
+        const pattern = try allocator.dupe(u8, result.args[1]);
+        return .{ .query = .{ .pattern = pattern } };
+    }
+
     if (result.args.len >= 2 and std.mem.eql(u8, result.args[0], "GET")) {
         const id = try allocator.dupe(u8, result.args[1]);
         return .{ .get = .{ .identifier = id } };
@@ -220,41 +233,46 @@ fn build_instruction(allocator: std.mem.Allocator, result: parser.ParseResult) e
         std.mem.eql(u8, result.args[0], "RULE") and
         std.mem.eql(u8, result.args[1], "SET"))
     {
-        const runner_type = result.args[4..];
-        if (runner_type.len >= 2 and std.mem.eql(u8, runner_type[0], "shell")) {
-            const id = try allocator.dupe(u8, result.args[2]);
-            errdefer allocator.free(id);
-            const pattern = try allocator.dupe(u8, result.args[3]);
-            errdefer allocator.free(pattern);
-            const command = try allocator.dupe(u8, runner_type[1]);
-            return .{ .rule_set = .{
-                .identifier = id,
-                .pattern = pattern,
-                .runner = .{ .shell = .{ .command = command } },
-            } };
-        }
-        if (runner_type.len >= 4 and std.mem.eql(u8, runner_type[0], "amqp")) {
-            const id = try allocator.dupe(u8, result.args[2]);
-            errdefer allocator.free(id);
-            const pattern = try allocator.dupe(u8, result.args[3]);
-            errdefer allocator.free(pattern);
-            const dsn = try allocator.dupe(u8, runner_type[1]);
-            errdefer allocator.free(dsn);
-            const exchange = try allocator.dupe(u8, runner_type[2]);
-            errdefer allocator.free(exchange);
-            const routing_key = try allocator.dupe(u8, runner_type[3]);
-            return .{ .rule_set = .{
-                .identifier = id,
-                .pattern = pattern,
-                .runner = .{ .amqp = .{
-                    .dsn = dsn,
-                    .exchange = exchange,
-                    .routing_key = routing_key,
-                } },
-            } };
-        }
+        return try build_rule_set_instruction(allocator, result.args);
     }
 
+    return null;
+}
+
+fn build_rule_set_instruction(allocator: std.mem.Allocator, args: [][]u8) error{OutOfMemory}!?instruction.Instruction {
+    const runner_type = args[4..];
+    if (runner_type.len >= 2 and std.mem.eql(u8, runner_type[0], "shell")) {
+        const id = try allocator.dupe(u8, args[2]);
+        errdefer allocator.free(id);
+        const pattern = try allocator.dupe(u8, args[3]);
+        errdefer allocator.free(pattern);
+        const command = try allocator.dupe(u8, runner_type[1]);
+        return .{ .rule_set = .{
+            .identifier = id,
+            .pattern = pattern,
+            .runner = .{ .shell = .{ .command = command } },
+        } };
+    }
+    if (runner_type.len >= 4 and std.mem.eql(u8, runner_type[0], "amqp")) {
+        const id = try allocator.dupe(u8, args[2]);
+        errdefer allocator.free(id);
+        const pattern = try allocator.dupe(u8, args[3]);
+        errdefer allocator.free(pattern);
+        const dsn = try allocator.dupe(u8, runner_type[1]);
+        errdefer allocator.free(dsn);
+        const exchange = try allocator.dupe(u8, runner_type[2]);
+        errdefer allocator.free(exchange);
+        const routing_key = try allocator.dupe(u8, runner_type[3]);
+        return .{ .rule_set = .{
+            .identifier = id,
+            .pattern = pattern,
+            .runner = .{ .amqp = .{
+                .dsn = dsn,
+                .exchange = exchange,
+                .routing_key = routing_key,
+            } },
+        } };
+    }
     return null;
 }
 
@@ -338,17 +356,44 @@ fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Ins
         .get => |g| {
             allocator.free(g.identifier);
         },
+        .query => |q| {
+            allocator.free(q.pattern);
+        },
     }
 }
 
 fn write_response(allocator: std.mem.Allocator, stream: std.net.Stream, resp: query.Response) !void {
-    const status = if (resp.success) "OK" else "ERROR";
-    const msg = if (resp.body) |body|
-        try std.fmt.allocPrint(allocator, "{s} {s} {s}\n", .{ resp.request.identifier, status, body })
-    else
-        try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ resp.request.identifier, status });
-    defer allocator.free(msg);
-    _ = try stream.write(msg);
+    switch (resp.request.instruction) {
+        .query => {
+            if (!resp.success) {
+                const msg = try std.fmt.allocPrint(allocator, "{s} ERROR\n", .{resp.request.identifier});
+                defer allocator.free(msg);
+                _ = try stream.write(msg);
+                return;
+            }
+            if (resp.body) |body| {
+                var iter = std.mem.splitScalar(u8, body, '\n');
+                while (iter.next()) |line| {
+                    if (line.len == 0) continue;
+                    const msg = try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ resp.request.identifier, line });
+                    defer allocator.free(msg);
+                    _ = try stream.write(msg);
+                }
+            }
+            const ok_line = try std.fmt.allocPrint(allocator, "{s} OK\n", .{resp.request.identifier});
+            defer allocator.free(ok_line);
+            _ = try stream.write(ok_line);
+        },
+        else => {
+            const status = if (resp.success) "OK" else "ERROR";
+            const msg = if (resp.body) |body|
+                try std.fmt.allocPrint(allocator, "{s} {s} {s}\n", .{ resp.request.identifier, status, body })
+            else
+                try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ resp.request.identifier, status });
+            defer allocator.free(msg);
+            _ = try stream.write(msg);
+        },
+    }
 }
 
 test "response router registers and deregisters clients" {
@@ -444,6 +489,64 @@ test "free_instruction_strings frees GET identifier without leak" {
     const id = try allocator.dupe(u8, "job.1");
     const instr = instruction.Instruction{ .get = .{ .identifier = id } };
     free_instruction_strings(allocator, instr);
+}
+
+test "build_instruction parses QUERY command with pattern" {
+    var args = [_][]u8{ @constCast("QUERY"), @constCast("backup.") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .query => |q| try std.testing.expectEqualStrings("backup.", q.pattern),
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction returns null for QUERY without pattern" {
+    var args = [_][]u8{@constCast("QUERY")};
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "write_response formats multi-line body with request_id prefix per line" {
+    var fds: [2]i32 = undefined;
+    const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds);
+    try std.testing.expectEqual(@as(usize, 0), rc);
+    const read_fd: std.posix.socket_t = @intCast(fds[0]);
+    const write_fd: std.posix.socket_t = @intCast(fds[1]);
+    defer std.posix.close(read_fd);
+
+    const write_stream = std.net.Stream{ .handle = write_fd };
+
+    const req = query.Request{
+        .client = 0,
+        .identifier = "req1",
+        .instruction = .{ .query = .{ .pattern = "backup." } },
+    };
+    const resp = query.Response{
+        .request = req,
+        .success = true,
+        .body = "backup.daily planned 1595586600000000000\nbackup.weekly planned 1595586660000000000\n",
+    };
+
+    try write_response(std.testing.allocator, write_stream, resp);
+    write_stream.close();
+
+    var buf: [512]u8 = undefined;
+    const n = try std.posix.read(read_fd, &buf);
+    try std.testing.expectEqualStrings(
+        "req1 backup.daily planned 1595586600000000000\nreq1 backup.weekly planned 1595586660000000000\nreq1 OK\n",
+        buf[0..n],
+    );
 }
 
 test "write_response appends body when response body is non-null" {

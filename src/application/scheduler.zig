@@ -18,9 +18,7 @@ pub const Scheduler = struct {
     rule_storage: RuleStorage,
     execution_client: ExecutionClient,
     logfile_path: ?[]const u8,
-    /// Borrowed handle — caller must keep this Dir open for the Scheduler's lifetime.
-    /// Set by `load()`, used by `append_to_logfile()` for persistence writes.
-    /// The Scheduler does not close this handle; ownership remains with the caller.
+    /// Borrowed: caller keeps this Dir open; Scheduler does not close it.
     logfile_dir: ?std.fs.Dir,
     load_arena: ?std.heap.ArenaAllocator,
     fsync_on_persist: bool,
@@ -86,11 +84,10 @@ pub const Scheduler = struct {
     pub fn handle_query(self: *Scheduler, request: Request) !Response {
         var handler = QueryHandler.init(self.allocator, &self.job_storage, &self.rule_storage);
         const response = try handler.handle(request);
+        errdefer if (response.body) |b| self.allocator.free(b);
 
-        if (response.success) {
-            if (self.logfile_path) |_| {
-                try self.append_to_logfile(request);
-            }
+        if (response.success and self.logfile_path != null) {
+            try self.append_to_logfile(request);
         }
 
         return response;
@@ -110,7 +107,7 @@ pub const Scheduler = struct {
                 .pattern = args.pattern,
                 .runner = args.runner,
             } },
-            .get => return,
+            .get, .query => return,
         };
 
         const encoded = try persistence.encoder.encode(self.allocator, entry);
@@ -344,6 +341,93 @@ test "handle_query with get instruction returns failure for missing job" {
     try std.testing.expectEqual(@as(?[]const u8, null), response.body);
 }
 
+test "handle_query with query instruction returns success with matching jobs in body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try scheduler.job_storage.set(Job{ .identifier = "backup.daily", .execution = 1595586600_000000000, .status = .planned });
+    try scheduler.job_storage.set(Job{ .identifier = "backup.weekly", .execution = 1595586660_000000000, .status = .planned });
+    try scheduler.job_storage.set(Job{ .identifier = "deploy.prod", .execution = 1595586720_000000000, .status = .planned });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-query-1",
+        .instruction = .{ .query = .{ .pattern = "backup." } },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "backup.daily") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "backup.weekly") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "deploy.prod") == null);
+}
+
+test "handle_query with query instruction returns success with null body when no jobs match" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try scheduler.job_storage.set(Job{ .identifier = "deploy.prod", .execution = 1595586720_000000000, .status = .planned });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-query-2",
+        .instruction = .{ .query = .{ .pattern = "backup." } },
+    });
+
+    try std.testing.expect(response.success);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.body);
+}
+
+test "handle_query with query instruction does not persist to logfile" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    const tmp_path = "/tmp/ztick-test-scheduler-query-no-persist.log";
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        file.close();
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
+    });
+
+    const size_after_set = try get_file_size(tmp_path);
+    try std.testing.expect(size_after_set > 0);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-query",
+        .instruction = .{ .query = .{ .pattern = "job." } },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expectEqual(size_after_set, try get_file_size(tmp_path));
+}
+
 test "handle_query with get instruction does not persist to logfile" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
@@ -369,12 +453,7 @@ test "handle_query with get instruction does not persist to logfile" {
         .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
     });
 
-    const size_after_set = blk: {
-        const file = try std.fs.cwd().openFile(tmp_path, .{});
-        defer file.close();
-        const stat = try file.stat();
-        break :blk stat.size;
-    };
+    const size_after_set = try get_file_size(tmp_path);
     try std.testing.expect(size_after_set > 0);
 
     const response = try scheduler.handle_query(Request{
@@ -384,14 +463,7 @@ test "handle_query with get instruction does not persist to logfile" {
     });
     defer if (response.body) |b| allocator.free(b);
 
-    const size_after_get = blk: {
-        const file = try std.fs.cwd().openFile(tmp_path, .{});
-        defer file.close();
-        const stat = try file.stat();
-        break :blk stat.size;
-    };
-
-    try std.testing.expectEqual(size_after_set, size_after_get);
+    try std.testing.expectEqual(size_after_set, try get_file_size(tmp_path));
 }
 
 test "double load deinits previous arena without leak" {
@@ -433,4 +505,11 @@ test "double load deinits previous arena without leak" {
         try std.testing.expect(job != null);
         try std.testing.expectEqual(@as(i64, 1000), job.?.execution);
     }
+}
+
+fn get_file_size(path: []const u8) !u64 {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    const stat = try file.stat();
+    return stat.size;
 }

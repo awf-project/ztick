@@ -14,6 +14,9 @@ pub const Instruction = union(enum) {
     get: struct {
         identifier: []const u8,
     },
+    query: struct {
+        pattern: []const u8,
+    },
 };
 
 test "set instruction stores identifier and execution timestamp" {
@@ -39,4 +42,16 @@ test "get instruction stores identifier" {
     const instr = Instruction{ .get = .{ .identifier = "job.1" } };
     try std.testing.expectEqualStrings("job.1", instr.get.identifier);
     try std.testing.expectEqual(std.meta.Tag(Instruction).get, std.meta.activeTag(instr));
+}
+
+test "query instruction stores pattern" {
+    const instr = Instruction{ .query = .{ .pattern = "backup." } };
+    try std.testing.expectEqualStrings("backup.", instr.query.pattern);
+    try std.testing.expectEqual(std.meta.Tag(Instruction).query, std.meta.activeTag(instr));
+}
+
+test "query instruction accepts empty pattern" {
+    const instr = Instruction{ .query = .{ .pattern = "" } };
+    try std.testing.expectEqualStrings("", instr.query.pattern);
+    try std.testing.expectEqual(std.meta.Tag(Instruction).query, std.meta.activeTag(instr));
 }
