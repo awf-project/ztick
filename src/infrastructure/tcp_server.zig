@@ -48,20 +48,20 @@ pub const ResponseRouter = struct {
 pub const TcpServer = struct {
     allocator: std.mem.Allocator,
     address: []const u8,
-    threads: std.ArrayListUnmanaged(std.Thread),
+    active_connections: std.atomic.Value(usize),
     running: *std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, address: []const u8, running: *std.atomic.Value(bool)) TcpServer {
         return .{
             .allocator = allocator,
             .address = address,
-            .threads = std.ArrayListUnmanaged(std.Thread){},
+            .active_connections = std.atomic.Value(usize).init(0),
             .running = running,
         };
     }
 
     pub fn deinit(self: *TcpServer) void {
-        self.threads.deinit(self.allocator);
+        _ = self;
     }
 
     pub fn start(
@@ -87,29 +87,43 @@ pub const TcpServer = struct {
             const client_id = next_client_id;
             next_client_id +%= 1;
 
-            const thread = std.Thread.spawn(.{}, handle_connection, .{
+            _ = self.active_connections.fetchAdd(1, .release);
+            const thread = std.Thread.spawn(.{}, connection_worker, .{
+                &self.active_connections,
                 self.allocator,
                 conn.stream,
                 client_id,
                 request_channel,
                 response_router,
             }) catch {
+                _ = self.active_connections.fetchSub(1, .release);
                 conn.stream.close();
                 continue;
             };
-            self.threads.append(self.allocator, thread) catch continue;
+            thread.detach();
         }
 
         server.deinit();
     }
 
     pub fn join_all(self: *TcpServer) void {
-        for (self.threads.items) |thread| {
-            thread.join();
+        while (self.active_connections.load(.acquire) > 0) {
+            std.Thread.sleep(1_000_000); // 1ms
         }
-        self.threads.clearAndFree(self.allocator);
     }
 };
+
+fn connection_worker(
+    active_connections: *std.atomic.Value(usize),
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    client_id: u128,
+    request_channel: *Channel(query.Request),
+    response_router: *ResponseRouter,
+) void {
+    defer _ = active_connections.fetchSub(1, .release);
+    handle_connection(allocator, stream, client_id, request_channel, response_router);
+}
 
 fn handle_connection(
     allocator: std.mem.Allocator,
@@ -186,8 +200,11 @@ fn handle_connection(
                     return; // channel closed
                 }
             } else {
-                // FR-005: Send ERROR for recognized but malformed commands (e.g. QUERY without pattern)
-                if (result.args.len >= 1 and std.mem.eql(u8, result.args[0], "QUERY")) {
+                // Send ERROR for recognized commands missing required arguments (QUERY, REMOVE, REMOVERULE)
+                if (result.args.len >= 1 and (std.mem.eql(u8, result.args[0], "QUERY") or
+                    std.mem.eql(u8, result.args[0], "REMOVE") or
+                    std.mem.eql(u8, result.args[0], "REMOVERULE")))
+                {
                     const msg = std.fmt.allocPrint(allocator, "{s} ERROR\n", .{result.command}) catch {
                         result.deinit(allocator);
                         return;
@@ -234,6 +251,16 @@ fn build_instruction(allocator: std.mem.Allocator, result: parser.ParseResult) e
         std.mem.eql(u8, result.args[1], "SET"))
     {
         return try build_rule_set_instruction(allocator, result.args);
+    }
+
+    if (result.args.len >= 2 and std.mem.eql(u8, result.args[0], "REMOVE")) {
+        const id = try allocator.dupe(u8, result.args[1]);
+        return .{ .remove = .{ .identifier = id } };
+    }
+
+    if (result.args.len >= 2 and std.mem.eql(u8, result.args[0], "REMOVERULE")) {
+        const id = try allocator.dupe(u8, result.args[1]);
+        return .{ .remove_rule = .{ .identifier = id } };
     }
 
     return null;
@@ -358,6 +385,12 @@ fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Ins
         },
         .query => |q| {
             allocator.free(q.pattern);
+        },
+        .remove => |r| {
+            allocator.free(r.identifier);
+        },
+        .remove_rule => |r| {
+            allocator.free(r.identifier);
         },
     }
 }
@@ -547,6 +580,65 @@ test "write_response formats multi-line body with request_id prefix per line" {
         "req1 backup.daily planned 1595586600000000000\nreq1 backup.weekly planned 1595586660000000000\nreq1 OK\n",
         buf[0..n],
     );
+}
+
+test "build_instruction parses REMOVE command with identifier" {
+    var args = [_][]u8{ @constCast("REMOVE"), @constCast("backup-daily") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .remove => |r| try std.testing.expectEqualStrings("backup-daily", r.identifier),
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction returns null for REMOVE without identifier" {
+    var args = [_][]u8{@constCast("REMOVE")};
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "build_instruction parses REMOVERULE command with identifier" {
+    var args = [_][]u8{ @constCast("REMOVERULE"), @constCast("notify-slack") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .remove_rule => |r| try std.testing.expectEqualStrings("notify-slack", r.identifier),
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction returns null for REMOVERULE without identifier" {
+    var args = [_][]u8{@constCast("REMOVERULE")};
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "free_instruction_strings frees REMOVE identifier without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "backup-daily");
+    const instr = instruction.Instruction{ .remove = .{ .identifier = id } };
+    free_instruction_strings(allocator, instr);
 }
 
 test "write_response appends body when response body is non-null" {

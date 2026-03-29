@@ -156,6 +156,45 @@ test "rule set via query enables subsequent job execution" {
     try std.testing.expectEqual(JobStatus.executed, scheduler.job_storage.get("deploy.release.1").?.status);
 }
 
+fn build_logfile_bytes(allocator: std.mem.Allocator, entries: []const persistence_encoder.Entry) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+
+    for (entries) |entry| {
+        const enc = try persistence_encoder.encode(allocator, entry);
+        defer allocator.free(enc);
+        const framed = try persistence_logfile.encode(allocator, enc);
+        defer allocator.free(framed);
+        try out.appendSlice(allocator, framed);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn replay_into_scheduler(allocator: std.mem.Allocator, data: []const u8, scheduler: *Scheduler) !std.heap.ArenaAllocator {
+    const parsed = try persistence_logfile.parse(allocator, data);
+    defer {
+        for (parsed.entries) |e| allocator.free(e);
+        allocator.free(parsed.entries);
+    }
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+
+    for (parsed.entries) |entry| {
+        const decoded = try persistence_encoder.decode(arena, entry);
+        switch (decoded) {
+            .job => |j| try scheduler.job_storage.set(j),
+            .rule => |r| try scheduler.rule_storage.set(r),
+            .job_removal => |r| _ = scheduler.job_storage.delete(r.identifier),
+            .rule_removal => |r| _ = scheduler.rule_storage.delete(r.identifier),
+        }
+    }
+
+    return decode_arena;
+}
+
 test "persisted state restores into scheduler and resumes execution" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -168,42 +207,17 @@ test "persisted state restores into scheduler and resumes execution" {
         .runner = .{ .shell = .{ .command = "/bin/true" } },
     };
 
-    const enc_job = try persistence_encoder.encode(allocator, .{ .job = original_job });
-    defer allocator.free(enc_job);
-    const enc_rule = try persistence_encoder.encode(allocator, .{ .rule = original_rule });
-    defer allocator.free(enc_rule);
-
-    const lf_job = try persistence_logfile.encode(allocator, enc_job);
-    defer allocator.free(lf_job);
-    const lf_rule = try persistence_logfile.encode(allocator, enc_rule);
-    defer allocator.free(lf_rule);
-
-    const combined = try allocator.alloc(u8, lf_job.len + lf_rule.len);
-    defer allocator.free(combined);
-    @memcpy(combined[0..lf_job.len], lf_job);
-    @memcpy(combined[lf_job.len..], lf_rule);
-
-    const parsed = try persistence_logfile.parse(allocator, combined);
-    defer {
-        for (parsed.entries) |e| allocator.free(e);
-        allocator.free(parsed.entries);
-    }
-
-    // Arena owns all decoded string allocations, matching Scheduler.load() pattern
-    var decode_arena = std.heap.ArenaAllocator.init(allocator);
-    defer decode_arena.deinit();
-    const arena = decode_arena.allocator();
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = original_job },
+        .{ .rule = original_rule },
+    });
+    defer allocator.free(logfile_data);
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
-    for (parsed.entries) |entry| {
-        const decoded = try persistence_encoder.decode(arena, entry);
-        switch (decoded) {
-            .job => |j| try scheduler.job_storage.set(j),
-            .rule => |r| try scheduler.rule_storage.set(r),
-        }
-    }
+    var decode_arena = try replay_into_scheduler(allocator, logfile_data, &scheduler);
+    defer decode_arena.deinit();
 
     const restored = scheduler.job_storage.get("app.restore.1");
     try std.testing.expect(restored != null);
@@ -413,6 +427,110 @@ test "query no match returns success with null body" {
 
     try std.testing.expect(response.success);
     try std.testing.expectEqual(@as(?[]const u8, null), response.body);
+}
+
+test "SET then REMOVE then GET returns absent" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set",
+        .instruction = .{ .set = .{ .identifier = "backup.daily", .execution = 1595586600000000000 } },
+    });
+
+    const present = scheduler.job_storage.get("backup.daily");
+    try std.testing.expect(present != null);
+
+    const remove_resp = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-remove",
+        .instruction = .{ .remove = .{ .identifier = "backup.daily" } },
+    });
+    try std.testing.expect(remove_resp.success);
+
+    const get_resp = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-get",
+        .instruction = .{ .get = .{ .identifier = "backup.daily" } },
+    });
+
+    try std.testing.expect(!get_resp.success);
+    try std.testing.expectEqual(@as(?[]const u8, null), get_resp.body);
+}
+
+test "RULE SET then REMOVERULE then rule is absent" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-rule-set",
+        .instruction = .{ .rule_set = .{
+            .identifier = "notify-slack",
+            .pattern = "deploy.",
+            .runner = .{ .shell = .{ .command = "/bin/notify" } },
+        } },
+    });
+
+    try std.testing.expect(scheduler.rule_storage.get("notify-slack") != null);
+
+    const remove_resp = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-rule-remove",
+        .instruction = .{ .remove_rule = .{ .identifier = "notify-slack" } },
+    });
+    try std.testing.expect(remove_resp.success);
+
+    try std.testing.expectEqual(@as(?Rule, null), scheduler.rule_storage.get("notify-slack"));
+}
+
+test "SET then REMOVE persisted and replayed leaves job absent" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "cleanup.daily", .execution = 1595586600000000000, .status = .planned } },
+        .{ .job_removal = .{ .identifier = "cleanup.daily" } },
+    });
+    defer allocator.free(logfile_data);
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var decode_arena = try replay_into_scheduler(allocator, logfile_data, &scheduler);
+    defer decode_arena.deinit();
+
+    try std.testing.expectEqual(@as(?Job, null), scheduler.job_storage.get("cleanup.daily"));
+}
+
+test "RULE SET then REMOVERULE persisted and replayed leaves rule absent" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = .{ .identifier = "notify-oncall", .pattern = "alert.", .runner = .{ .shell = .{ .command = "/bin/notify" } } } },
+        .{ .rule_removal = .{ .identifier = "notify-oncall" } },
+    });
+    defer allocator.free(logfile_data);
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var decode_arena = try replay_into_scheduler(allocator, logfile_data, &scheduler);
+    defer decode_arena.deinit();
+
+    try std.testing.expectEqual(@as(?Rule, null), scheduler.rule_storage.get("notify-oncall"));
 }
 
 test "execution failure marks triggered job as failed" {

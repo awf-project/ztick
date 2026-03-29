@@ -57,6 +57,8 @@
 - Copy storage results into owned allocation before mutation; never iterate and mutate simultaneously
 - Close channels before joining threads to prevent deadlocks; document shutdown sequence explicitly
 - Try openFile(.write_only) first, fall back to createFile for new logfiles; handles both append and initialization
+- Pre-allocate capacity in thread tracking list before spawning; ensure append cannot fail due to OOM and orphan spawned threads
+- Remove thread handles from tracking list after joining; never accumulate handles indefinitely as this causes O(n) memory growth
 
 ## Test Conventions
 

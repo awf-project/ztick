@@ -69,8 +69,14 @@ pub fn compress(allocator: std.mem.Allocator, dir: std.fs.Dir, filenames: Filena
         allocator.free(entry_ids);
     }
 
+    // First pass: record each ID's last position and flag IDs whose last entry is a removal.
+    // Three structures track this: entry_ids maps index→decoded ID, last_index maps ID→last
+    // position, removed_ids collects IDs whose final entry is a removal type.
     var last_index = std.StringHashMap(usize).init(allocator);
     defer last_index.deinit();
+
+    var removed_ids = std.StringHashMap(void).init(allocator);
+    defer removed_ids.deinit();
 
     for (parsed.entries, 0..) |entry, i| {
         const decoded = encoder.decode(allocator, entry) catch {
@@ -81,11 +87,18 @@ pub fn compress(allocator: std.mem.Allocator, dir: std.fs.Dir, filenames: Filena
         const id = switch (decoded) {
             .job => |j| j.identifier,
             .rule => |r| r.identifier,
+            .job_removal => |r| r.identifier,
+            .rule_removal => |r| r.identifier,
         };
         entry_ids[i] = id;
         last_index.put(id, i) catch return error.Failure;
+        switch (decoded) {
+            .job_removal, .rule_removal => removed_ids.put(id, {}) catch return error.Failure,
+            else => _ = removed_ids.remove(id),
+        }
     }
 
+    // Second pass: emit only entries at their last position whose ID is not flagged as removed.
     var out = std.ArrayListUnmanaged(u8){};
     defer out.deinit(allocator);
 
@@ -94,6 +107,7 @@ pub fn compress(allocator: std.mem.Allocator, dir: std.fs.Dir, filenames: Filena
         if (maybe_id) |id| {
             const last = last_index.get(id) orelse continue;
             if (last != i) continue;
+            if (removed_ids.contains(id)) continue;
         }
         const framed = logfile.encode(allocator, entry) catch return error.Failure;
         defer allocator.free(framed);
@@ -162,6 +176,82 @@ test "compress succeeds with empty logfile.to_compress" {
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(default_filenames.source));
     _ = try tmp.dir.statFile(default_filenames.dest);
+}
+
+test "compress excludes job whose last entry is a removal" {
+    const default_filenames: Filenames = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const job_raw = try encoder.encode(std.testing.allocator, .{ .job = .{
+        .identifier = "job1",
+        .execution = 100,
+        .status = .planned,
+    } });
+    defer std.testing.allocator.free(job_raw);
+    const removal_raw = try encoder.encode(std.testing.allocator, .{ .job_removal = .{ .identifier = "job1" } });
+    defer std.testing.allocator.free(removal_raw);
+
+    const framed_job = try logfile.encode(std.testing.allocator, job_raw);
+    defer std.testing.allocator.free(framed_job);
+    const framed_removal = try logfile.encode(std.testing.allocator, removal_raw);
+    defer std.testing.allocator.free(framed_removal);
+
+    {
+        const f = try tmp.dir.createFile(default_filenames.source, .{});
+        defer f.close();
+        try f.writeAll(framed_job);
+        try f.writeAll(framed_removal);
+    }
+
+    try compress(std.testing.allocator, tmp.dir, default_filenames);
+
+    const compressed = try tmp.dir.readFileAlloc(std.testing.allocator, default_filenames.dest, 1024 * 1024);
+    defer std.testing.allocator.free(compressed);
+    const parsed = try logfile.parse(std.testing.allocator, compressed);
+    defer {
+        for (parsed.entries) |e| std.testing.allocator.free(e);
+        std.testing.allocator.free(parsed.entries);
+    }
+    try std.testing.expectEqual(@as(usize, 0), parsed.entries.len);
+}
+
+test "compress excludes rule whose last entry is a removal" {
+    const default_filenames: Filenames = .{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rule_raw = try encoder.encode(std.testing.allocator, .{ .rule = .{
+        .identifier = "rule1",
+        .pattern = "job-*",
+        .runner = .{ .shell = .{ .command = "echo" } },
+    } });
+    defer std.testing.allocator.free(rule_raw);
+    const removal_raw = try encoder.encode(std.testing.allocator, .{ .rule_removal = .{ .identifier = "rule1" } });
+    defer std.testing.allocator.free(removal_raw);
+
+    const framed_rule = try logfile.encode(std.testing.allocator, rule_raw);
+    defer std.testing.allocator.free(framed_rule);
+    const framed_removal = try logfile.encode(std.testing.allocator, removal_raw);
+    defer std.testing.allocator.free(framed_removal);
+
+    {
+        const f = try tmp.dir.createFile(default_filenames.source, .{});
+        defer f.close();
+        try f.writeAll(framed_rule);
+        try f.writeAll(framed_removal);
+    }
+
+    try compress(std.testing.allocator, tmp.dir, default_filenames);
+
+    const compressed = try tmp.dir.readFileAlloc(std.testing.allocator, default_filenames.dest, 1024 * 1024);
+    defer std.testing.allocator.free(compressed);
+    const parsed = try logfile.parse(std.testing.allocator, compressed);
+    defer {
+        for (parsed.entries) |e| std.testing.allocator.free(e);
+        std.testing.allocator.free(parsed.entries);
+    }
+    try std.testing.expectEqual(@as(usize, 0), parsed.entries.len);
 }
 
 test "compress deduplicates entries keeping latest" {

@@ -103,6 +103,30 @@ Breakdown:
 - `0004` = command length 4
 - `74697469` = "titi" (UTF-8)
 
+### Type 2: Job Removal Entry
+
+Marks a job as removed. Contains only the identifier — no timestamp or status.
+
+```
+[1 byte: type = 2]
+[2 bytes: identifier length (big-endian u16)]
+[L bytes: identifier string (UTF-8)]
+```
+
+During logfile replay, a job removal entry causes the corresponding job to be deleted from `JobStorage`. During background compression, if the last entry for an ID is a removal, the ID is excluded entirely from the compressed output.
+
+### Type 3: Rule Removal Entry
+
+Marks a rule as removed. Contains only the identifier.
+
+```
+[1 byte: type = 3]
+[2 bytes: identifier length (big-endian u16)]
+[L bytes: identifier string (UTF-8)]
+```
+
+Behaves identically to job removal: during replay the rule is deleted from `RuleStorage`, and during compression the ID is excluded from output.
+
 ## Encoding Details
 
 ### String Encoding
@@ -227,6 +251,12 @@ while (true) {
         1 => {
             // Parse Rule
         },
+        2 => {
+            // Parse Job Removal (identifier only)
+        },
+        3 => {
+            // Parse Rule Removal (identifier only)
+        },
         else => return error.UnknownEntryType,
     }
 }
@@ -265,8 +295,8 @@ return error.StringOverflow
 On startup, ztick reads the entire logfile:
 
 1. Parse the raw bytes into length-prefixed frames
-2. Decode each frame into a Job or Rule entry
-3. Load Job entries into `JobStorage`, Rule entries into `RuleStorage`
+2. Decode each frame into a Job, Rule, Job Removal, or Rule Removal entry
+3. Load Job entries into `JobStorage`, Rule entries into `RuleStorage`; removal entries delete the corresponding entry from storage
 
 If a frame is incomplete (e.g., truncated write from a crash), the parser stops and returns the remaining unparsed bytes — it does not skip ahead. If a complete frame contains invalid data, decoding returns `InvalidData` and loading stops. This means corruption at any point truncates the log at that position; entries after the corruption are lost.
 
@@ -287,6 +317,7 @@ Typical entry sizes:
 | Job (long id) | 50-100 bytes |
 | Rule (short pattern, short command) | 40-60 bytes |
 | Rule (long pattern, long command) | 100-200 bytes |
+| Job/Rule Removal | 10-30 bytes |
 
 With 10,000 jobs and 100 rules, expect ~300 KB logfile.
 

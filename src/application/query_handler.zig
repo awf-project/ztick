@@ -65,6 +65,8 @@ pub const QueryHandler = struct {
                 const body = try body_buf.toOwnedSlice(self.allocator);
                 return Response{ .request = request, .success = true, .body = body };
             },
+            .remove => |args| self.job_storage.delete(args.identifier),
+            .remove_rule => |args| self.rule_storage.delete(args.identifier),
         };
 
         return Response{ .request = request, .success = success };
@@ -264,4 +266,98 @@ test "handle query instruction with empty pattern returns all jobs" {
     try std.testing.expect(response.body != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "backup.daily") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "deploy.prod") != null);
+}
+
+test "handle remove instruction removes existing job and returns success" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    try job_storage.set(.{ .identifier = "backup-daily", .execution = 1595586600_000000000, .status = .planned });
+
+    const request = Request{
+        .client = 8,
+        .identifier = "req-8",
+        .instruction = .{ .remove = .{ .identifier = "backup-daily" } },
+    };
+
+    const response = try handler.handle(request);
+    try std.testing.expect(response.success);
+    try std.testing.expect(job_storage.get("backup-daily") == null);
+}
+
+test "handle remove instruction returns failure for missing job" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    const request = Request{
+        .client = 9,
+        .identifier = "req-9",
+        .instruction = .{ .remove = .{ .identifier = "nonexistent" } },
+    };
+
+    const response = try handler.handle(request);
+    try std.testing.expect(!response.success);
+}
+
+test "handle remove_rule instruction removes existing rule and returns success" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    try rule_storage.set(.{ .identifier = "notify-slack", .pattern = "deploy.", .runner = .{ .shell = .{ .command = "notify" } } });
+
+    const request = Request{
+        .client = 10,
+        .identifier = "req-10",
+        .instruction = .{ .remove_rule = .{ .identifier = "notify-slack" } },
+    };
+
+    const response = try handler.handle(request);
+    try std.testing.expect(response.success);
+    try std.testing.expect(rule_storage.get("notify-slack") == null);
+}
+
+test "handle remove_rule instruction returns failure for missing rule" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    const request = Request{
+        .client = 11,
+        .identifier = "req-11",
+        .instruction = .{ .remove_rule = .{ .identifier = "ghost-rule" } },
+    };
+
+    const response = try handler.handle(request);
+    try std.testing.expect(!response.success);
 }
