@@ -2,6 +2,7 @@
 zig-out/
 zig-cache/
 .zig-cache/
+logfile
 
 # IDE
 *.swp
@@ -11,10 +12,6 @@ zig-cache/
 .env
 .env.local
 *.env
-
-# AWF runtime data
-.awf/storage/states/
-.awf/storage/logs/
 
 # Temporary files
 *.tmp

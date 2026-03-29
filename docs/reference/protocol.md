@@ -28,13 +28,14 @@ Every command follows this structure:
 ```
 
 - `request_id` — A client-chosen identifier echoed back in the response (e.g., `req-1`, `cmd-42`)
-- `instruction` — The operation to perform (`SET` or `RULE SET`)
+- `instruction` — The operation to perform (`SET`, `GET`, or `RULE SET`)
 - `args` — Instruction-specific arguments
 
 ## Response Format
 
 ```
 <request_id> <status>\n
+<request_id> <status> <body>\n
 ```
 
 | Status | Meaning |
@@ -43,6 +44,8 @@ Every command follows this structure:
 | `ERROR` | Command failed (e.g., storage error) |
 
 The `request_id` matches the one sent in the command, allowing clients to correlate responses.
+
+Write commands (`SET`, `RULE SET`) return a status-only response. Read commands (`GET`) return a response with additional data in the body after the status.
 
 ## Error Handling
 
@@ -53,7 +56,7 @@ The `request_id` matches the one sent in the command, allowing clients to correl
 | Unrecognized command | Silently ignored, no response sent (see below) |
 | Out of memory | Connection closed |
 
-**Important**: Only `SET` and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
+**Important**: Only `SET`, `GET`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
 
 ## Commands
 
@@ -80,6 +83,40 @@ echo 'req-1 SET backup.daily 1711612800000000000' | socat - TCP:localhost:5678
 echo 'req-2 SET app.task.1 2026-03-30 14:00:00' | socat - TCP:localhost:5678
 # Response: req-2 OK
 ```
+
+### GET
+
+Retrieve a job's current state.
+
+**Syntax**:
+```
+<request_id> GET <job_identifier>
+```
+
+**Parameters**:
+- `job_identifier` (string): The job identifier to look up (e.g., `backup.daily`)
+
+**Response**:
+- Success: `<request_id> OK <status> <execution_ns>\n`
+- Not found: `<request_id> ERROR\n`
+
+| Field | Description |
+|-------|-------------|
+| `status` | Job status: `planned`, `triggered`, `executed`, or `failed` |
+| `execution_ns` | Execution timestamp in nanoseconds since Unix epoch |
+
+**Examples**:
+```bash
+# Get a job's state
+echo 'req-5 GET backup.daily' | socat - TCP:localhost:5678
+# Response: req-5 OK planned 1711612800000000000
+
+# Get a nonexistent job
+echo 'req-6 GET no.such.job' | socat - TCP:localhost:5678
+# Response: req-6 ERROR
+```
+
+**Notes**: GET is a read-only command — it does not generate any persistence log entry.
 
 ### RULE SET
 
@@ -135,7 +172,6 @@ Escaping inside quoted strings:
 ## Unimplemented Commands
 
 The following commands are **not yet implemented**. The server silently ignores them — no response is sent and the connection remains open:
-- `GET` — Retrieve a job's state
 - `QUERY` — List jobs matching a pattern
 - `REMOVE` — Delete a job
 - `REMOVERULE` — Delete a rule
@@ -157,6 +193,10 @@ echo 'r2 SET backup.daily 2026-03-30 02:00:00' | socat - TCP:localhost:5678
 # Schedule another job with nanosecond timestamp
 echo 'r3 SET backup.weekly 1711872000000000000' | socat - TCP:localhost:5678
 # r3 OK
+
+# Retrieve the job's state
+echo 'r4 GET backup.daily' | socat - TCP:localhost:5678
+# r4 OK planned 1743303600000000000
 ```
 
 ### Batch Operations

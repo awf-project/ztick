@@ -11,6 +11,9 @@ pub const Instruction = union(enum) {
         pattern: []const u8,
         runner: runner.Runner,
     },
+    get: struct {
+        identifier: []const u8,
+    },
 };
 
 test "set instruction stores identifier and execution timestamp" {
@@ -30,4 +33,10 @@ test "rule_set instruction stores identifier pattern and runner" {
     try std.testing.expectEqualStrings("job.", instr.rule_set.pattern);
     try std.testing.expectEqualStrings("echo", instr.rule_set.runner.shell.command);
     try std.testing.expectEqual(std.meta.Tag(Instruction).rule_set, std.meta.activeTag(instr));
+}
+
+test "get instruction stores identifier" {
+    const instr = Instruction{ .get = .{ .identifier = "job.1" } };
+    try std.testing.expectEqualStrings("job.1", instr.get.identifier);
+    try std.testing.expectEqual(std.meta.Tag(Instruction).get, std.meta.activeTag(instr));
 }

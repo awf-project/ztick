@@ -3,6 +3,8 @@ const domain = @import("../../domain.zig");
 
 pub const DecodeError = error{InvalidData};
 
+/// Persisted entry types. GET instructions are read-only and skipped at the
+/// scheduler layer (scheduler.zig:append_to_logfile), so no encoder variant is needed.
 pub const Entry = union(enum) {
     job: domain.job.Job,
     rule: domain.rule.Rule,
