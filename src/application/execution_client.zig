@@ -154,6 +154,41 @@ test "pull_results drains tracked executions" {
     try std.testing.expectEqual(@as(usize, 0), second.len);
 }
 
+test "resolve does not propagate allocation error to caller" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var client = ExecutionClient.init(allocator);
+    defer client.deinit();
+
+    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } });
+    const identifier = client.pending.items[0].identifier;
+
+    client.resolve(.{ .identifier = identifier, .success = true });
+
+    try std.testing.expectEqual(@as(usize, 1), client.resolved.items.len);
+}
+
+test "resolve silently discards result on allocation failure" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    // fail_index = 2: allows 2 allocations (triggered.put + pending.append in trigger)
+    // then fails on resolved.append inside resolve
+    var failing = std.testing.FailingAllocator.init(gpa.allocator(), .{ .fail_index = 2 });
+    var client = ExecutionClient.init(failing.allocator());
+    defer client.deinit();
+
+    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } });
+    const identifier = client.pending.items[0].identifier;
+
+    // resolve must not panic — silent catch handles OOM
+    client.resolve(.{ .identifier = identifier, .success = true });
+
+    try std.testing.expectEqual(@as(usize, 0), client.resolved.items.len);
+}
+
 test "drain_pending clears only sent prefix on channel closed" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

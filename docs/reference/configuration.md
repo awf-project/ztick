@@ -16,15 +16,15 @@ Logging configuration.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `level` | string | `"info"` | Log verbosity: `off`, `error`, `warn`, `info`, `debug`, `trace` |
+| `level` | string | `"info"` | Log verbosity threshold: `off`, `error`, `warn`, `info`, `debug`, `trace`. Messages at or above this level are written to stderr; messages below are suppressed. |
 
-**Levels**:
-- `off` — No output (silent)
-- `error` — Output errors only (most quiet)
-- `warn` — Warnings and errors
-- `info` — General information (recommended for production)
-- `debug` — Detailed debugging output
-- `trace` — Maximum verbosity (most verbose)
+**Levels** (ordered from least to most verbose):
+- `off` — All log output suppressed, including startup messages
+- `error` — Errors only (e.g. controller start failures)
+- `warn` — Warnings and above (e.g. database load failures)
+- `info` — Startup info (config path, log level, listen address, loaded job/rule counts), client connect/disconnect, and above (recommended for production)
+- `debug` — Instruction receipt, execution outcomes, and above
+- `trace` — Maximum verbosity (maps to debug internally)
 
 ### `[controller]`
 
@@ -45,6 +45,7 @@ Persistence and scheduling configuration.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `logfile_path` | string | `"logfile"` | Path to the append-only persistence logfile |
 | `fsync_on_persist` | bool | `true` | Call fsync after each persistence write (safer, slower) |
 | `framerate` | integer | `512` | Scheduler tick rate in Hz (valid range: 1-65535) |
 
@@ -63,6 +64,7 @@ level = "debug"
 listen = "0.0.0.0:9000"
 
 [database]
+logfile_path = "data/ztick.log"
 fsync_on_persist = false
 framerate = 100
 ```

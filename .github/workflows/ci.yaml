@@ -16,7 +16,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.1
+          version: latest
 
       - name: Check formatting
         run: zig fmt --check .
@@ -28,7 +28,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.1
+          version: latest
 
       - name: Run tests
         run: zig build test
@@ -41,7 +41,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.1
+          version: latest
 
       - name: Build release
         run: zig build -Doptimize=ReleaseSafe

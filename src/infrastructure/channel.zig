@@ -72,6 +72,19 @@ pub fn Channel(comptime T: type) type {
             self.not_full.broadcast();
         }
 
+        pub const TrySendError = error{ ChannelClosed, ChannelFull };
+
+        pub fn try_send(self: *Self, item: T) TrySendError!void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.closed) return error.ChannelClosed;
+            if (self.count == self.capacity) return error.ChannelFull;
+            self.buffer[self.tail] = item;
+            self.tail = (self.tail + 1) % self.capacity;
+            self.count += 1;
+            self.not_empty.signal();
+        }
+
         pub fn try_receive(self: *Self) ?T {
             self.mutex.lock();
             defer self.mutex.unlock();
