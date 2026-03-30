@@ -40,7 +40,7 @@ pub const ResponseRouter = struct {
         const channel = self.channels.get(response.request.client);
         self.mutex.unlock();
         if (channel) |ch| {
-            ch.send(response) catch {};
+            ch.try_send(response) catch {};
         }
     }
 };
@@ -92,6 +92,7 @@ pub const TcpServer = struct {
                 &self.active_connections,
                 self.allocator,
                 conn.stream,
+                conn.address,
                 client_id,
                 request_channel,
                 response_router,
@@ -117,21 +118,25 @@ fn connection_worker(
     active_connections: *std.atomic.Value(usize),
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
+    address: std.net.Address,
     client_id: u128,
     request_channel: *Channel(query.Request),
     response_router: *ResponseRouter,
 ) void {
     defer _ = active_connections.fetchSub(1, .release);
-    handle_connection(allocator, stream, client_id, request_channel, response_router);
+    handle_connection(allocator, stream, address, client_id, request_channel, response_router);
 }
 
 fn handle_connection(
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
+    address: std.net.Address,
     client_id: u128,
     request_channel: *Channel(query.Request),
     response_router: *ResponseRouter,
 ) void {
+    std.log.info("client connected: {f}", .{address});
+    defer std.log.info("client disconnected: {f}", .{address});
     defer stream.close();
 
     var response_channel = Channel(query.Response).init(allocator, 1) catch return;
@@ -171,6 +176,7 @@ fn handle_connection(
                 result.deinit(allocator);
                 return;
             }) |instr| {
+                std.log.debug("instruction received: {s}", .{@tagName(instr)});
                 // Instruction owns duped strings; free all parsed args uniformly.
                 for (result.args) |arg| allocator.free(arg);
                 allocator.free(result.args);
@@ -188,7 +194,6 @@ fn handle_connection(
                     return;
                 };
 
-                // Wait for response and write back to client
                 if (response_channel.receive()) |resp| {
                     write_response(allocator, stream, resp) catch {};
                     // Free only the request_id (result.command) — not stored by scheduler.
@@ -735,6 +740,168 @@ test "write_response formats list_rules multi-line body with request_id prefix" 
     try std.testing.expect(std.mem.endsWith(u8, output, "r1 OK\n"));
 }
 
+test "handle_connection exits cleanly when client disconnects immediately" {
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    pair.write_stream.close();
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    handle_connection(
+        std.testing.allocator,
+        std.net.Stream{ .handle = pair.read_fd },
+        addr,
+        42,
+        &req_ch,
+        &router,
+    );
+}
+
+test "handle_connection deregisters client from router on disconnect" {
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    pair.write_stream.close();
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    handle_connection(
+        std.testing.allocator,
+        std.net.Stream{ .handle = pair.read_fd },
+        addr,
+        77,
+        &req_ch,
+        &router,
+    );
+
+    router.mutex.lock();
+    const count = router.channels.count();
+    router.mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "build_instruction parses SET command with integer timestamp" {
+    var args = [_][]u8{ @constCast("SET"), @constCast("backup.daily"), @constCast("1595586600000000000") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .set => |s| {
+            try std.testing.expectEqualStrings("backup.daily", s.identifier);
+            try std.testing.expectEqual(@as(i64, 1595586600000000000), s.execution);
+        },
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction parses RULE SET command with shell runner" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.backup"), @constCast("backup.*"), @constCast("shell"), @constCast("/usr/bin/backup.sh") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .rule_set => |r| {
+            try std.testing.expectEqualStrings("rule.backup", r.identifier);
+            try std.testing.expectEqualStrings("backup.*", r.pattern);
+            switch (r.runner) {
+                .shell => |sh| try std.testing.expectEqualStrings("/usr/bin/backup.sh", sh.command),
+                .amqp => return error.WrongRunnerType,
+            }
+        },
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction returns null for SET without timestamp" {
+    var args = [_][]u8{ @constCast("SET"), @constCast("backup.daily") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "response router silently ignores response for unregistered client" {
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const req = query.Request{
+        .client = 999,
+        .identifier = "req1",
+        .instruction = .{ .get = .{ .identifier = "job.1" } },
+    };
+    const resp = query.Response{ .request = req, .success = true };
+    router.route(resp);
+}
+
+test "response router drops response on full channel without crash" {
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    var ch = try Channel(query.Response).init(std.testing.allocator, 1);
+    defer ch.deinit();
+
+    const client_id = @as(query.Client, 5);
+    router.register(client_id, &ch);
+
+    const req = query.Request{
+        .client = client_id,
+        .identifier = "r1",
+        .instruction = .{ .get = .{ .identifier = "j1" } },
+    };
+    const first = query.Response{ .request = req, .success = true };
+    const second = query.Response{ .request = req, .success = false };
+
+    router.route(first);
+    router.route(second); // channel full — silently dropped, must not crash
+
+    router.deregister(client_id);
+    const received = ch.try_receive();
+    try std.testing.expect(received != null);
+    try std.testing.expect(received.?.success);
+}
+
+test "handle_connection passes peer address and exits cleanly" {
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    pair.write_stream.close();
+
+    const addr = try std.net.Address.parseIp("192.168.1.42", 54321);
+    handle_connection(
+        std.testing.allocator,
+        std.net.Stream{ .handle = pair.read_fd },
+        addr,
+        99,
+        &req_ch,
+        &router,
+    );
+}
+
 test "write_response formats list_rules empty result as OK only" {
     const pair = try make_socket_pair();
     defer std.posix.close(pair.read_fd);
@@ -756,4 +923,92 @@ test "write_response formats list_rules empty result as OK only" {
     var buf: [128]u8 = undefined;
     const n = try std.posix.read(pair.read_fd, &buf);
     try std.testing.expectEqualStrings("r1 OK\n", buf[0..n]);
+}
+
+test "handle_connection forwards SET instruction to request channel" {
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    try pair.write_stream.writeAll("r1 SET job.backup 1595586600000000000\n");
+    pair.write_stream.close();
+
+    const Context = struct {
+        received_tag: []const u8 = "",
+
+        fn respond(self: *@This(), rch: *Channel(query.Request), rtr: *ResponseRouter) void {
+            if (rch.receive()) |req| {
+                self.received_tag = @tagName(req.instruction);
+                // In production the scheduler owns instruction strings; free them here to avoid leak.
+                free_instruction_strings(std.testing.allocator, req.instruction);
+                const resp = query.Response{ .request = req, .success = true };
+                rtr.route(resp);
+                // handle_connection frees resp.request.identifier after receiving the response.
+            }
+        }
+    };
+
+    var ctx = Context{};
+    const t = try std.Thread.spawn(.{}, Context.respond, .{ &ctx, &req_ch, &router });
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    handle_connection(
+        std.testing.allocator,
+        std.net.Stream{ .handle = pair.read_fd },
+        addr,
+        42,
+        &req_ch,
+        &router,
+    );
+
+    t.join();
+
+    try std.testing.expectEqualStrings("set", ctx.received_tag);
+}
+
+test "handle_connection forwards LISTRULES instruction to request channel" {
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    try pair.write_stream.writeAll("r2 LISTRULES\n");
+    pair.write_stream.close();
+
+    const Context = struct {
+        received_tag: []const u8 = "",
+
+        fn respond(self: *@This(), rch: *Channel(query.Request), rtr: *ResponseRouter) void {
+            if (rch.receive()) |req| {
+                self.received_tag = @tagName(req.instruction);
+                // list_rules has no strings to free.
+                const resp = query.Response{ .request = req, .success = true };
+                rtr.route(resp);
+            }
+        }
+    };
+
+    var ctx = Context{};
+    const t = try std.Thread.spawn(.{}, Context.respond, .{ &ctx, &req_ch, &router });
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    handle_connection(
+        std.testing.allocator,
+        std.net.Stream{ .handle = pair.read_fd },
+        addr,
+        43,
+        &req_ch,
+        &router,
+    );
+
+    t.join();
+
+    try std.testing.expectEqualStrings("list_rules", ctx.received_tag);
 }

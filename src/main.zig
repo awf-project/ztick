@@ -21,6 +21,42 @@ const infrastructure_persistence_background = @import("infrastructure/persistenc
 const interfaces_config = @import("interfaces/config.zig");
 const interfaces_cli = @import("interfaces/cli.zig");
 
+var runtime_log_level: ?std.log.Level = null;
+
+pub const std_options = std.Options{
+    .log_level = .debug,
+    .logFn = log_fn,
+};
+
+fn log_fn_write(
+    writer: anytype,
+    comptime level: std.log.Level,
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const threshold = runtime_log_level orelse return;
+    if (@intFromEnum(level) > @intFromEnum(threshold)) return;
+    const level_name = comptime switch (level) {
+        .err => "ERROR",
+        .warn => "WARN",
+        .info => "INFO",
+        .debug => "DEBUG",
+    };
+    writer.print("[" ++ level_name ++ "] " ++ format ++ "\n", args) catch return;
+}
+
+fn log_fn(
+    comptime level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    _ = scope;
+    std.debug.lockStdErr();
+    defer std.debug.unlockStdErr();
+    log_fn_write(std.fs.File.stderr().deprecatedWriter(), level, format, args);
+}
+
 const Channel = infrastructure_channel.Channel;
 const TcpServer = infrastructure_tcp_server.TcpServer;
 const Scheduler = application_scheduler.Scheduler;
@@ -55,6 +91,17 @@ test {
 
 const ResponseRouter = infrastructure_tcp_server.ResponseRouter;
 
+fn log_level_to_std(level: interfaces_config.LogLevel) ?std.log.Level {
+    return switch (level) {
+        .info => .info,
+        .warn => .warn,
+        .debug => .debug,
+        .@"error" => .err,
+        .trace => .debug,
+        .off => null,
+    };
+}
+
 const ControllerContext = struct {
     allocator: std.mem.Allocator,
     address: []const u8,
@@ -86,7 +133,7 @@ fn run_controller(ctx: ControllerContext) void {
     var server = TcpServer.init(ctx.allocator, ctx.address, ctx.running);
     defer server.deinit();
     server.start(ctx.request_ch, ctx.response_router) catch |err| {
-        std.debug.print("CONTROLLER: start failed: {}\n", .{err});
+        std.log.err("controller: start failed: {}", .{err});
         return;
     };
     server.join_all();
@@ -97,7 +144,13 @@ fn run_database(ctx: DatabaseContext) void {
     scheduler.fsync_on_persist = ctx.fsync_on_persist;
     defer scheduler.deinit();
 
-    scheduler.load(ctx.allocator, ctx.logfile_dir, ctx.logfile_path) catch {};
+    scheduler.load(ctx.allocator, ctx.logfile_dir, ctx.logfile_path) catch |err| {
+        std.log.warn("database: load failed: {}", .{err});
+    };
+    std.log.info("loaded {d} jobs, {d} rules", .{
+        scheduler.job_storage.jobs.count(),
+        scheduler.rule_storage.rules.count(),
+    });
 
     const clock = Clock.init(ctx.framerate, ctx.running);
     clock.start(TickContext{
@@ -141,6 +194,96 @@ fn run_processor(ctx: ProcessorContext) void {
         };
         ctx.exec_response_ch.send(resp) catch return;
     }
+}
+
+test "config log levels map to matching standard log levels" {
+    try std.testing.expectEqual(std.log.Level.info, log_level_to_std(.info).?);
+    try std.testing.expectEqual(std.log.Level.warn, log_level_to_std(.warn).?);
+    try std.testing.expectEqual(std.log.Level.debug, log_level_to_std(.debug).?);
+}
+
+test "config error level maps to standard err level" {
+    // Config.LogLevel uses @"error"; std.log.Level uses .err
+    try std.testing.expectEqual(std.log.Level.err, log_level_to_std(.@"error").?);
+}
+
+test "config trace level maps to standard debug level" {
+    // std.log has no trace level; trace maps to the most permissive level
+    try std.testing.expectEqual(std.log.Level.debug, log_level_to_std(.trace).?);
+}
+
+test "config off level disables all logging" {
+    try std.testing.expectEqual(@as(?std.log.Level, null), log_level_to_std(.off));
+}
+
+test "log output is written when message level meets configured threshold" {
+    const saved = runtime_log_level;
+    defer runtime_log_level = saved;
+    runtime_log_level = .info;
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    log_fn_write(fbs.writer(), .info, "test message", .{});
+    try std.testing.expect(fbs.getWritten().len > 0);
+}
+
+test "log output uses bracket-level prefix and newline terminator" {
+    const saved = runtime_log_level;
+    defer runtime_log_level = saved;
+    runtime_log_level = .info;
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    log_fn_write(fbs.writer(), .info, "hello {s}", .{"world"});
+    try std.testing.expectEqualStrings("[INFO] hello world\n", fbs.getWritten());
+}
+
+test "log output formats error level as [ERROR] prefix" {
+    const saved = runtime_log_level;
+    defer runtime_log_level = saved;
+    runtime_log_level = .err;
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    log_fn_write(fbs.writer(), .err, "critical failure", .{});
+    try std.testing.expectEqualStrings("[ERROR] critical failure\n", fbs.getWritten());
+}
+
+test "log output is suppressed when message level is below configured threshold" {
+    const saved = runtime_log_level;
+    defer runtime_log_level = saved;
+    runtime_log_level = .warn;
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    log_fn_write(fbs.writer(), .info, "should not appear", .{});
+    try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
+}
+
+test "startup log shows zero counts on empty database" {
+    const saved = runtime_log_level;
+    defer runtime_log_level = saved;
+    runtime_log_level = .info;
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    log_fn_write(fbs.writer(), .info, "loaded {d} jobs, {d} rules", .{ @as(usize, 0), @as(usize, 0) });
+    try std.testing.expectEqualStrings("[INFO] loaded 0 jobs, 0 rules\n", fbs.getWritten());
+}
+
+test "startup log shows actual job and rule counts" {
+    const saved = runtime_log_level;
+    defer runtime_log_level = saved;
+    runtime_log_level = .info;
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    log_fn_write(fbs.writer(), .info, "loaded {d} jobs, {d} rules", .{ @as(usize, 3), @as(usize, 2) });
+    try std.testing.expectEqualStrings("[INFO] loaded 3 jobs, 2 rules\n", fbs.getWritten());
+}
+
+test "startup log is suppressed when log level is off" {
+    const saved = runtime_log_level;
+    defer runtime_log_level = saved;
+    runtime_log_level = null;
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    log_fn_write(fbs.writer(), .info, "loaded {d} jobs, {d} rules", .{ @as(usize, 5), @as(usize, 3) });
+    try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
 }
 
 test "processor thread routes execution request to response channel" {
@@ -248,6 +391,11 @@ pub fn main() !void {
     defer if (args.config_path) |p| allocator.free(p);
     const cfg = try interfaces_config.load(allocator, args.config_path);
     defer cfg.deinit(allocator);
+
+    runtime_log_level = log_level_to_std(cfg.log_level);
+    std.log.info("config: {s}", .{args.config_path orelse "default"});
+    std.log.info("log level: {s}", .{@tagName(cfg.log_level)});
+    std.log.info("listening on {s}", .{cfg.controller_listen});
 
     const cwd = std.fs.cwd();
 

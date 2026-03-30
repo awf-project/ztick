@@ -16,6 +16,8 @@ logfile
 # Temporary files
 *.tmp
 *.bak
+*.db
+test_debug_log.db
 
 .grepai/
 .specify/

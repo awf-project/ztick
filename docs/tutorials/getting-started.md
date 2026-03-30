@@ -60,13 +60,16 @@ Run ztick with your configuration:
 zig build run -- -c config.toml
 ```
 
-The process starts silently and listens for TCP connections on the configured address. No output is expected on startup.
+You should see log output on stderr:
 
-To verify it's running, check the port in another terminal:
-
-```bash
-ss -tlnp | grep 5678
 ```
+[INFO] config: config.toml
+[INFO] log level: info
+[INFO] listening on 127.0.0.1:5678
+[INFO] loaded 0 jobs, 0 rules
+```
+
+The process is now listening for TCP connections on the configured address.
 
 ## Step 4: Create a Rule
 
@@ -146,6 +149,15 @@ Restart ztick:
 
 ```bash
 zig build run -- -c config.toml
+```
+
+The log output now shows your persisted data was restored:
+
+```
+[INFO] config: config.toml
+[INFO] log level: info
+[INFO] listening on 127.0.0.1:5678
+[INFO] loaded 2 jobs, 1 rules
 ```
 
 Your jobs and rules are restored from the logfile. Send the same commands again to verify they still work.

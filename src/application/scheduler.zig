@@ -146,6 +146,7 @@ pub const Scheduler = struct {
                 var updated = job;
                 updated.status = if (result.success) .executed else .failed;
                 try self.job_storage.set(updated);
+                std.log.debug("execution outcome: job={s} success={}", .{ job.identifier, result.success });
             }
         }
 
@@ -676,6 +677,84 @@ test "handle_query with list_rules instruction does not persist to logfile" {
     defer if (response.body) |b| allocator.free(b);
 
     try std.testing.expectEqual(size_after_rule_set, try get_file_size(tmp_path));
+}
+
+test "tick marks job as failed after failed execution result" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
+    try scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "job.", .runner = .{ .shell = .{ .command = "echo" } } });
+
+    try scheduler.tick(1000);
+
+    for (scheduler.execution_client.pending.items) |req| {
+        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = false });
+    }
+    scheduler.execution_client.pending.clearRetainingCapacity();
+
+    try scheduler.tick(2000);
+
+    const job = scheduler.job_storage.get("job.1");
+    try std.testing.expect(job != null);
+    try std.testing.expectEqual(domain.job.JobStatus.failed, job.?.status);
+}
+
+test "tick processes execution result for unknown job without error" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
+    try scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "job.", .runner = .{ .shell = .{ .command = "echo" } } });
+
+    try scheduler.tick(1000);
+
+    _ = scheduler.job_storage.delete("job.1");
+
+    for (scheduler.execution_client.pending.items) |req| {
+        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
+    }
+    scheduler.execution_client.pending.clearRetainingCapacity();
+
+    try scheduler.tick(2000);
+}
+
+test "tick updates all job statuses when multiple execution results arrive in single tick" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try scheduler.job_storage.set(Job{ .identifier = "job.a", .execution = 1000, .status = .planned });
+    try scheduler.job_storage.set(Job{ .identifier = "job.b", .execution = 1000, .status = .planned });
+    try scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "job.", .runner = .{ .shell = .{ .command = "echo" } } });
+
+    try scheduler.tick(1000);
+
+    for (scheduler.execution_client.pending.items) |req| {
+        const success = std.mem.eql(u8, req.job_identifier, "job.a");
+        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = success });
+    }
+    scheduler.execution_client.pending.clearRetainingCapacity();
+
+    try scheduler.tick(2000);
+
+    const job_a = scheduler.job_storage.get("job.a");
+    const job_b = scheduler.job_storage.get("job.b");
+    try std.testing.expect(job_a != null);
+    try std.testing.expect(job_b != null);
+    try std.testing.expectEqual(domain.job.JobStatus.executed, job_a.?.status);
+    try std.testing.expectEqual(domain.job.JobStatus.failed, job_b.?.status);
 }
 
 fn get_file_size(path: []const u8) !u64 {

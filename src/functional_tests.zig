@@ -636,6 +636,264 @@ test "LISTRULES with AMQP rule includes all runner fields" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "routing.key") != null);
 }
 
+// Feature: F005
+
+fn spawn_ztick(allocator: std.mem.Allocator, config_path: []const u8) !std.process.Child {
+    var child = std.process.Child.init(
+        &[_][]const u8{ "zig-out/bin/ztick", "-c", config_path },
+        allocator,
+    );
+    child.stderr_behavior = .Pipe;
+    child.stdout_behavior = .Ignore;
+    child.stdin_behavior = .Ignore;
+    try child.spawn();
+    return child;
+}
+
+fn drain_stderr(stderr_file: std.fs.File, buf: []u8) []const u8 {
+    // Set non-blocking so read returns immediately when no data available.
+    const flags = std.posix.fcntl(stderr_file.handle, std.posix.F.GETFL, 0) catch return buf[0..0];
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(stderr_file.handle, std.posix.F.SETFL, flags | nonblock) catch return buf[0..0];
+
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = stderr_file.read(buf[filled..]) catch break;
+        if (n == 0) break;
+        filled += n;
+    }
+    return buf[0..filled];
+}
+
+test "startup with default log level produces config and listening address on stderr" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+    try config_file.writeAll("[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\nlogfile_path = \"test_startup_log.db\"\n");
+    config_file.close();
+
+    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    defer allocator.free(config_path);
+
+    var child = try spawn_ztick(allocator, config_path);
+    const stderr_file = child.stderr.?;
+
+    std.Thread.sleep(300_000_000);
+
+    var stderr_buf: [4096]u8 = undefined;
+    const stderr = drain_stderr(stderr_file, &stderr_buf);
+
+    _ = child.kill() catch {};
+    _ = child.wait() catch {};
+
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] config:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] log level: info") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] listening on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] loaded") != null);
+
+    tmp_dir.dir.deleteFile("test_startup_log.db") catch {};
+}
+
+test "startup with log level off produces no stderr output" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+    try config_file.writeAll("[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\nlogfile_path = \"test_silent_log.db\"\n");
+    config_file.close();
+
+    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    defer allocator.free(config_path);
+
+    var child = try spawn_ztick(allocator, config_path);
+    const stderr_file = child.stderr.?;
+
+    std.Thread.sleep(300_000_000);
+
+    var stderr_buf: [4096]u8 = undefined;
+    const stderr = drain_stderr(stderr_file, &stderr_buf);
+
+    _ = child.kill() catch {};
+    _ = child.wait() catch {};
+
+    try std.testing.expectEqual(@as(usize, 0), stderr.len);
+
+    tmp_dir.dir.deleteFile("test_silent_log.db") catch {};
+}
+
+test "startup with warn log level suppresses info messages" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+    try config_file.writeAll("[log]\nlevel = \"warn\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\nlogfile_path = \"test_warn_log.db\"\n");
+    config_file.close();
+
+    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    defer allocator.free(config_path);
+
+    var child = try spawn_ztick(allocator, config_path);
+    const stderr_file = child.stderr.?;
+
+    std.Thread.sleep(300_000_000);
+
+    var stderr_buf: [4096]u8 = undefined;
+    const stderr = drain_stderr(stderr_file, &stderr_buf);
+
+    _ = child.kill() catch {};
+    _ = child.wait() catch {};
+
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO]") == null);
+
+    tmp_dir.dir.deleteFile("test_warn_log.db") catch {};
+}
+
+test "startup logs loaded job and rule counts from persisted data" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const job1 = domain_job.Job{ .identifier = "app.task.1", .execution = 1595586600_000000000, .status = .planned };
+    const job2 = domain_job.Job{ .identifier = "app.task.2", .execution = 1595586700_000000000, .status = .planned };
+    const rule1 = domain_rule.Rule{
+        .identifier = "rule.app",
+        .pattern = "app.",
+        .runner = .{ .shell = .{ .command = "/bin/true" } },
+    };
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = job1 },
+        .{ .job = job2 },
+        .{ .rule = rule1 },
+    });
+    defer allocator.free(logfile_data);
+
+    var logfile = try tmp_dir.dir.createFile("test_counts.db", .{});
+    try logfile.writeAll(logfile_data);
+    logfile.close();
+
+    const logfile_real_path = try tmp_dir.dir.realpathAlloc(allocator, "test_counts.db");
+    defer allocator.free(logfile_real_path);
+
+    var config_buf: [512]u8 = undefined;
+    const config_content = try std.fmt.bufPrint(&config_buf, "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\nlogfile_path = \"{s}\"\n", .{logfile_real_path});
+
+    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+    try config_file.writeAll(config_content);
+    config_file.close();
+
+    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    defer allocator.free(config_path);
+
+    var child = try spawn_ztick(allocator, config_path);
+    const stderr_file = child.stderr.?;
+
+    std.Thread.sleep(300_000_000);
+
+    var stderr_buf: [4096]u8 = undefined;
+    const stderr = drain_stderr(stderr_file, &stderr_buf);
+
+    _ = child.kill() catch {};
+    _ = child.wait() catch {};
+
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] loaded 2 jobs, 1 rules") != null);
+}
+
+test "client connect and disconnect are logged at info level" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+    try config_file.writeAll("[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:19876\"\n\n[database]\nlogfile_path = \"test_connect_log.db\"\n");
+    config_file.close();
+
+    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    defer allocator.free(config_path);
+
+    var child = try spawn_ztick(allocator, config_path);
+    const stderr_file = child.stderr.?;
+
+    std.Thread.sleep(300_000_000);
+
+    // Connect a TCP client to trigger connect log
+    const addr = std.net.Address.parseIp("127.0.0.1", 19876) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.SkipZigTest;
+    };
+    std.Thread.sleep(100_000_000);
+    stream.close();
+    std.Thread.sleep(100_000_000);
+
+    var stderr_buf: [4096]u8 = undefined;
+    const stderr = drain_stderr(stderr_file, &stderr_buf);
+
+    _ = child.kill() catch {};
+    _ = child.wait() catch {};
+
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] client connected:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] client disconnected:") != null);
+
+    tmp_dir.dir.deleteFile("test_connect_log.db") catch {};
+}
+
+test "instruction received is logged at debug level" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+    try config_file.writeAll("[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19877\"\n\n[database]\nlogfile_path = \"test_debug_log.db\"\n");
+    config_file.close();
+
+    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    defer allocator.free(config_path);
+
+    var child = try spawn_ztick(allocator, config_path);
+    const stderr_file = child.stderr.?;
+
+    std.Thread.sleep(300_000_000);
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19877) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.SkipZigTest;
+    };
+
+    _ = stream.write("req-1 SET app.task.1 1595586600000000000\n") catch {
+        stream.close();
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.SkipZigTest;
+    };
+    std.Thread.sleep(500_000_000);
+    stream.close();
+    std.Thread.sleep(200_000_000);
+
+    var stderr_buf: [8192]u8 = undefined;
+    const stderr = drain_stderr(stderr_file, &stderr_buf);
+
+    _ = child.kill() catch {};
+    _ = child.wait() catch {};
+
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[DEBUG] instruction received:") != null);
+
+    tmp_dir.dir.deleteFile("test_debug_log.db") catch {};
+}
+
 test "execution failure marks triggered job as failed" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
