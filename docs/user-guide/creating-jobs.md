@@ -170,7 +170,7 @@ GET is read-only — it does not affect persistence.
 
 ## Searching Jobs
 
-Use the `QUERY` command to find jobs matching a prefix pattern:
+Use the `QUERY` command to find jobs matching a prefix pattern, or list all jobs when no pattern is given:
 
 ```bash
 # List all jobs starting with "backup."
@@ -184,10 +184,10 @@ r1 backup.weekly planned 1743390000000000000
 r1 OK
 ```
 
-Use an empty pattern to list all jobs:
+List all jobs (omit the pattern):
 
 ```bash
-echo 'r1 QUERY ""' | socat - TCP:localhost:5678
+echo 'r1 QUERY' | socat - TCP:localhost:5678
 ```
 
 QUERY is read-only — it does not generate persistence entries.

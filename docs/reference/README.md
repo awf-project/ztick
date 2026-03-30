@@ -30,12 +30,12 @@ framerate = 1                     # Evaluations per second
 ```
 SET <id> <timestamp>                    # Create job
 GET <id>                                # Retrieve job
-QUERY <pattern>                         # List matching jobs
+QUERY [<pattern>]                       # List matching jobs (or all)
 REMOVE <id>                             # Delete job
 
 RULE SET <id> <pattern> <runner>        # Create rule
 REMOVERULE <id>                         # Delete rule
-LISTRULES                               # List all rules (not yet implemented)
+LISTRULES                               # List all rules
 ```
 
 ### Data Types

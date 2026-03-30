@@ -23,6 +23,7 @@ pub const Instruction = union(enum) {
     remove_rule: struct {
         identifier: []const u8,
     },
+    list_rules: struct {},
 };
 
 test "set instruction stores identifier and execution timestamp" {
@@ -72,4 +73,9 @@ test "remove_rule instruction stores identifier" {
     const instr = Instruction{ .remove_rule = .{ .identifier = "notify-slack" } };
     try std.testing.expectEqualStrings("notify-slack", instr.remove_rule.identifier);
     try std.testing.expectEqual(std.meta.Tag(Instruction).remove_rule, std.meta.activeTag(instr));
+}
+
+test "list_rules instruction is active tag" {
+    const instr = Instruction{ .list_rules = .{} };
+    try std.testing.expectEqual(std.meta.Tag(Instruction).list_rules, std.meta.activeTag(instr));
 }

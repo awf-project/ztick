@@ -63,7 +63,7 @@ echo 'req-1 REMOVERULE my.rule' | nc localhost 5678
 ### List Rules
 
 ```bash
-echo 'LISTRULES' | nc localhost 5678
+echo 'req-1 LISTRULES' | socat - TCP:localhost:5678
 ```
 
 ## Common Tasks

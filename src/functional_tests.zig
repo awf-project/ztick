@@ -184,12 +184,7 @@ fn replay_into_scheduler(allocator: std.mem.Allocator, data: []const u8, schedul
 
     for (parsed.entries) |entry| {
         const decoded = try persistence_encoder.decode(arena, entry);
-        switch (decoded) {
-            .job => |j| try scheduler.job_storage.set(j),
-            .rule => |r| try scheduler.rule_storage.set(r),
-            .job_removal => |r| _ = scheduler.job_storage.delete(r.identifier),
-            .rule_removal => |r| _ = scheduler.rule_storage.delete(r.identifier),
-        }
+        try scheduler.replay_entry(decoded);
     }
 
     return decode_arena;
@@ -531,6 +526,114 @@ test "RULE SET then REMOVERULE persisted and replayed leaves rule absent" {
     defer decode_arena.deinit();
 
     try std.testing.expectEqual(@as(?Rule, null), scheduler.rule_storage.get("notify-oncall"));
+}
+
+test "RULE SET then LISTRULES returns all rules" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-rule-1",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.backup",
+            .pattern = "backup.",
+            .runner = .{ .shell = .{ .command = "/usr/bin/backup.sh" } },
+        } },
+    });
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-rule-2",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.notify",
+            .pattern = "notify.",
+            .runner = .{ .shell = .{ .command = "/usr/bin/notify.sh" } },
+        } },
+    });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-list",
+        .instruction = .{ .list_rules = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.backup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "backup.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "/usr/bin/backup.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.notify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "/usr/bin/notify.sh") != null);
+
+    var line_count: usize = 0;
+    var it = std.mem.splitScalar(u8, response.body.?, '\n');
+    while (it.next()) |line| {
+        if (line.len > 0) line_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), line_count);
+}
+
+test "LISTRULES with no rules returns success with null body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-list",
+        .instruction = .{ .list_rules = .{} },
+    });
+
+    try std.testing.expect(response.success);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.body);
+}
+
+test "LISTRULES with AMQP rule includes all runner fields" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-rule",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.publish",
+            .pattern = "events.",
+            .runner = .{ .amqp = .{
+                .dsn = "amqp://localhost",
+                .exchange = "exchange_name",
+                .routing_key = "routing.key",
+            } },
+        } },
+    });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-list",
+        .instruction = .{ .list_rules = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.publish") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "events.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "amqp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "amqp://localhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "exchange_name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "routing.key") != null);
 }
 
 test "execution failure marks triggered job as failed" {

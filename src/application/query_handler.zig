@@ -67,6 +67,25 @@ pub const QueryHandler = struct {
             },
             .remove => |args| self.job_storage.delete(args.identifier),
             .remove_rule => |args| self.rule_storage.delete(args.identifier),
+            .list_rules => {
+                if (self.rule_storage.rules.count() == 0) {
+                    return Response{ .request = request, .success = true };
+                }
+
+                var body_buf = std.ArrayListUnmanaged(u8){};
+                errdefer body_buf.deinit(self.allocator);
+
+                var it = self.rule_storage.rules.valueIterator();
+                while (it.next()) |rule| {
+                    switch (rule.runner) {
+                        .shell => |sh| try body_buf.writer(self.allocator).print("{s} {s} shell {s}\n", .{ rule.identifier, rule.pattern, sh.command }),
+                        .amqp => |mq| try body_buf.writer(self.allocator).print("{s} {s} amqp {s} {s} {s}\n", .{ rule.identifier, rule.pattern, mq.dsn, mq.exchange, mq.routing_key }),
+                    }
+                }
+
+                const body = try body_buf.toOwnedSlice(self.allocator);
+                return Response{ .request = request, .success = true, .body = body };
+            },
         };
 
         return Response{ .request = request, .success = success };
@@ -360,4 +379,98 @@ test "handle remove_rule instruction returns failure for missing rule" {
 
     const response = try handler.handle(request);
     try std.testing.expect(!response.success);
+}
+
+test "handle list_rules instruction returns success with null body when no rules loaded" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    const request = Request{
+        .client = 12,
+        .identifier = "req-12",
+        .instruction = .{ .list_rules = .{} },
+    };
+
+    const response = try handler.handle(request);
+    try std.testing.expect(response.success);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.body);
+}
+
+test "handle list_rules instruction returns success with all shell rules in body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    try rule_storage.set(.{ .identifier = "rule.backup", .pattern = "backup.", .runner = .{ .shell = .{ .command = "/usr/bin/backup.sh" } } });
+    try rule_storage.set(.{ .identifier = "rule.notify", .pattern = "notify.", .runner = .{ .shell = .{ .command = "/usr/bin/notify.sh" } } });
+
+    const request = Request{
+        .client = 13,
+        .identifier = "req-13",
+        .instruction = .{ .list_rules = .{} },
+    };
+
+    const response = try handler.handle(request);
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.backup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "backup.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "/usr/bin/backup.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.notify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "/usr/bin/notify.sh") != null);
+}
+
+test "handle list_rules instruction returns success with amqp rule fields in body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    try rule_storage.set(.{ .identifier = "rule.publish", .pattern = "events.", .runner = .{ .amqp = .{
+        .dsn = "amqp://localhost",
+        .exchange = "exchange_name",
+        .routing_key = "routing.key",
+    } } });
+
+    const request = Request{
+        .client = 14,
+        .identifier = "req-14",
+        .instruction = .{ .list_rules = .{} },
+    };
+
+    const response = try handler.handle(request);
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.publish") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "events.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "amqp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "amqp://localhost") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "exchange_name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "routing.key") != null);
 }

@@ -181,7 +181,7 @@ Every command follows this format:
 |---------|-------------|---------|
 | `SET` | Create/update a job | `r1 SET job.name 2026-04-01 12:00:00` |
 | `GET` | Retrieve job state | `r1 GET job.name` |
-| `QUERY` | List jobs by prefix | `r1 QUERY job.` |
+| `QUERY` | List jobs by prefix (or all) | `r1 QUERY job.` |
 | `RULE SET` | Create/update a rule | `r1 RULE SET rule.name job. shell "/bin/cmd --flag"` |
 
 See [Protocol Reference](../reference/protocol.md) for full details.
