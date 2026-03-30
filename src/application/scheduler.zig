@@ -74,12 +74,16 @@ pub const Scheduler = struct {
 
         for (result.entries) |entry_data| {
             const entry = persistence.encoder.decode(arena, entry_data) catch continue;
-            switch (entry) {
-                .job => |job| try self.job_storage.set(job),
-                .rule => |rule| try self.rule_storage.set(rule),
-                .job_removal => |removal| _ = self.job_storage.delete(removal.identifier),
-                .rule_removal => |removal| _ = self.rule_storage.delete(removal.identifier),
-            }
+            try self.replay_entry(entry);
+        }
+    }
+
+    pub fn replay_entry(self: *Scheduler, entry: Entry) !void {
+        switch (entry) {
+            .job => |job| try self.job_storage.set(job),
+            .rule => |rule| try self.rule_storage.set(rule),
+            .job_removal => |removal| _ = self.job_storage.delete(removal.identifier),
+            .rule_removal => |removal| _ = self.rule_storage.delete(removal.identifier),
         }
     }
 
@@ -111,7 +115,7 @@ pub const Scheduler = struct {
             } },
             .remove => |args| .{ .job_removal = .{ .identifier = args.identifier } },
             .remove_rule => |args| .{ .rule_removal = .{ .identifier = args.identifier } },
-            .get, .query => return,
+            .get, .query, .list_rules => return,
         };
 
         const encoded = try persistence.encoder.encode(self.allocator, entry);
@@ -630,6 +634,48 @@ test "remove_rule round-trip through logfile" {
 
         try std.testing.expectEqual(@as(?Rule, null), scheduler.rule_storage.get("rule.1"));
     }
+}
+
+test "handle_query with list_rules instruction does not persist to logfile" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    const tmp_path = "/tmp/ztick-test-scheduler-listrules-no-persist.log";
+    {
+        const file = try std.fs.cwd().createFile(tmp_path, .{});
+        file.close();
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-rule-set",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.1",
+            .pattern = "job.",
+            .runner = .{ .shell = .{ .command = "echo hello" } },
+        } },
+    });
+
+    const size_after_rule_set = try get_file_size(tmp_path);
+    try std.testing.expect(size_after_rule_set > 0);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-listrules",
+        .instruction = .{ .list_rules = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expectEqual(size_after_rule_set, try get_file_size(tmp_path));
 }
 
 fn get_file_size(path: []const u8) !u64 {

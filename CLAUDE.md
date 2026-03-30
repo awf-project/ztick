@@ -4,6 +4,7 @@
 - Use tagged unions for protocol and runner types; error unions for fallible operations
 - Four strict layers: domain/ (pure data, zero deps), application/ (state machines, storage), infrastructure/ (IO adapters), interfaces/ (CLI, config)
 - Each layer has a barrel export file (domain.zig, application.zig, infrastructure.zig, interfaces.zig); import layers through barrels only
+- All tagged union variants must declare payloads with `struct {}` syntax, even when empty, for consistent pattern matching and destructuring across the codebase
 
 ## Build System
 
@@ -69,3 +70,4 @@
 
 - Normalize all function names to snake_case, including private functions; remove dead code completely
 - Verify implementation matches the original specification (e.g., protocol format, timestamp parsing, command definitions)
+- Never name tests after implementation internals (e.g., 'has no payload'); name them after observable behavior from the caller's perspective (e.g., 'returns formatted rules')

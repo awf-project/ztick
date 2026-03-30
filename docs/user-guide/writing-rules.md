@@ -114,10 +114,13 @@ echo 'r1 RULE SET rule.backup backup. shell /usr/bin/backup-v2.sh' | socat - TCP
 echo 'r1 RULE SET rule.backup backup. shell /usr/bin/backup.sh' | socat - TCP:localhost:5678
 echo 'r2 RULE SET rule.report report. shell /usr/bin/generate-report.sh' | socat - TCP:localhost:5678
 
-# 2. Schedule jobs
-echo 'r3 SET backup.daily 2026-04-01 02:00:00' | socat - TCP:localhost:5678
-echo 'r4 SET backup.weekly 2026-04-07 03:00:00' | socat - TCP:localhost:5678
-echo 'r5 SET report.monthly 2026-04-01 06:00:00' | socat - TCP:localhost:5678
+# 2. Verify rules are loaded
+echo 'r3 LISTRULES' | socat - TCP:localhost:5678
+
+# 3. Schedule jobs
+echo 'r4 SET backup.daily 2026-04-01 02:00:00' | socat - TCP:localhost:5678
+echo 'r5 SET backup.weekly 2026-04-07 03:00:00' | socat - TCP:localhost:5678
+echo 'r6 SET report.monthly 2026-04-01 06:00:00' | socat - TCP:localhost:5678
 ```
 
 When each job's execution time arrives:
@@ -144,10 +147,24 @@ r1 ERROR
 
 REMOVERULE persists the deletion to the logfile — the rule stays removed across server restarts and background compression. Removing a rule does **not** cancel pending jobs that were previously matched by it.
 
-## Limitations
+## Listing Rules
 
-The following operations are **not yet implemented**:
-- `LISTRULES` — List all rules
+Use `LISTRULES` to see all configured rules:
+
+```bash
+echo 'r1 LISTRULES' | socat - TCP:localhost:5678
+```
+
+Response (one line per rule, then `OK`):
+```
+r1 rule.backup backup. shell /usr/bin/backup.sh
+r1 rule.report report. shell /usr/bin/generate-report.sh
+r1 OK
+```
+
+If no rules are loaded, the response is just `r1 OK`. Rules are returned in unspecified order.
+
+See [Protocol Reference](../reference/protocol.md#listrules) for full details.
 
 ## Best Practices
 

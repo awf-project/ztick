@@ -28,7 +28,7 @@ Every command follows this structure:
 ```
 
 - `request_id` — A client-chosen identifier echoed back in the response (e.g., `req-1`, `cmd-42`)
-- `instruction` — The operation to perform (`SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, or `RULE SET`)
+- `instruction` — The operation to perform (`SET`, `GET`, `QUERY`, `LISTRULES`, `REMOVE`, `REMOVERULE`, or `RULE SET`)
 - `args` — Instruction-specific arguments
 
 ## Response Format
@@ -45,7 +45,7 @@ Every command follows this structure:
 
 The `request_id` matches the one sent in the command, allowing clients to correlate responses.
 
-Write commands (`SET`, `RULE SET`) and delete commands (`REMOVE`, `REMOVERULE`) return a status-only response. Read commands (`GET`) return a response with additional data in the body after the status. List commands (`QUERY`) return multiple lines followed by a terminal `OK` line.
+Write commands (`SET`, `RULE SET`) and delete commands (`REMOVE`, `REMOVERULE`) return a status-only response. Read commands (`GET`) return a response with additional data in the body after the status. List commands (`QUERY`, `LISTRULES`) return multiple lines followed by a terminal `OK` line.
 
 ## Error Handling
 
@@ -56,7 +56,7 @@ Write commands (`SET`, `RULE SET`) and delete commands (`REMOVE`, `REMOVERULE`) 
 | Unrecognized command | Silently ignored, no response sent (see below) |
 | Out of memory | Connection closed |
 
-**Important**: Only `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
+**Important**: Only `SET`, `GET`, `QUERY`, `LISTRULES`, `REMOVE`, `REMOVERULE`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
 
 ## Commands
 
@@ -120,20 +120,19 @@ echo 'req-6 GET no.such.job' | socat - TCP:localhost:5678
 
 ### QUERY
 
-List jobs matching a prefix pattern.
+List jobs matching a prefix pattern, or all jobs when no pattern is given.
 
 **Syntax**:
 ```
-<request_id> QUERY <pattern>
+<request_id> QUERY [<pattern>]
 ```
 
 **Parameters**:
-- `pattern` (string): Prefix to match against job identifiers. Use `""` (empty quoted string) to match all jobs.
+- `pattern` (string, optional): Prefix to match against job identifiers. When omitted, returns all jobs.
 
 **Response**:
 - One line per matching job: `<request_id> <job_id> <status> <execution_ns>\n`
 - Terminal line: `<request_id> OK\n`
-- Missing pattern: `<request_id> ERROR\n`
 
 | Field | Description |
 |-------|-------------|
@@ -150,22 +149,60 @@ echo 'req-1 QUERY backup.' | socat - TCP:localhost:5678
 # req-1 backup.weekly planned 1711872000000000000
 # req-1 OK
 
-# Query all jobs (empty pattern)
-echo 'req-2 QUERY ""' | socat - TCP:localhost:5678
+# Query all jobs (no pattern)
+echo 'req-2 QUERY' | socat - TCP:localhost:5678
 # Response: one line per job, followed by req-2 OK
 
 # Query with no matches
 echo 'req-3 QUERY nonexistent.' | socat - TCP:localhost:5678
 # Response:
 # req-3 OK
-
-# Missing pattern (error)
-echo 'req-4 QUERY' | socat - TCP:localhost:5678
-# Response:
-# req-4 ERROR
 ```
 
 **Notes**: QUERY is a read-only command — it does not generate any persistence log entry. Results are returned in unspecified order (hashmap iteration order).
+
+### LISTRULES
+
+List all configured rules.
+
+**Syntax**:
+```
+<request_id> LISTRULES
+```
+
+**Parameters**: None. Extra trailing arguments are silently ignored.
+
+**Response**:
+- One line per rule: `<request_id> <rule_id> <pattern> <runner_type> <runner_args...>\n`
+- Terminal line: `<request_id> OK\n`
+
+| Field | Description |
+|-------|-------------|
+| `rule_id` | The rule's identifier |
+| `pattern` | Prefix pattern the rule matches against |
+| `runner_type` | Runner type: `shell` or `amqp` |
+| `runner_args` | Shell: `<command>`. AMQP: `<dsn> <exchange> <routing_key>` |
+
+**Examples**:
+```bash
+# List all rules (with shell and amqp rules loaded)
+echo 'req-1 LISTRULES' | socat - TCP:localhost:5678
+# Response:
+# req-1 rule.backup backup. shell /usr/bin/backup.sh
+# req-1 rule.notify notify. amqp amqp://broker:5672 jobs notifications
+# req-1 OK
+
+# List rules when none are loaded
+echo 'req-2 LISTRULES' | socat - TCP:localhost:5678
+# Response:
+# req-2 OK
+
+# Extra arguments are ignored
+echo 'req-3 LISTRULES foo' | socat - TCP:localhost:5678
+# Response: same as LISTRULES without arguments
+```
+
+**Notes**: LISTRULES is a read-only command — it does not generate any persistence log entry. Results are returned in unspecified order (hashmap iteration order).
 
 ### REMOVE
 
@@ -276,11 +313,6 @@ Escaping inside quoted strings:
 - `\"` → `"`
 - `\\` → `\`
 
-## Unimplemented Commands
-
-The following commands are **not yet implemented**. The server silently ignores them — no response is sent and the connection remains open:
-- `LISTRULES` — List all rules
-
 ## Examples
 
 ### Full Session
@@ -308,13 +340,18 @@ echo 'r5 QUERY backup.' | socat - TCP:localhost:5678
 # r5 backup.weekly planned 1711872000000000000
 # r5 OK
 
-# Remove the weekly backup job
-echo 'r6 REMOVE backup.weekly' | socat - TCP:localhost:5678
+# List all configured rules
+echo 'r6 LISTRULES' | socat - TCP:localhost:5678
+# r6 rule.backup backup. shell /usr/bin/backup.sh
 # r6 OK
 
-# Remove the backup rule
-echo 'r7 REMOVERULE rule.backup' | socat - TCP:localhost:5678
+# Remove the weekly backup job
+echo 'r7 REMOVE backup.weekly' | socat - TCP:localhost:5678
 # r7 OK
+
+# Remove the backup rule
+echo 'r8 REMOVERULE rule.backup' | socat - TCP:localhost:5678
+# r8 OK
 ```
 
 ### Batch Operations
@@ -357,6 +394,12 @@ sock.send(b'r3 QUERY app.\n')
 print(sock.recv(4096).decode())
 # r3 app.task.1 planned 1743350400000000000
 # r3 OK
+
+# List all rules
+sock.send(b'r4 LISTRULES\n')
+print(sock.recv(4096).decode())
+# r4 rule.app app. shell /bin/echo hello
+# r4 OK
 
 sock.close()
 ```

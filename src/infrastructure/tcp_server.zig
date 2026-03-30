@@ -228,8 +228,7 @@ fn handle_connection(
 
 fn build_instruction(allocator: std.mem.Allocator, result: parser.ParseResult) error{OutOfMemory}!?instruction.Instruction {
     if (result.args.len >= 1 and std.mem.eql(u8, result.args[0], "QUERY")) {
-        if (result.args.len < 2) return null;
-        const pattern = try allocator.dupe(u8, result.args[1]);
+        const pattern = if (result.args.len >= 2) try allocator.dupe(u8, result.args[1]) else try allocator.dupe(u8, "");
         return .{ .query = .{ .pattern = pattern } };
     }
 
@@ -261,6 +260,10 @@ fn build_instruction(allocator: std.mem.Allocator, result: parser.ParseResult) e
     if (result.args.len >= 2 and std.mem.eql(u8, result.args[0], "REMOVERULE")) {
         const id = try allocator.dupe(u8, result.args[1]);
         return .{ .remove_rule = .{ .identifier = id } };
+    }
+
+    if (result.args.len >= 1 and std.mem.eql(u8, result.args[0], "LISTRULES")) {
+        return .{ .list_rules = .{} };
     }
 
     return null;
@@ -392,12 +395,13 @@ fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Ins
         .remove_rule => |r| {
             allocator.free(r.identifier);
         },
+        .list_rules => {},
     }
 }
 
 fn write_response(allocator: std.mem.Allocator, stream: std.net.Stream, resp: query.Response) !void {
     switch (resp.request.instruction) {
-        .query => {
+        .query, .list_rules => {
             if (!resp.success) {
                 const msg = try std.fmt.allocPrint(allocator, "{s} ERROR\n", .{resp.request.identifier});
                 defer allocator.free(msg);
@@ -539,7 +543,7 @@ test "build_instruction parses QUERY command with pattern" {
     }
 }
 
-test "build_instruction returns null for QUERY without pattern" {
+test "build_instruction parses QUERY without pattern as empty prefix" {
     var args = [_][]u8{@constCast("QUERY")};
     const result = parser.ParseResult{
         .command = @constCast("req1"),
@@ -547,18 +551,31 @@ test "build_instruction returns null for QUERY without pattern" {
         .remaining = "",
     };
     const instr = try build_instruction(std.testing.allocator, result);
-    try std.testing.expect(instr == null);
+    try std.testing.expect(instr != null);
+    try std.testing.expectEqual(std.meta.Tag(instruction.Instruction).query, std.meta.activeTag(instr.?));
+    std.testing.allocator.free(instr.?.query.pattern);
 }
 
-test "write_response formats multi-line body with request_id prefix per line" {
+const SocketPair = struct {
+    read_fd: std.posix.socket_t,
+    write_stream: std.net.Stream,
+};
+
+fn make_socket_pair() !SocketPair {
     var fds: [2]i32 = undefined;
     const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds);
     try std.testing.expectEqual(@as(usize, 0), rc);
     const read_fd: std.posix.socket_t = @intCast(fds[0]);
     const write_fd: std.posix.socket_t = @intCast(fds[1]);
-    defer std.posix.close(read_fd);
+    return .{
+        .read_fd = read_fd,
+        .write_stream = std.net.Stream{ .handle = write_fd },
+    };
+}
 
-    const write_stream = std.net.Stream{ .handle = write_fd };
+test "write_response formats multi-line body with request_id prefix per line" {
+    const pair = try make_socket_pair();
+    defer std.posix.close(pair.read_fd);
 
     const req = query.Request{
         .client = 0,
@@ -571,11 +588,11 @@ test "write_response formats multi-line body with request_id prefix per line" {
         .body = "backup.daily planned 1595586600000000000\nbackup.weekly planned 1595586660000000000\n",
     };
 
-    try write_response(std.testing.allocator, write_stream, resp);
-    write_stream.close();
+    try write_response(std.testing.allocator, pair.write_stream, resp);
+    pair.write_stream.close();
 
     var buf: [512]u8 = undefined;
-    const n = try std.posix.read(read_fd, &buf);
+    const n = try std.posix.read(pair.read_fd, &buf);
     try std.testing.expectEqualStrings(
         "req1 backup.daily planned 1595586600000000000\nreq1 backup.weekly planned 1595586660000000000\nreq1 OK\n",
         buf[0..n],
@@ -642,14 +659,8 @@ test "free_instruction_strings frees REMOVE identifier without leak" {
 }
 
 test "write_response appends body when response body is non-null" {
-    var fds: [2]i32 = undefined;
-    const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds);
-    try std.testing.expectEqual(@as(usize, 0), rc);
-    const read_fd: std.posix.socket_t = @intCast(fds[0]);
-    const write_fd: std.posix.socket_t = @intCast(fds[1]);
-    defer std.posix.close(read_fd);
-
-    const write_stream = std.net.Stream{ .handle = write_fd };
+    const pair = try make_socket_pair();
+    defer std.posix.close(pair.read_fd);
 
     const req = query.Request{
         .client = 0,
@@ -662,10 +673,87 @@ test "write_response appends body when response body is non-null" {
         .body = "planned 1595586600000000000",
     };
 
-    try write_response(std.testing.allocator, write_stream, resp);
-    write_stream.close();
+    try write_response(std.testing.allocator, pair.write_stream, resp);
+    pair.write_stream.close();
 
     var buf: [512]u8 = undefined;
-    const n = try std.posix.read(read_fd, &buf);
+    const n = try std.posix.read(pair.read_fd, &buf);
     try std.testing.expectEqualStrings("req1 OK planned 1595586600000000000\n", buf[0..n]);
+}
+
+test "build_instruction parses LISTRULES command" {
+    var args = [_][]u8{@constCast("LISTRULES")};
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    switch (instr) {
+        .list_rules => {},
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction parses LISTRULES command ignoring trailing args" {
+    var args = [_][]u8{ @constCast("LISTRULES"), @constCast("foo") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    switch (instr) {
+        .list_rules => {},
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "write_response formats list_rules multi-line body with request_id prefix" {
+    const pair = try make_socket_pair();
+    defer std.posix.close(pair.read_fd);
+
+    const req = query.Request{
+        .client = 0,
+        .identifier = "r1",
+        .instruction = .{ .list_rules = .{} },
+    };
+    const resp = query.Response{
+        .request = req,
+        .success = true,
+        .body = "rule.backup backup.* shell /usr/bin/backup.sh\nrule.notify notify.* shell /usr/bin/notify.sh\n",
+    };
+
+    try write_response(std.testing.allocator, pair.write_stream, resp);
+    pair.write_stream.close();
+
+    var buf: [512]u8 = undefined;
+    const n = try std.posix.read(pair.read_fd, &buf);
+    const output = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, output, "r1 rule.backup backup.* shell /usr/bin/backup.sh\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "r1 rule.notify notify.* shell /usr/bin/notify.sh\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "r1 OK\n"));
+}
+
+test "write_response formats list_rules empty result as OK only" {
+    const pair = try make_socket_pair();
+    defer std.posix.close(pair.read_fd);
+
+    const req = query.Request{
+        .client = 0,
+        .identifier = "r1",
+        .instruction = .{ .list_rules = .{} },
+    };
+    const resp = query.Response{
+        .request = req,
+        .success = true,
+        .body = null,
+    };
+
+    try write_response(std.testing.allocator, pair.write_stream, resp);
+    pair.write_stream.close();
+
+    var buf: [128]u8 = undefined;
+    const n = try std.posix.read(pair.read_fd, &buf);
+    try std.testing.expectEqualStrings("r1 OK\n", buf[0..n]);
 }
