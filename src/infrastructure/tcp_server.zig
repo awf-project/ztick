@@ -2,9 +2,37 @@ const std = @import("std");
 const domain = @import("../domain.zig");
 const parser = @import("protocol/parser.zig");
 const Channel = @import("channel.zig").Channel;
+const TlsContext = @import("tls_context.zig").TlsContext;
+const TlsStream = @import("tls_context.zig").TlsStream;
 
 const query = domain.query;
 const instruction = domain.instruction;
+
+pub const Connection = union(enum) {
+    plain: struct { stream: std.net.Stream },
+    tls: struct { stream: TlsStream },
+
+    pub fn read(self: Connection, buf: []u8) !usize {
+        return switch (self) {
+            .plain => |p| p.stream.read(buf),
+            .tls => |t| t.stream.read(buf),
+        };
+    }
+
+    pub fn write(self: Connection, buf: []const u8) !usize {
+        return switch (self) {
+            .plain => |p| p.stream.write(buf),
+            .tls => |t| t.stream.write(buf),
+        };
+    }
+
+    pub fn close(self: Connection) void {
+        switch (self) {
+            .plain => |p| p.stream.close(),
+            .tls => |t| t.stream.close(),
+        }
+    }
+};
 
 pub const ResponseRouter = struct {
     mutex: std.Thread.Mutex,
@@ -50,13 +78,15 @@ pub const TcpServer = struct {
     address: []const u8,
     active_connections: std.atomic.Value(usize),
     running: *std.atomic.Value(bool),
+    tls_context: ?*TlsContext,
 
-    pub fn init(allocator: std.mem.Allocator, address: []const u8, running: *std.atomic.Value(bool)) TcpServer {
+    pub fn init(allocator: std.mem.Allocator, address: []const u8, running: *std.atomic.Value(bool), tls_context: ?*TlsContext) TcpServer {
         return .{
             .allocator = allocator,
             .address = address,
             .active_connections = std.atomic.Value(usize).init(0),
             .running = running,
+            .tls_context = tls_context,
         };
     }
 
@@ -96,6 +126,7 @@ pub const TcpServer = struct {
                 client_id,
                 request_channel,
                 response_router,
+                self.tls_context,
             }) catch {
                 _ = self.active_connections.fetchSub(1, .release);
                 conn.stream.close();
@@ -108,8 +139,11 @@ pub const TcpServer = struct {
     }
 
     pub fn join_all(self: *TcpServer) void {
+        var attempts: usize = 0;
         while (self.active_connections.load(.acquire) > 0) {
             std.Thread.sleep(1_000_000); // 1ms
+            attempts += 1;
+            if (attempts >= 5000) break; // 5s max shutdown wait
         }
     }
 };
@@ -122,14 +156,22 @@ fn connection_worker(
     client_id: u128,
     request_channel: *Channel(query.Request),
     response_router: *ResponseRouter,
+    tls_context: ?*TlsContext,
 ) void {
     defer _ = active_connections.fetchSub(1, .release);
-    handle_connection(allocator, stream, address, client_id, request_channel, response_router);
+    const conn: Connection = if (tls_context) |tls_ctx| blk: {
+        const tls_stream = tls_ctx.accept(stream.handle) catch {
+            stream.close();
+            return;
+        };
+        break :blk Connection{ .tls = .{ .stream = tls_stream } };
+    } else Connection{ .plain = .{ .stream = stream } };
+    handle_connection(allocator, conn, address, client_id, request_channel, response_router);
 }
 
 fn handle_connection(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    conn: Connection,
     address: std.net.Address,
     client_id: u128,
     request_channel: *Channel(query.Request),
@@ -137,7 +179,7 @@ fn handle_connection(
 ) void {
     std.log.info("client connected: {f}", .{address});
     defer std.log.info("client disconnected: {f}", .{address});
-    defer stream.close();
+    defer conn.close();
 
     var response_channel = Channel(query.Response).init(allocator, 1) catch return;
     defer response_channel.deinit();
@@ -149,8 +191,8 @@ fn handle_connection(
     var filled: usize = 0;
 
     while (true) {
-        const n = stream.read(buf[filled..]) catch return;
-        if (n == 0) return; // client disconnected
+        const n = conn.read(buf[filled..]) catch return;
+        if (n == 0) return;
 
         filled += n;
 
@@ -158,7 +200,7 @@ fn handle_connection(
         while (true) {
             const data = buf[consumed..filled];
             const result = parser.parse(allocator, data) catch |err| switch (err) {
-                error.Incomplete => break, // need more data
+                error.Incomplete => break,
                 error.Invalid => {
                     // Skip the invalid line (find next newline)
                     if (std.mem.indexOfScalar(u8, data, '\n')) |nl| {
@@ -195,7 +237,7 @@ fn handle_connection(
                 };
 
                 if (response_channel.receive()) |resp| {
-                    write_response(allocator, stream, resp) catch {};
+                    write_response(allocator, conn, resp) catch {};
                     // Free only the request_id (result.command) — not stored by scheduler.
                     // Instruction strings (job id, pattern, runner args) are now owned
                     // by the scheduler's storage and must not be freed here.
@@ -215,7 +257,7 @@ fn handle_connection(
                         return;
                     };
                     defer allocator.free(msg);
-                    _ = stream.write(msg) catch {};
+                    _ = conn.write(msg) catch {};
                 }
                 result.deinit(allocator);
             }
@@ -404,13 +446,13 @@ fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Ins
     }
 }
 
-fn write_response(allocator: std.mem.Allocator, stream: std.net.Stream, resp: query.Response) !void {
+fn write_response(allocator: std.mem.Allocator, conn: Connection, resp: query.Response) !void {
     switch (resp.request.instruction) {
         .query, .list_rules => {
             if (!resp.success) {
                 const msg = try std.fmt.allocPrint(allocator, "{s} ERROR\n", .{resp.request.identifier});
                 defer allocator.free(msg);
-                _ = try stream.write(msg);
+                _ = try conn.write(msg);
                 return;
             }
             if (resp.body) |body| {
@@ -419,12 +461,12 @@ fn write_response(allocator: std.mem.Allocator, stream: std.net.Stream, resp: qu
                     if (line.len == 0) continue;
                     const msg = try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ resp.request.identifier, line });
                     defer allocator.free(msg);
-                    _ = try stream.write(msg);
+                    _ = try conn.write(msg);
                 }
             }
             const ok_line = try std.fmt.allocPrint(allocator, "{s} OK\n", .{resp.request.identifier});
             defer allocator.free(ok_line);
-            _ = try stream.write(ok_line);
+            _ = try conn.write(ok_line);
         },
         else => {
             const status = if (resp.success) "OK" else "ERROR";
@@ -433,7 +475,7 @@ fn write_response(allocator: std.mem.Allocator, stream: std.net.Stream, resp: qu
             else
                 try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ resp.request.identifier, status });
             defer allocator.free(msg);
-            _ = try stream.write(msg);
+            _ = try conn.write(msg);
         },
     }
 }
@@ -495,7 +537,7 @@ test "parse_timestamp returns zero on invalid input" {
 
 test "tcp server init stores address" {
     var running = std.atomic.Value(bool).init(true);
-    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running);
+    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null);
     defer server.deinit();
     try std.testing.expectEqualStrings("127.0.0.1:5678", server.address);
 }
@@ -593,7 +635,7 @@ test "write_response formats multi-line body with request_id prefix per line" {
         .body = "backup.daily planned 1595586600000000000\nbackup.weekly planned 1595586660000000000\n",
     };
 
-    try write_response(std.testing.allocator, pair.write_stream, resp);
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
     pair.write_stream.close();
 
     var buf: [512]u8 = undefined;
@@ -678,7 +720,7 @@ test "write_response appends body when response body is non-null" {
         .body = "planned 1595586600000000000",
     };
 
-    try write_response(std.testing.allocator, pair.write_stream, resp);
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
     pair.write_stream.close();
 
     var buf: [512]u8 = undefined;
@@ -729,7 +771,7 @@ test "write_response formats list_rules multi-line body with request_id prefix" 
         .body = "rule.backup backup.* shell /usr/bin/backup.sh\nrule.notify notify.* shell /usr/bin/notify.sh\n",
     };
 
-    try write_response(std.testing.allocator, pair.write_stream, resp);
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
     pair.write_stream.close();
 
     var buf: [512]u8 = undefined;
@@ -754,7 +796,7 @@ test "handle_connection exits cleanly when client disconnects immediately" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        std.net.Stream{ .handle = pair.read_fd },
+        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
         addr,
         42,
         &req_ch,
@@ -776,7 +818,7 @@ test "handle_connection deregisters client from router on disconnect" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        std.net.Stream{ .handle = pair.read_fd },
+        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
         addr,
         77,
         &req_ch,
@@ -894,7 +936,7 @@ test "handle_connection passes peer address and exits cleanly" {
     const addr = try std.net.Address.parseIp("192.168.1.42", 54321);
     handle_connection(
         std.testing.allocator,
-        std.net.Stream{ .handle = pair.read_fd },
+        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
         addr,
         99,
         &req_ch,
@@ -917,7 +959,7 @@ test "write_response formats list_rules empty result as OK only" {
         .body = null,
     };
 
-    try write_response(std.testing.allocator, pair.write_stream, resp);
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
     pair.write_stream.close();
 
     var buf: [128]u8 = undefined;
@@ -958,7 +1000,7 @@ test "handle_connection forwards SET instruction to request channel" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        std.net.Stream{ .handle = pair.read_fd },
+        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
         addr,
         42,
         &req_ch,
@@ -1001,7 +1043,7 @@ test "handle_connection forwards LISTRULES instruction to request channel" {
     const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        std.net.Stream{ .handle = pair.read_fd },
+        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
         addr,
         43,
         &req_ch,
@@ -1011,4 +1053,71 @@ test "handle_connection forwards LISTRULES instruction to request channel" {
     t.join();
 
     try std.testing.expectEqualStrings("list_rules", ctx.received_tag);
+}
+
+test "plain Connection read returns data from underlying socket" {
+    const pair = try make_socket_pair();
+
+    try pair.write_stream.writeAll("hello");
+    pair.write_stream.close();
+
+    const conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } };
+    var buf: [16]u8 = undefined;
+    const n = try conn.read(&buf);
+    try std.testing.expectEqualStrings("hello", buf[0..n]);
+}
+
+test "plain Connection write delivers data through socket" {
+    const pair = try make_socket_pair();
+    defer std.posix.close(pair.read_fd);
+
+    const conn = Connection{ .plain = .{ .stream = pair.write_stream } };
+    _ = try conn.write("world");
+    conn.close();
+
+    var buf: [16]u8 = undefined;
+    const n = try std.posix.read(pair.read_fd, &buf);
+    try std.testing.expectEqualStrings("world", buf[0..n]);
+}
+
+test "write_response accepts plain Connection and formats OK response" {
+    const pair = try make_socket_pair();
+    defer std.posix.close(pair.read_fd);
+
+    const conn = Connection{ .plain = .{ .stream = pair.write_stream } };
+    const req = query.Request{
+        .client = 0,
+        .identifier = "r1",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 0 } },
+    };
+    const resp = query.Response{ .request = req, .success = true, .body = null };
+
+    try write_response(std.testing.allocator, conn, resp);
+    conn.close();
+
+    var buf: [64]u8 = undefined;
+    const n = try std.posix.read(pair.read_fd, &buf);
+    try std.testing.expectEqualStrings("r1 OK\n", buf[0..n]);
+}
+
+test "handle_connection accepts plain Connection and exits cleanly" {
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    pair.write_stream.close();
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    handle_connection(
+        std.testing.allocator,
+        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
+        addr,
+        100,
+        &req_ch,
+        &router,
+    );
 }

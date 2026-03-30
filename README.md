@@ -15,6 +15,7 @@ A time-based job scheduler written in Zig with hexagonal architecture, explicit 
 - **Persistence**: Append-only logfile with binary encoding and compression
 - **Configuration**: TOML-based settings for logging, listen address, and framerate
 - **Startup logging**: Runtime-configurable log levels with structured output for startup, connections, and execution lifecycle
+- **TLS support**: Optional TLS encryption for TCP protocol traffic using system OpenSSL
 
 ## Quick Start
 
@@ -103,6 +104,39 @@ framerate = 512             # scheduler tick rate (1-65535)
 ```
 
 All values are optional and fall back to the defaults shown above.
+
+### TLS
+
+ztick supports optional TLS encryption for the TCP protocol server. When TLS is configured, all protocol traffic (commands, job identifiers, shell commands) is encrypted in transit.
+
+**Generate a self-signed certificate:**
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout key.pem -out cert.pem -days 365 -nodes \
+  -subj "/CN=ztick"
+```
+
+**Configure TLS in your config file:**
+
+```toml
+[controller]
+listen = "127.0.0.1:5679"
+tls_cert = "/path/to/cert.pem"
+tls_key = "/path/to/key.pem"
+```
+
+By convention, use port `5678` for plaintext and port `5679` for TLS to avoid confusion between encrypted and unencrypted endpoints.
+
+Both `tls_cert` and `tls_key` must be set together. If only one is provided, ztick exits with a configuration error at startup. When neither is set, ztick runs in plaintext mode (the default).
+
+**Test the connection:**
+
+```bash
+openssl s_client -connect 127.0.0.1:5679 -quiet
+```
+
+**Requirements:** TLS support requires `libssl-dev` (Debian/Ubuntu) or `openssl-devel` (Fedora/RHEL) installed on the build machine. Plaintext-only builds have no additional dependencies. See [ADR 0003](docs/ADR/0003-openssl-tls-dependency.md) for details on the OpenSSL dependency decision.
 
 ## Threading Model
 

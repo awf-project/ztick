@@ -29,7 +29,6 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) (ParseError || std
 
     if (pos == input.len) return ParseError.Incomplete;
     if (input[pos] == '\n') {
-        allocator.free(command);
         return ParseError.Invalid;
     }
 

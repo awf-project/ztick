@@ -665,6 +665,137 @@ fn drain_stderr(stderr_file: std.fs.File, buf: []u8) []const u8 {
     return buf[0..filled];
 }
 
+const TlsPaths = struct {
+    cwd: []const u8,
+    cert: []const u8,
+    key: []const u8,
+
+    fn resolve(allocator: std.mem.Allocator) !TlsPaths {
+        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        errdefer allocator.free(cwd);
+        const cert = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/tls/cert.pem", .{cwd});
+        errdefer allocator.free(cert);
+        const key = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/tls/key.pem", .{cwd});
+        return .{ .cwd = cwd, .cert = cert, .key = key };
+    }
+
+    fn deinit(self: TlsPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+        allocator.free(self.cert);
+        allocator.free(self.cwd);
+    }
+};
+
+const TestServer = struct {
+    child: std.process.Child,
+    tmp_dir: std.testing.TmpDir,
+    config_path: []const u8,
+    allocator: std.mem.Allocator,
+
+    fn start(allocator: std.mem.Allocator, config_content: []const u8) !TestServer {
+        var tmp_dir = std.testing.tmpDir(.{});
+        errdefer tmp_dir.cleanup();
+
+        var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+        try config_file.writeAll(config_content);
+        config_file.close();
+
+        const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+        errdefer allocator.free(config_path);
+
+        const child = try spawn_ztick(allocator, config_path);
+
+        std.Thread.sleep(300_000_000);
+
+        return .{
+            .child = child,
+            .tmp_dir = tmp_dir,
+            .config_path = config_path,
+            .allocator = allocator,
+        };
+    }
+
+    fn stop(self: *TestServer) void {
+        _ = self.child.kill() catch {};
+        _ = self.child.wait() catch {};
+        self.allocator.free(self.config_path);
+        self.tmp_dir.cleanup();
+    }
+};
+
+// Feature: F006
+
+test "plaintext mode accepts commands when no TLS config is present" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(allocator, "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19879\"\n\n[database]\nlogfile_path = \"test_plaintext_f006.db\"\n");
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19879) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+
+    _ = stream.write("req-backward-compat-1 SET app.backward.compat.job 1595586600000000000\n") catch {
+        stream.close();
+        return error.SkipZigTest;
+    };
+
+    std.Thread.sleep(500_000_000);
+    stream.close();
+    std.Thread.sleep(100_000_000);
+
+    var stderr_buf: [8192]u8 = undefined;
+    const stderr = drain_stderr(server.child.stderr.?, &stderr_buf);
+
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] listening on") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[DEBUG] instruction received: set") != null);
+
+    server.tmp_dir.dir.deleteFile("test_plaintext_f006.db") catch {};
+}
+
+test "partial TLS config with only tls_cert is rejected at startup" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+    try config_file.writeAll("[log]\nlevel = \"error\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\ntls_cert = \"/any/path/cert.pem\"\n\n[database]\nlogfile_path = \"test_partial_tls_cert.db\"\n");
+    config_file.close();
+
+    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    defer allocator.free(config_path);
+
+    var child = try spawn_ztick(allocator, config_path);
+    const term = try child.wait();
+
+    switch (term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "partial TLS config with only tls_key is rejected at startup" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+    try config_file.writeAll("[log]\nlevel = \"error\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\ntls_key = \"/any/path/key.pem\"\n\n[database]\nlogfile_path = \"test_partial_tls_key.db\"\n");
+    config_file.close();
+
+    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    defer allocator.free(config_path);
+
+    var child = try spawn_ztick(allocator, config_path);
+    const term = try child.wait();
+
+    switch (term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => try std.testing.expect(false),
+    }
+}
+
 test "startup with default log level produces config and listening address on stderr" {
     const allocator = std.testing.allocator;
 
@@ -924,4 +1055,184 @@ test "execution failure marks triggered job as failed" {
 
     try scheduler.tick(2000);
     try std.testing.expectEqual(JobStatus.failed, scheduler.job_storage.get("deploy.release.1").?.status);
+}
+
+// Feature: F006
+
+test "TLS-enabled server accepts encrypted connections and processes SET command over encrypted channel" {
+    const allocator = std.testing.allocator;
+
+    const tls = try TlsPaths.resolve(allocator);
+    defer tls.deinit(allocator);
+
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19884\"\ntls_cert = \"{s}\"\ntls_key = \"{s}\"\n\n[database]\nlogfile_path = \"test_tls_encrypted.db\"\n",
+        .{ tls.cert, tls.key },
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    std.Thread.sleep(200_000_000);
+
+    // Use openssl s_client to connect over TLS and send a SET command
+    var openssl = std.process.Child.init(
+        &[_][]const u8{
+            "openssl",       "s_client",
+            "-connect",      "127.0.0.1:19884",
+            "-quiet",        "-no_ign_eof",
+            "-verify_quiet",
+        },
+        allocator,
+    );
+    openssl.stdin_behavior = .Pipe;
+    openssl.stdout_behavior = .Pipe;
+    openssl.stderr_behavior = .Pipe;
+    try openssl.spawn();
+
+    std.Thread.sleep(300_000_000);
+
+    _ = openssl.stdin.?.write("req-tls-1 SET app.tls.encrypted.job 1595586600000000000\n") catch {
+        _ = openssl.kill() catch {};
+        _ = openssl.wait() catch {};
+        server.tmp_dir.dir.deleteFile("test_tls_encrypted.db") catch {};
+        return error.SkipZigTest;
+    };
+
+    std.Thread.sleep(500_000_000);
+
+    openssl.stdin.?.close();
+    openssl.stdin = null;
+
+    std.Thread.sleep(200_000_000);
+
+    // Read openssl stdout for the server response
+    const stdout_file = openssl.stdout.?;
+    const flags = std.posix.fcntl(stdout_file.handle, std.posix.F.GETFL, 0) catch {
+        _ = openssl.kill() catch {};
+        _ = openssl.wait() catch {};
+        server.tmp_dir.dir.deleteFile("test_tls_encrypted.db") catch {};
+        return error.SkipZigTest;
+    };
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(stdout_file.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_filled: usize = 0;
+    while (stdout_filled < stdout_buf.len) {
+        const n = stdout_file.read(stdout_buf[stdout_filled..]) catch break;
+        if (n == 0) break;
+        stdout_filled += n;
+    }
+    const tls_response = stdout_buf[0..stdout_filled];
+
+    _ = openssl.kill() catch {};
+    _ = openssl.wait() catch {};
+
+    // Read server stderr for debug logs
+    var stderr_buf: [8192]u8 = undefined;
+    const stderr_output = drain_stderr(server.child.stderr.?, &stderr_buf);
+
+    // The TLS response must contain "OK" from the SET command
+    if (std.mem.indexOf(u8, tls_response, "OK") == null) {
+        std.debug.print("\nTLS response ({d} bytes): '{s}'\n", .{ tls_response.len, tls_response });
+        std.debug.print("Server stderr:\n{s}\n", .{stderr_output});
+        return error.TestExpectedEqual;
+    }
+
+    // Verify the server processed the SET instruction
+    try std.testing.expect(std.mem.indexOf(u8, stderr_output, "[DEBUG] instruction received: set") != null);
+
+    server.tmp_dir.dir.deleteFile("test_tls_encrypted.db") catch {};
+}
+
+test "failed TLS handshake closes offending connection without crashing server" {
+    const allocator = std.testing.allocator;
+
+    const tls = try TlsPaths.resolve(allocator);
+    defer tls.deinit(allocator);
+
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:19883\"\ntls_cert = \"{s}\"\ntls_key = \"{s}\"\n\n[database]\nlogfile_path = \"test_tls_bad_handshake.db\"\n",
+        .{ tls.cert, tls.key },
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19883) catch unreachable;
+
+    // Connect with plain TCP and send garbage bytes (not a TLS ClientHello)
+    var bad_conn = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+
+    _ = bad_conn.write("GARBAGE BYTES NOT A TLS CLIENT HELLO") catch {};
+
+    std.Thread.sleep(500_000_000);
+
+    const recv_timeout = std.posix.timeval{ .sec = 0, .usec = 300_000 };
+    std.posix.setsockopt(
+        bad_conn.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&recv_timeout),
+    ) catch {};
+
+    var read_buf: [16]u8 = undefined;
+    const n: usize = bad_conn.read(&read_buf) catch |err| switch (err) {
+        error.ConnectionResetByPeer, error.WouldBlock => 0,
+        else => {
+            bad_conn.close();
+            server.tmp_dir.dir.deleteFile("test_tls_bad_handshake.db") catch {};
+            return err;
+        },
+    };
+    bad_conn.close();
+
+    try std.testing.expectEqual(@as(usize, 0), n);
+
+    var next_conn = std.net.tcpConnectToAddress(addr) catch |err| {
+        server.tmp_dir.dir.deleteFile("test_tls_bad_handshake.db") catch {};
+        return err;
+    };
+    next_conn.close();
+
+    server.tmp_dir.dir.deleteFile("test_tls_bad_handshake.db") catch {};
+}
+
+test "server recovers after client disconnects during TLS handshake" {
+    const allocator = std.testing.allocator;
+
+    const tls = try TlsPaths.resolve(allocator);
+    defer tls.deinit(allocator);
+
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:19885\"\ntls_cert = \"{s}\"\ntls_key = \"{s}\"\n\n[database]\nlogfile_path = \"test_tls_mid_handshake.db\"\n",
+        .{ tls.cert, tls.key },
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19885) catch unreachable;
+
+    var partial_conn = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+
+    _ = partial_conn.write("\x16\x03\x03\x00\x01") catch {};
+    partial_conn.close();
+
+    std.Thread.sleep(500_000_000);
+
+    var next_conn = std.net.tcpConnectToAddress(addr) catch |err| {
+        server.tmp_dir.dir.deleteFile("test_tls_mid_handshake.db") catch {};
+        return err;
+    };
+    next_conn.close();
+
+    server.tmp_dir.dir.deleteFile("test_tls_mid_handshake.db") catch {};
 }

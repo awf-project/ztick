@@ -19,6 +19,8 @@ level = "info"                    # error, warn, info, debug
 
 [controller]
 listen = "127.0.0.1:5678"        # TCP server address
+tls_cert = "/path/to/cert.pem"   # Optional: enable TLS
+tls_key = "/path/to/key.pem"     # Optional: enable TLS
 
 [database]
 fsync_on_persist = true          # Flush on every write

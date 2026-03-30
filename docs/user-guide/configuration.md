@@ -55,6 +55,8 @@ listen = "127.0.0.1:5678"
 | Option | Type | Default | Notes |
 |--------|------|---------|-------|
 | `listen` | string | `127.0.0.1:5678` | TCP address and port to listen on |
+| `tls_cert` | string (path) | (optional) | Path to PEM-encoded TLS certificate |
+| `tls_key` | string (path) | (optional) | Path to PEM-encoded TLS private key |
 
 **Examples:**
 
@@ -70,7 +72,56 @@ listen = "[::1]:5678"
 # Non-standard port
 [controller]
 listen = "127.0.0.1:9999"
+
+# Enable TLS encryption (use port 5679 by convention)
+[controller]
+listen = "127.0.0.1:5679"
+tls_cert = "/etc/ztick/cert.pem"
+tls_key = "/etc/ztick/key.pem"
 ```
+
+### Setting Up TLS
+
+ztick supports optional TLS encryption for secure communication. When configured, all protocol traffic is encrypted in transit.
+
+**Requirements:**
+- `libssl-dev` (Debian/Ubuntu) or `openssl-devel` (Fedora/RHEL) on build machine
+- PEM-format certificate and private key files
+
+**Generate a self-signed certificate:**
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout key.pem -out cert.pem -days 365 -nodes \
+  -subj "/CN=ztick"
+```
+
+This creates:
+- `cert.pem` — Public certificate (valid for 365 days)
+- `key.pem` — Private key (unencrypted with `-nodes`)
+
+**Enable in config:**
+
+```toml
+[controller]
+listen = "127.0.0.1:5679"
+tls_cert = "/path/to/cert.pem"
+tls_key = "/path/to/key.pem"
+```
+
+By convention, use port `5678` for plaintext and port `5679` for TLS to avoid confusion between encrypted and unencrypted endpoints.
+
+**Test the connection:**
+
+```bash
+openssl s_client -connect 127.0.0.1:5679 -quiet
+```
+
+**Important notes:**
+- Both `tls_cert` and `tls_key` **must be set together**
+- If only one is provided, ztick exits with a configuration error
+- Omit both to run in plaintext mode (default)
+- When TLS is disabled, the server functions identically to earlier versions — plaintext mode is fully backward compatible
 
 ### `[database]` — Persistence and Timing
 
@@ -169,7 +220,9 @@ framerate = 512
 level = "warn"
 
 [controller]
-listen = "0.0.0.0:5678"
+listen = "0.0.0.0:5679"
+tls_cert = "/etc/ztick/cert.pem"
+tls_key = "/etc/ztick/key.pem"
 
 [database]
 fsync_on_persist = true
@@ -177,7 +230,7 @@ framerate = 512
 ```
 
 - Minimal logging (errors and warnings only)
-- Listen on all interfaces for distributed clients
+- Listen on all interfaces with TLS encryption (port 5679)
 - Safe persistence
 
 ### High-Volume

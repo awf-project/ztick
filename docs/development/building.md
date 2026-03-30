@@ -5,6 +5,7 @@ Guide to compiling, testing, and packaging ztick from source.
 ## Prerequisites
 
 - **Zig 0.14.1** ([download](https://ziglang.org/download/))
+- **libssl-dev** (Debian/Ubuntu) or **openssl-devel** (Fedora/RHEL) — required for TLS support
 - **git** (optional, for cloning the repository)
 
 ## Build Variants

@@ -1,0 +1,12 @@
+[log]
+level = "info"
+
+[controller]
+listen = "127.0.0.1:5678"
+tls_cert = "test/fixtures/tls/cert.pem"
+tls_key = "test/fixtures/tls/key.pem"
+
+[database]
+fsync_on_persist = false
+framerate = 512
+logfile_path = "ztick.log"

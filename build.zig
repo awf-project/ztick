@@ -1,8 +1,20 @@
 const std = @import("std");
 
+fn link_openssl(step: *std.Build.Step.Compile) void {
+    step.linkLibC();
+    step.linkSystemLibrary("ssl");
+    step.linkSystemLibrary("crypto");
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // Link OpenSSL only when tls_context.zig is present; plaintext-only builds remain zero-dependency.
+    const tls_enabled = blk: {
+        b.build_root.handle.access("src/infrastructure/tls_context.zig", .{}) catch break :blk false;
+        break :blk true;
+    };
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -14,6 +26,7 @@ pub fn build(b: *std.Build) void {
         .name = "ztick",
         .root_module = root_module,
     });
+    if (tls_enabled) link_openssl(exe);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -41,6 +54,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         const layer_test = b.addTest(.{ .root_module = layer_module });
+        if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(layer_test);
         const run_layer_test = b.addRunArtifact(layer_test);
         test_step.dependOn(&run_layer_test.step);
         const step = b.step(layer.name, layer.desc);
@@ -53,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const main_tests = b.addTest(.{ .root_module = main_test_module });
+    if (tls_enabled) link_openssl(main_tests);
     const run_main_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_main_tests.step);
 
@@ -65,6 +80,7 @@ pub fn build(b: *std.Build) void {
     const functional_test = b.addTest(.{
         .root_module = functional_module,
     });
+    if (tls_enabled) link_openssl(functional_test);
     const run_functional = b.addRunArtifact(functional_test);
     const functional_step = b.step("test-functional", "Run functional tests");
     functional_step.dependOn(&run_functional.step);

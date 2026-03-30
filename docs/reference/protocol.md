@@ -4,20 +4,25 @@ The ztick protocol is a simple line-based text protocol for communicating with t
 
 ## Protocol Overview
 
-- **Transport**: TCP
+- **Transport**: TCP (plaintext or TLS-encrypted)
 - **Format**: Newline-terminated lines
 - **Parser**: Space-separated arguments with quoted string support
 - **Max line size**: 4096 bytes (fixed per-connection buffer)
+
+**TLS Support:** When ztick is configured with TLS certificates, the protocol is transparently encrypted over the same TCP connection. The protocol itself is unchanged — clients using TLS need only change their connection mechanism (e.g., use `openssl s_client` instead of `nc`). See [Configuration Reference](configuration.md) for TLS setup.
 
 ## Connection
 
 ```
 1. Connect to the TCP server (default: 127.0.0.1:5678)
-2. Send commands as lines (terminated with \n)
-3. Receive responses (also newline-terminated)
-4. Connection stays open for multiple commands
-5. Close when done
+2. If TLS is configured, complete the TLS handshake
+3. Send commands as lines (terminated with \n)
+4. Receive responses (also newline-terminated)
+5. Connection stays open for multiple commands
+6. Close when done
 ```
+
+When TLS is enabled, plaintext clients that connect will have their connection closed after a failed handshake. The server remains available to new connections.
 
 ## Command Format
 

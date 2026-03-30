@@ -20,6 +20,8 @@ pub const ConfigError = error{
 pub const Config = struct {
     log_level: LogLevel,
     controller_listen: []const u8,
+    controller_tls_cert: ?[]const u8,
+    controller_tls_key: ?[]const u8,
     database_fsync_on_persist: bool,
     database_framerate: u16,
     /// Zig extension: configurable logfile path (Rust reference used hardcoded "logfile").
@@ -27,6 +29,8 @@ pub const Config = struct {
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.controller_listen);
+        if (self.controller_tls_cert) |cert| allocator.free(cert);
+        if (self.controller_tls_key) |key| allocator.free(key);
         allocator.free(self.database_logfile_path);
     }
 };
@@ -35,6 +39,10 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
     var log_level: LogLevel = .info;
     var controller_listen: ?[]u8 = null;
     errdefer if (controller_listen) |cl| allocator.free(cl);
+    var controller_tls_cert: ?[]u8 = null;
+    errdefer if (controller_tls_cert) |cert| allocator.free(cert);
+    var controller_tls_key: ?[]u8 = null;
+    errdefer if (controller_tls_key) |key| allocator.free(key);
     var database_fsync_on_persist: bool = true;
     var database_framerate: u16 = 512;
     var database_logfile_path: ?[]u8 = null;
@@ -73,6 +81,12 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
             if (std.mem.eql(u8, key, "listen")) {
                 if (controller_listen) |prev| allocator.free(prev);
                 controller_listen = try allocator.dupe(u8, unquote(raw_val));
+            } else if (std.mem.eql(u8, key, "tls_cert")) {
+                if (controller_tls_cert) |prev| allocator.free(prev);
+                controller_tls_cert = try allocator.dupe(u8, unquote(raw_val));
+            } else if (std.mem.eql(u8, key, "tls_key")) {
+                if (controller_tls_key) |prev| allocator.free(prev);
+                controller_tls_key = try allocator.dupe(u8, unquote(raw_val));
             } else {
                 return ConfigError.UnknownKey;
             }
@@ -98,9 +112,15 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
         }
     }
 
+    if ((controller_tls_cert != null) != (controller_tls_key != null)) {
+        return ConfigError.InvalidValue;
+    }
+
     return Config{
         .log_level = log_level,
         .controller_listen = controller_listen orelse try allocator.dupe(u8, "127.0.0.1:5678"),
+        .controller_tls_cert = controller_tls_cert,
+        .controller_tls_key = controller_tls_key,
         .database_fsync_on_persist = database_fsync_on_persist,
         .database_framerate = database_framerate,
         .database_logfile_path = database_logfile_path orelse try allocator.dupe(u8, "logfile"),
@@ -191,4 +211,43 @@ test "parse rejects unknown key in section" {
         \\
     );
     try std.testing.expectError(ConfigError.UnknownKey, result);
+}
+
+test "tls fields default to null when not configured" {
+    const cfg = try parse(std.testing.allocator, "");
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.controller_tls_cert);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.controller_tls_key);
+}
+
+test "parse sets both tls cert and key when both configured" {
+    const cfg = try parse(std.testing.allocator,
+        \\[controller]
+        \\tls_cert = "/etc/ztick/server.crt"
+        \\tls_key = "/etc/ztick/server.key"
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("/etc/ztick/server.crt", cfg.controller_tls_cert.?);
+    try std.testing.expectEqualStrings("/etc/ztick/server.key", cfg.controller_tls_key.?);
+}
+
+test "parse rejects config with tls cert but no tls key" {
+    const result = parse(std.testing.allocator,
+        \\[controller]
+        \\tls_cert = "/etc/ztick/server.crt"
+        \\
+    );
+    try std.testing.expectError(ConfigError.InvalidValue, result);
+}
+
+test "parse rejects config with tls key but no tls cert" {
+    const result = parse(std.testing.allocator,
+        \\[controller]
+        \\tls_key = "/etc/ztick/server.key"
+        \\
+    );
+    try std.testing.expectError(ConfigError.InvalidValue, result);
 }

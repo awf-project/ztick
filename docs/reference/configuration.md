@@ -33,11 +33,21 @@ TCP server configuration.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `listen` | string | `"127.0.0.1:5678"` | TCP address and port for the protocol server |
+| `tls_cert` | string (path) | `null` | Path to PEM-encoded TLS certificate file (requires `tls_key` to be set) |
+| `tls_key` | string (path) | `null` | Path to PEM-encoded TLS private key file (requires `tls_cert` to be set) |
 
 **Address Format**: `<host>:<port>` where host is IPv4 or IPv6
 - `127.0.0.1:5678` — Localhost only
 - `0.0.0.0:5678` — All interfaces (IPv4)
 - `[::1]:5678` — Localhost only (IPv6)
+
+**TLS Configuration Notes:**
+- Both `tls_cert` and `tls_key` must be set together to enable TLS
+- If only one is set, ztick exits with `ConfigError.InvalidValue` at startup
+- Omit both to run in plaintext mode (default)
+- By convention, use port `5678` for plaintext and port `5679` for TLS to avoid confusion between encrypted and unencrypted endpoints
+- Requires `libssl-dev` (Debian/Ubuntu) or equivalent on the build machine
+- See [README TLS section](../../README.md#tls) for certificate generation instructions
 
 ### `[database]`
 
@@ -61,7 +71,9 @@ Persistence and scheduling configuration.
 level = "debug"
 
 [controller]
-listen = "0.0.0.0:9000"
+listen = "0.0.0.0:5679"
+tls_cert = "/etc/ztick/cert.pem"
+tls_key = "/etc/ztick/key.pem"
 
 [database]
 logfile_path = "data/ztick.log"
@@ -77,4 +89,4 @@ framerate = 100
 | `FramerateOutOfRange` | `framerate` is 0 |
 | `UnknownSection` | Section name is not `log`, `controller`, or `database` |
 | `UnknownKey` | Key is not recognized within its section |
-| `InvalidValue` | Value cannot be parsed (e.g. non-boolean for `fsync_on_persist`) |
+| `InvalidValue` | Value cannot be parsed (e.g. non-boolean for `fsync_on_persist`), or only one of `tls_cert`/`tls_key` is set |

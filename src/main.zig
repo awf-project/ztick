@@ -17,6 +17,7 @@ const infrastructure_channel = @import("infrastructure/channel.zig");
 const infrastructure_clock = @import("infrastructure/clock.zig");
 const infrastructure_shell_runner = @import("infrastructure/shell_runner.zig");
 const infrastructure_tcp_server = @import("infrastructure/tcp_server.zig");
+const infrastructure_tls_context = @import("infrastructure/tls_context.zig");
 const infrastructure_persistence_background = @import("infrastructure/persistence/background.zig");
 const interfaces_config = @import("interfaces/config.zig");
 const interfaces_cli = @import("interfaces/cli.zig");
@@ -84,6 +85,7 @@ test {
     _ = infrastructure_clock;
     _ = infrastructure_shell_runner;
     _ = infrastructure_tcp_server;
+    _ = infrastructure_tls_context;
     _ = infrastructure_persistence_background;
     _ = interfaces_config;
     _ = interfaces_cli;
@@ -108,6 +110,7 @@ const ControllerContext = struct {
     request_ch: *Channel(query.Request),
     response_router: *ResponseRouter,
     running: *std.atomic.Value(bool),
+    tls_context: ?*infrastructure_tls_context.TlsContext,
 };
 
 const DatabaseContext = struct {
@@ -130,7 +133,7 @@ const ProcessorContext = struct {
 };
 
 fn run_controller(ctx: ControllerContext) void {
-    var server = TcpServer.init(ctx.allocator, ctx.address, ctx.running);
+    var server = TcpServer.init(ctx.allocator, ctx.address, ctx.running, ctx.tls_context);
     defer server.deinit();
     server.start(ctx.request_ch, ctx.response_router) catch |err| {
         std.log.err("controller: start failed: {}", .{err});
@@ -342,6 +345,50 @@ test "processor thread propagates shell failure to response channel" {
     thread.join();
 }
 
+test "controller context tls_context is null when no TLS cert is configured" {
+    const allocator = std.testing.allocator;
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    var running = std.atomic.Value(bool).init(false);
+
+    const ctx = ControllerContext{
+        .allocator = allocator,
+        .address = "127.0.0.1:0",
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .running = &running,
+        .tls_context = null,
+    };
+    try std.testing.expectEqual(@as(?*infrastructure_tls_context.TlsContext, null), ctx.tls_context);
+}
+
+test "controller context tls_context is non-null when cert and key are configured" {
+    const allocator = std.testing.allocator;
+    var tls_ctx = try infrastructure_tls_context.TlsContext.create(
+        "test/fixtures/tls/cert.pem",
+        "test/fixtures/tls/key.pem",
+    );
+    defer tls_ctx.deinit();
+
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    var running = std.atomic.Value(bool).init(false);
+
+    const ctx = ControllerContext{
+        .allocator = allocator,
+        .address = "127.0.0.1:0",
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .running = &running,
+        .tls_context = &tls_ctx,
+    };
+    try std.testing.expect(ctx.tls_context != null);
+}
+
 test "tick processes query request and routes response" {
     const allocator = std.testing.allocator;
     var req_ch = try Channel(query.Request).init(allocator, 4);
@@ -413,12 +460,20 @@ pub fn main() !void {
 
     var running = std.atomic.Value(bool).init(true);
 
+    var tls_ctx: ?infrastructure_tls_context.TlsContext = null;
+    if (cfg.controller_tls_cert) |cert| {
+        const key = cfg.controller_tls_key.?;
+        tls_ctx = try infrastructure_tls_context.TlsContext.create(cert, key);
+    }
+    defer if (tls_ctx) |*ctx| ctx.deinit();
+
     const controller_thread = try std.Thread.spawn(.{}, run_controller, .{ControllerContext{
         .allocator = allocator,
         .address = cfg.controller_listen,
         .request_ch = &query_request_ch,
         .response_router = &response_router,
         .running = &running,
+        .tls_context = if (tls_ctx) |*ctx| ctx else null,
     }});
 
     const database_thread = try std.Thread.spawn(.{}, run_database, .{DatabaseContext{
