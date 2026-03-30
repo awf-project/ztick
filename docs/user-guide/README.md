@@ -19,8 +19,8 @@ Task-oriented how-to guides for common ztick operations.
 - **[Configuration](configuration.md)** — Customize behavior
   - Logging levels
   - TCP server settings
+  - TLS encryption setup
   - Persistence and evaluation frequency
-  - Environment variable overrides
 
 ## Quick Reference
 

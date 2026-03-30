@@ -8,6 +8,7 @@ This tutorial walks you through building, configuring, and running ztick for the
 - A POSIX shell (bash, zsh, etc.)
 - `socat` for sending TCP commands (or `nc`/`ncat` if available)
 - Basic familiarity with command-line tools
+- **Optional**: `libssl-dev` (Debian/Ubuntu) or `openssl-devel` (Fedora/RHEL) if you want to build with TLS support
 
 ## Step 1: Build the Project
 
@@ -201,9 +202,11 @@ See [Protocol Reference](../reference/protocol.md) for full details.
 ## Next Steps
 
 - **[Writing Rules](../user-guide/writing-rules.md)** — Learn pattern matching and runners
-- **[Configuration](../user-guide/configuration.md)** — Explore all options
+- **[Configuration](../user-guide/configuration.md)** — Explore all options, including TLS setup
 - **[Protocol Reference](../reference/protocol.md)** — Full protocol reference
 - **[Architecture](../development/architecture.md)** — Understand the design
+
+**Want to secure your deployment?** See the [TLS Setup Guide](../user-guide/configuration.md#setting-up-tls) for encrypting protocol traffic.
 
 ## Troubleshooting
 

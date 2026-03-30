@@ -30,6 +30,7 @@ Numbers are never reused. If a decision is reversed, the original ADR is marked 
 |-----|-------|--------|
 | [0001](0001-hexagonal-architecture.md) | Hexagonal Architecture (Ports and Adapters) | Accepted |
 | [0002](0002-zig-language-choice.md) | Zig Language Choice | Accepted |
+| [0003](0003-openssl-tls-dependency.md) | System OpenSSL for Server-Side TLS | Accepted |
 
 ## Creating a New ADR
 

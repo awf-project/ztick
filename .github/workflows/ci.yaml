@@ -30,6 +30,16 @@ jobs:
         with:
           version: latest
 
+      - name: Install OpenSSL dev headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Generate TLS test certificates
+        run: |
+          mkdir -p test/fixtures/tls
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout test/fixtures/tls/key.pem -out test/fixtures/tls/cert.pem \
+            -days 3650 -nodes -subj "/CN=localhost"
+
       - name: Run tests
         run: zig build test
 
@@ -42,6 +52,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: latest
+
+      - name: Install OpenSSL dev headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
       - name: Build release
         run: zig build -Doptimize=ReleaseSafe
