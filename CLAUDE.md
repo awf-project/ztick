@@ -5,6 +5,7 @@
 - Four strict layers: domain/ (pure data, zero deps), application/ (state machines, storage), infrastructure/ (IO adapters), interfaces/ (CLI, config)
 - Each layer has a barrel export file (domain.zig, application.zig, infrastructure.zig, interfaces.zig); import layers through barrels only
 - All tagged union variants must declare payloads with `struct {}` syntax, even when empty, for consistent pattern matching and destructuring across the codebase
+- Logfile dump must never load entire file into memory; implement sequential frame reads to comply with NFR-001 scaling constraint
 
 ## Build System
 
@@ -60,6 +61,9 @@
 - Try openFile(.write_only) first, fall back to createFile for new logfiles; handles both append and initialization
 - Pre-allocate capacity in thread tracking list before spawning; ensure append cannot fail due to OOM and orphan spawned threads
 - Remove thread handles from tracking list after joining; never accumulate handles indefinitely as this causes O(n) memory growth
+- Always escape control characters (0x00-0x1F excluding tab/CR/LF) in JSON output per RFC 8259; missing escapes produce invalid JSON that tools like jq reject
+- For follow mode initial offset: subtract remaining partial-frame bytes from file length, not file length itself; starting at file end skips incomplete frames
+- Never silently ignore persistence decode errors; emit warnings to stderr with byte offset for each failure to aid debugging
 
 ## Test Conventions
 

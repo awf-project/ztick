@@ -16,6 +16,7 @@ A time-based job scheduler written in Zig with hexagonal architecture, explicit 
 - **Configuration**: TOML-based settings for logging, listen address, and framerate
 - **Startup logging**: Runtime-configurable log levels with structured output for startup, connections, and execution lifecycle
 - **TLS support**: Optional TLS encryption for TCP protocol traffic using system OpenSSL
+- **Logfile dump**: Offline inspection of binary logfiles with text/JSON output, compact mode, and live tail
 
 ## Quick Start
 
@@ -84,9 +85,26 @@ ztick follows **hexagonal architecture** with 4 strict layers:
 
 ## CLI
 
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `ztick` | Start the scheduler server (default) |
+| `ztick dump <logfile>` | Inspect binary logfile contents offline |
+
+### Server Flags
+
 | Flag | Description |
 |------|-------------|
 | `-c`, `--config` | Path to TOML configuration file |
+
+### Dump Flags
+
+| Flag | Description |
+|------|-------------|
+| `--format text\|json` | Output format: human-readable text (default) or NDJSON |
+| `--compact` | Show only effective state (deduplicate by ID, omit removed entries) |
+| `--follow` | Live tail mode — watch for newly appended entries |
 
 ## Configuration
 

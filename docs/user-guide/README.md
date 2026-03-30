@@ -22,6 +22,12 @@ Task-oriented how-to guides for common ztick operations.
   - TLS encryption setup
   - Persistence and evaluation frequency
 
+- **[Inspecting Logfiles](inspecting-logfiles.md)** — Dump and analyze the binary logfile
+  - Human-readable text output
+  - NDJSON export for `jq` pipelines
+  - Compact mode for effective state
+  - Live tail with `--follow`
+
 ## Quick Reference
 
 ### Create a Job
@@ -64,6 +70,15 @@ echo 'req-1 REMOVERULE my.rule' | nc localhost 5678
 
 ```bash
 echo 'req-1 LISTRULES' | socat - TCP:localhost:5678
+```
+
+### Inspect Logfile
+
+```bash
+ztick dump logfile                          # text output
+ztick dump logfile --format json            # NDJSON output
+ztick dump logfile --compact                # effective state only
+ztick dump logfile --follow                 # live tail
 ```
 
 ## Common Tasks
