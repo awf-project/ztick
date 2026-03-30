@@ -1236,3 +1236,514 @@ test "server recovers after client disconnects during TLS handshake" {
 
     server.tmp_dir.dir.deleteFile("test_tls_mid_handshake.db") catch {};
 }
+
+const DumpTestResult = struct {
+    stdout: []const u8,
+    exit_code: u8,
+    allocator: std.mem.Allocator,
+    _tmp_dir: std.testing.TmpDir,
+    _logfile_path: []const u8,
+
+    fn deinit(self: *DumpTestResult) void {
+        self.allocator.free(self.stdout);
+        self.allocator.free(self._logfile_path);
+        self._tmp_dir.cleanup();
+    }
+};
+
+fn run_dump_command(allocator: std.mem.Allocator, logfile_data: ?[]const u8, extra_args: []const []const u8) !DumpTestResult {
+    var tmp_dir = std.testing.tmpDir(.{});
+    errdefer tmp_dir.cleanup();
+
+    const filename = "test.bin";
+    if (logfile_data) |data| {
+        var log_file = try tmp_dir.dir.createFile(filename, .{});
+        try log_file.writeAll(data);
+        log_file.close();
+    } else {
+        var log_file = try tmp_dir.dir.createFile(filename, .{});
+        log_file.close();
+    }
+
+    const logfile_path = try tmp_dir.dir.realpathAlloc(allocator, filename);
+    errdefer allocator.free(logfile_path);
+
+    var args_buf: [16][]const u8 = undefined;
+    args_buf[0] = "zig-out/bin/ztick";
+    args_buf[1] = "dump";
+    args_buf[2] = logfile_path;
+    for (extra_args, 0..) |arg, i| args_buf[3 + i] = arg;
+    const args = args_buf[0 .. 3 + extra_args.len];
+
+    var child = std.process.Child.init(args, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.stdin_behavior = .Ignore;
+    try child.spawn();
+
+    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 65536);
+    errdefer allocator.free(stdout_data);
+
+    const term = try child.wait();
+    const exit_code: u8 = switch (term) {
+        .Exited => |code| code,
+        else => return error.TestUnexpectedResult,
+    };
+
+    return DumpTestResult{
+        .stdout = stdout_data,
+        .exit_code = exit_code,
+        .allocator = allocator,
+        ._tmp_dir = tmp_dir,
+        ._logfile_path = logfile_path,
+    };
+}
+
+fn expect_follow_exits_cleanly_on_signal(allocator: std.mem.Allocator, signal: u6) !void {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var log_file = try tmp_dir.dir.createFile("follow_signal.bin", .{});
+    log_file.close();
+
+    const logfile_path = try tmp_dir.dir.realpathAlloc(allocator, "follow_signal.bin");
+    defer allocator.free(logfile_path);
+
+    var child = std.process.Child.init(
+        &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path, "--follow" },
+        allocator,
+    );
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.stdin_behavior = .Ignore;
+    try child.spawn();
+
+    std.Thread.sleep(200_000_000);
+    std.posix.kill(child.id, signal) catch {};
+    const term = try child.wait();
+
+    switch (term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "dump command prints all entries in text format" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "app.job.1", .execution = 1605457800000000000, .status = .planned } },
+        .{ .rule = .{ .identifier = "rule.1", .pattern = "app.", .runner = .{ .shell = .{ .command = "/bin/true" } } } },
+        .{ .job_removal = .{ .identifier = "old.job" } },
+        .{ .rule_removal = .{ .identifier = "old.rule" } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "SET app.job.1 1605457800000000000 planned\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "RULE SET rule.1 app. shell /bin/true\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "REMOVE old.job\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "REMOVERULE old.rule\n") != null);
+}
+
+test "dump command prints NDJSON entries with --format json" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "app.job.2", .execution = 1605457800000000000, .status = .executed } },
+        .{ .job_removal = .{ .identifier = "gone.job" } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{ "--format", "json" });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, result.stdout, "\n"), '\n');
+    const line1 = lines.next() orelse return error.TestUnexpectedResult;
+    const line2 = lines.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, line1, "\"type\":\"set\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line1, "\"identifier\":\"app.job.2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line2, "\"type\":\"remove\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line2, "\"identifier\":\"gone.job\"") != null);
+}
+
+test "dump command produces no output for empty logfile" {
+    const allocator = std.testing.allocator;
+
+    var result = try run_dump_command(allocator, null, &.{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("", result.stdout);
+}
+
+test "dump command exits 1 for missing logfile" {
+    const allocator = std.testing.allocator;
+
+    var child = std.process.Child.init(
+        &[_][]const u8{ "zig-out/bin/ztick", "dump", "/nonexistent/path/ztick-f007-test.bin" },
+        allocator,
+    );
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.stdin_behavior = .Ignore;
+    try child.spawn();
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 1), code),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "dump command --compact keeps only last SET per identifier" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "app.job.dedup", .execution = 1000000000000000000, .status = .planned } },
+        .{ .job = .{ .identifier = "app.job.dedup", .execution = 2000000000000000000, .status = .planned } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{"--compact"});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "SET app.job.dedup 2000000000000000000 planned\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "SET app.job.dedup 1000000000000000000 planned\n") == null);
+}
+
+test "dump command --compact omits entries whose final mutation is a removal" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "removed.job", .execution = 1605457800000000000, .status = .planned } },
+        .{ .job_removal = .{ .identifier = "removed.job" } },
+        .{ .job = .{ .identifier = "kept.job", .execution = 1605457800000000000, .status = .planned } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{"--compact"});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "removed.job") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "SET kept.job 1605457800000000000 planned\n") != null);
+}
+
+test "dump command prints warning to stderr and outputs complete entries for partial trailing frame" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "partial.job", .execution = 1605457800000000000, .status = .planned } },
+    });
+    defer allocator.free(logfile_data);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var log_file = try tmp_dir.dir.createFile("partial.bin", .{});
+    try log_file.writeAll(logfile_data);
+    try log_file.writeAll(&[_]u8{ 0, 0, 42 });
+    log_file.close();
+
+    const logfile_path = try tmp_dir.dir.realpathAlloc(allocator, "partial.bin");
+    defer allocator.free(logfile_path);
+
+    var child = std.process.Child.init(
+        &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path },
+        allocator,
+    );
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.stdin_behavior = .Ignore;
+    try child.spawn();
+
+    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 65536);
+    defer allocator.free(stdout_data);
+    const stderr_data = try child.stderr.?.readToEndAlloc(allocator, 65536);
+    defer allocator.free(stderr_data);
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, stdout_data, "SET partial.job 1605457800000000000 planned\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_data, "warning") != null);
+}
+
+test "dump command prints rule_set entry as NDJSON with nested runner object for shell runner" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = .{
+            .identifier = "rule.shell",
+            .pattern = "app.job.",
+            .runner = .{ .shell = .{ .command = "/bin/process" } },
+        } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{ "--format", "json" });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    const line = std.mem.trimRight(u8, result.stdout, "\n");
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"type\":\"rule_set\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"identifier\":\"rule.shell\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"runner\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"type\":\"shell\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"command\":\"/bin/process\"") != null);
+}
+
+test "dump command prints rule_set entry as NDJSON with nested runner object for amqp runner" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = .{
+            .identifier = "rule.amqp",
+            .pattern = "notify.",
+            .runner = .{ .amqp = .{
+                .dsn = "amqp://localhost",
+                .exchange = "events",
+                .routing_key = "notify.key",
+            } },
+        } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{ "--format", "json" });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    const line = std.mem.trimRight(u8, result.stdout, "\n");
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"type\":\"rule_set\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"identifier\":\"rule.amqp\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"type\":\"amqp\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"dsn\":\"amqp://localhost\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"exchange\":\"events\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"routing_key\":\"notify.key\"") != null);
+}
+
+test "dump command prints rule_removal entry as NDJSON" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule_removal = .{ .identifier = "rule.gone" } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{ "--format", "json" });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    const line = std.mem.trimRight(u8, result.stdout, "\n");
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"type\":\"remove_rule\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "\"identifier\":\"rule.gone\"") != null);
+}
+
+test "dump command --compact with --format json outputs compacted entries as NDJSON" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "app.job.1", .execution = 1000000000, .status = .planned } },
+        .{ .job = .{ .identifier = "app.job.1", .execution = 2000000000, .status = .planned } },
+        .{ .job = .{ .identifier = "app.job.2", .execution = 3000000000, .status = .planned } },
+        .{ .job_removal = .{ .identifier = "app.job.2" } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{ "--compact", "--format", "json" });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    const trimmed = std.mem.trimRight(u8, result.stdout, "\n");
+    var lines = std.mem.splitScalar(u8, trimmed, '\n');
+    const line1 = lines.next() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(lines.next() == null);
+    try std.testing.expect(std.mem.indexOf(u8, line1, "\"type\":\"set\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line1, "\"identifier\":\"app.job.1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line1, "2000000000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "app.job.2") == null);
+}
+
+test "dump command --compact keeps only last RULE SET per identifier" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = .{ .identifier = "dedup.rule", .pattern = "old.", .runner = .{ .shell = .{ .command = "old-cmd" } } } },
+        .{ .rule = .{ .identifier = "dedup.rule", .pattern = "new.", .runner = .{ .shell = .{ .command = "new-cmd" } } } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{"--compact"});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "RULE SET dedup.rule new. shell new-cmd\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "old.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "old-cmd") == null);
+}
+
+test "dump command --compact omits entries whose final mutation is a rule removal" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = .{ .identifier = "removed.rule", .pattern = "app.", .runner = .{ .shell = .{ .command = "/bin/notify" } } } },
+        .{ .rule_removal = .{ .identifier = "removed.rule" } },
+        .{ .rule = .{ .identifier = "kept.rule", .pattern = "other.", .runner = .{ .shell = .{ .command = "/bin/run" } } } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{"--compact"});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "removed.rule") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "RULE SET kept.rule other. shell /bin/run\n") != null);
+}
+
+test "dump command --compact with only removal entries produces no output" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .job_removal = .{ .identifier = "ghost.job" } },
+        .{ .rule_removal = .{ .identifier = "ghost.rule" } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{"--compact"});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expectEqualStrings("", result.stdout);
+}
+
+test "dump command --follow exits 0 on SIGINT" {
+    try expect_follow_exits_cleanly_on_signal(std.testing.allocator, std.posix.SIG.INT);
+}
+
+test "dump command --follow prints newly appended entries" {
+    const allocator = std.testing.allocator;
+
+    const initial_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "follow.initial", .execution = 1000000000000000000, .status = .planned } },
+    });
+    defer allocator.free(initial_data);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var log_file = try tmp_dir.dir.createFile("follow_append.bin", .{});
+    try log_file.writeAll(initial_data);
+    log_file.close();
+
+    const logfile_path = try tmp_dir.dir.realpathAlloc(allocator, "follow_append.bin");
+    defer allocator.free(logfile_path);
+
+    var child = std.process.Child.init(
+        &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path, "--follow" },
+        allocator,
+    );
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.stdin_behavior = .Ignore;
+    try child.spawn();
+
+    std.Thread.sleep(200_000_000);
+
+    const appended_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "follow.appended", .execution = 2000000000000000000, .status = .planned } },
+    });
+    defer allocator.free(appended_data);
+
+    var append_file = try tmp_dir.dir.openFile("follow_append.bin", .{ .mode = .write_only });
+    try append_file.seekFromEnd(0);
+    try append_file.writeAll(appended_data);
+    append_file.close();
+
+    std.Thread.sleep(2_500_000_000);
+
+    std.posix.kill(child.id, std.posix.SIG.INT) catch {};
+    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 65536);
+    defer allocator.free(stdout_data);
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, stdout_data, "SET follow.initial 1000000000000000000 planned\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_data, "SET follow.appended 2000000000000000000 planned\n") != null);
+}
+
+test "dump command --follow --format json prints new entries as NDJSON" {
+    const allocator = std.testing.allocator;
+
+    const initial_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "follow.json.initial", .execution = 1000000000000000000, .status = .planned } },
+    });
+    defer allocator.free(initial_data);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var log_file = try tmp_dir.dir.createFile("follow_json.bin", .{});
+    try log_file.writeAll(initial_data);
+    log_file.close();
+
+    const logfile_path = try tmp_dir.dir.realpathAlloc(allocator, "follow_json.bin");
+    defer allocator.free(logfile_path);
+
+    var child = std.process.Child.init(
+        &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path, "--follow", "--format", "json" },
+        allocator,
+    );
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.stdin_behavior = .Ignore;
+    try child.spawn();
+
+    std.Thread.sleep(200_000_000);
+
+    const appended_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "follow.json.appended", .execution = 2000000000000000000, .status = .planned } },
+    });
+    defer allocator.free(appended_data);
+
+    var append_file = try tmp_dir.dir.openFile("follow_json.bin", .{ .mode = .write_only });
+    try append_file.seekFromEnd(0);
+    try append_file.writeAll(appended_data);
+    append_file.close();
+
+    std.Thread.sleep(2_500_000_000);
+
+    std.posix.kill(child.id, std.posix.SIG.INT) catch {};
+    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 65536);
+    defer allocator.free(stdout_data);
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, stdout_data, "\"identifier\":\"follow.json.initial\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_data, "\"identifier\":\"follow.json.appended\"") != null);
+    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, stdout_data, "\n"), '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(line[0] == '{');
+        try std.testing.expect(line[line.len - 1] == '}');
+    }
+}
+
+test "dump command --follow exits 0 on SIGTERM" {
+    try expect_follow_exits_cleanly_on_signal(std.testing.allocator, std.posix.SIG.TERM);
+}

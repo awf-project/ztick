@@ -40,6 +40,15 @@ REMOVERULE <id>                         # Delete rule
 LISTRULES                               # List all rules
 ```
 
+### CLI (Dump Command)
+
+```
+ztick dump <logfile>                    # Inspect binary logfile
+  --format text|json                    # Output format (default: text)
+  --compact                             # Show effective state only
+  --follow                              # Live tail mode
+```
+
 ### Data Types
 
 | Type | Purpose | Example |

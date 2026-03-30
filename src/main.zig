@@ -21,6 +21,7 @@ const infrastructure_tls_context = @import("infrastructure/tls_context.zig");
 const infrastructure_persistence_background = @import("infrastructure/persistence/background.zig");
 const interfaces_config = @import("interfaces/config.zig");
 const interfaces_cli = @import("interfaces/cli.zig");
+const interfaces_dump = @import("interfaces/dump.zig");
 
 var runtime_log_level: ?std.log.Level = null;
 
@@ -89,6 +90,7 @@ test {
     _ = infrastructure_persistence_background;
     _ = interfaces_config;
     _ = interfaces_cli;
+    _ = interfaces_dump;
 }
 
 const ResponseRouter = infrastructure_tcp_server.ResponseRouter;
@@ -317,6 +319,17 @@ test "processor thread routes execution request to response channel" {
     thread.join();
 }
 
+test "run_dump returns FileNotFound for nonexistent logfile" {
+    const allocator = std.testing.allocator;
+    const options = interfaces_cli.DumpOptions{
+        .logfile_path = "/nonexistent/path/ztick-test-logfile.bin",
+        .format = .text,
+        .compact = false,
+        .follow = false,
+    };
+    try std.testing.expectError(interfaces_dump.DumpError.FileNotFound, interfaces_dump.run_dump(allocator, options));
+}
+
 test "processor thread propagates shell failure to response channel" {
     const allocator = std.testing.allocator;
     var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
@@ -434,13 +447,33 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try interfaces_cli.Args.parse(allocator);
-    defer if (args.config_path) |p| allocator.free(p);
-    const cfg = try interfaces_config.load(allocator, args.config_path);
+    const command = try interfaces_cli.parse(allocator);
+
+    if (command == .dump) {
+        defer allocator.free(command.dump.options.logfile_path);
+        interfaces_dump.run_dump(allocator, command.dump.options) catch |err| switch (err) {
+            error.FileNotFound => {
+                const stderr = std.fs.File.stderr().deprecatedWriter();
+                stderr.print("error: file not found: {s}\n", .{command.dump.options.logfile_path}) catch {};
+                std.process.exit(1);
+            },
+            error.PermissionDenied => {
+                const stderr = std.fs.File.stderr().deprecatedWriter();
+                stderr.print("error: permission denied: {s}\n", .{command.dump.options.logfile_path}) catch {};
+                std.process.exit(1);
+            },
+            else => return err,
+        };
+        return;
+    }
+
+    const config_path = command.server.config_path;
+    defer if (config_path) |p| allocator.free(p);
+    const cfg = try interfaces_config.load(allocator, config_path);
     defer cfg.deinit(allocator);
 
     runtime_log_level = log_level_to_std(cfg.log_level);
-    std.log.info("config: {s}", .{args.config_path orelse "default"});
+    std.log.info("config: {s}", .{config_path orelse "default"});
     std.log.info("log level: {s}", .{@tagName(cfg.log_level)});
     std.log.info("listening on {s}", .{cfg.controller_listen});
 
