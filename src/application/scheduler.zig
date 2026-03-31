@@ -1,6 +1,7 @@
 const std = @import("std");
 const domain = @import("../domain.zig");
 const persistence = @import("../infrastructure/persistence.zig");
+const telemetry = @import("../infrastructure/telemetry.zig");
 const JobStorage = @import("job_storage.zig").JobStorage;
 const RuleStorage = @import("rule_storage.zig").RuleStorage;
 const QueryHandler = @import("query_handler.zig").QueryHandler;
@@ -23,6 +24,7 @@ pub const Scheduler = struct {
     compression_interval_ns: i64,
     last_compression_ns: i64,
     active_process: ?*Process,
+    instruments: ?telemetry.Instruments,
 
     pub fn init(allocator: std.mem.Allocator) Scheduler {
         return .{
@@ -34,7 +36,12 @@ pub const Scheduler = struct {
             .compression_interval_ns = 0,
             .last_compression_ns = 0,
             .active_process = null,
+            .instruments = null,
         };
+    }
+
+    pub fn setInstruments(self: *Scheduler, instr: telemetry.Instruments) void {
+        self.instruments = instr;
     }
 
     pub fn deinit(self: *Scheduler) void {
@@ -81,12 +88,45 @@ pub const Scheduler = struct {
     }
 
     pub fn handle_query(self: *Scheduler, request: Request) !Response {
+        const command = @tagName(request.instruction);
+        var span: ?telemetry.Span = if (self.instruments) |instr|
+            (instr.tracer.startSpan(self.allocator, "ztick.request", .{ .kind = .Server }) catch null)
+        else
+            null;
+        if (span != null) {
+            span.?.setAttribute("ztick.request.id", .{ .string = request.identifier }) catch {};
+            span.?.setAttribute("ztick.command", .{ .string = command }) catch {};
+        }
+        defer if (span) |*s| {
+            // Set end_time_unix_nano before endSpan because the SDK exports the span
+            // in onSpanEnd (via SimpleProcessor) before its defer calls span.end().
+            s.end_time_unix_nano = @intCast(std.time.nanoTimestamp());
+            if (self.instruments) |instr| instr.tracer.endSpan(s);
+            s.deinit();
+        };
+
         var handler = QueryHandler.init(self.allocator, &self.job_storage, &self.rule_storage);
         const response = try handler.handle(request);
         errdefer if (response.body) |b| self.allocator.free(b);
 
+        if (span != null) {
+            span.?.setAttribute("ztick.success", .{ .bool = response.success }) catch {};
+        }
+
         if (response.success and self.persistence != null) {
             try self.append_to_persistence(request);
+        }
+
+        if (response.success) {
+            if (self.instruments) |instr| {
+                switch (request.instruction) {
+                    .set => try instr.jobs_scheduled.add(1, .{}),
+                    .remove => try instr.jobs_removed.add(1, .{}),
+                    .rule_set => try instr.rules_active.add(1, .{}),
+                    .remove_rule => try instr.rules_active.add(-1, .{}),
+                    .get, .query, .list_rules => {},
+                }
+            }
         }
 
         return response;
@@ -116,6 +156,13 @@ pub const Scheduler = struct {
                 updated.status = if (result.success) .executed else .failed;
                 try self.job_storage.set(updated);
                 std.log.debug("execution outcome: job={s} success={}", .{ job.identifier, result.success });
+                if (self.instruments) |instr| {
+                    try instr.jobs_executed.add(1, .{});
+                    if (result.success) {
+                        const duration_ms = @as(f64, @floatFromInt(current_time - job.execution)) / 1_000_000.0;
+                        try instr.execution_duration_ms.record(@max(0.0, duration_ms), .{});
+                    }
+                }
             }
         }
 
@@ -1243,4 +1290,195 @@ test "tick logs warning and retains .to_compress when compression fails" {
 
     try std.testing.expectEqual(@as(?*Process, null), scheduler.active_process);
     _ = try tmp.dir.statFile("logfile.to_compress");
+}
+
+test "handle_query SET with instruments calls jobs_scheduled counter" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const otel = @import("opentelemetry");
+    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+    defer meter_provider.shutdown();
+    const tracer_provider = try otel.trace.TracerProvider.init(
+        allocator,
+        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+    );
+    defer tracer_provider.shutdown();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1000 } },
+    });
+    try std.testing.expect(response.success);
+
+    const job = scheduler.job_storage.get("job.1");
+    try std.testing.expect(job != null);
+}
+
+test "handle_query REMOVE with instruments calls jobs_removed counter" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const otel = @import("opentelemetry");
+    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+    defer meter_provider.shutdown();
+    const tracer_provider = try otel.trace.TracerProvider.init(
+        allocator,
+        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+    );
+    defer tracer_provider.shutdown();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
+
+    try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .remove = .{ .identifier = "job.1" } },
+    });
+    try std.testing.expect(response.success);
+    try std.testing.expectEqual(@as(?Job, null), scheduler.job_storage.get("job.1"));
+}
+
+test "handle_query RULE_SET with instruments updates rules_active gauge" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const otel = @import("opentelemetry");
+    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+    defer meter_provider.shutdown();
+    const tracer_provider = try otel.trace.TracerProvider.init(
+        allocator,
+        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+    );
+    defer tracer_provider.shutdown();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.1",
+            .pattern = "job.",
+            .runner = .{ .shell = .{ .command = "echo" } },
+        } },
+    });
+    try std.testing.expect(response.success);
+
+    const rule = scheduler.rule_storage.get("rule.1");
+    try std.testing.expect(rule != null);
+}
+
+test "tick increments jobs_executed counter on successful execution result" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const otel = @import("opentelemetry");
+    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+    defer meter_provider.shutdown();
+    const tracer_provider = try otel.trace.TracerProvider.init(
+        allocator,
+        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+    );
+    defer tracer_provider.shutdown();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
+
+    try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
+    try scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "job.", .runner = .{ .shell = .{ .command = "echo" } } });
+
+    try scheduler.tick(1000);
+
+    for (scheduler.execution_client.pending.items) |req| {
+        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
+    }
+    scheduler.execution_client.pending.clearRetainingCapacity();
+
+    try scheduler.tick(2000);
+
+    const job = scheduler.job_storage.get("job.1");
+    try std.testing.expect(job != null);
+    try std.testing.expectEqual(domain.job.JobStatus.executed, job.?.status);
+}
+
+test "tick records execution duration in histogram for executed job" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const otel = @import("opentelemetry");
+    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+    defer meter_provider.shutdown();
+    const tracer_provider = try otel.trace.TracerProvider.init(
+        allocator,
+        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+    );
+    defer tracer_provider.shutdown();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
+
+    try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
+    try scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "job.", .runner = .{ .shell = .{ .command = "echo" } } });
+
+    try scheduler.tick(1000);
+
+    for (scheduler.execution_client.pending.items) |req| {
+        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
+    }
+    scheduler.execution_client.pending.clearRetainingCapacity();
+
+    try scheduler.tick(2000);
+
+    const job = scheduler.job_storage.get("job.1");
+    try std.testing.expect(job != null);
+    try std.testing.expectEqual(domain.job.JobStatus.executed, job.?.status);
+}
+
+test "scheduler with null instruments completes operations without error" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try std.testing.expectEqual(@as(?telemetry.Instruments, null), scheduler.instruments);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1000 } },
+    });
+
+    _ = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-2",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.1",
+            .pattern = "job.",
+            .runner = .{ .shell = .{ .command = "echo" } },
+        } },
+    });
+
+    try scheduler.tick(1000);
+    try scheduler.tick(2000);
 }

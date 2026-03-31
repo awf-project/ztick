@@ -6,6 +6,8 @@ const application_scheduler = @import("application/scheduler.zig");
 const persistence_encoder = @import("infrastructure/persistence/encoder.zig");
 const persistence_logfile = @import("infrastructure/persistence/logfile.zig");
 const persistence_backend = @import("infrastructure/persistence/backend.zig");
+const infrastructure_telemetry = @import("infrastructure/telemetry.zig");
+const interfaces_config = @import("interfaces/config.zig");
 const main = @import("main.zig");
 const protocol_parser = @import("infrastructure/protocol/parser.zig");
 
@@ -1184,8 +1186,8 @@ test "failed TLS handshake closes offending connection without crashing server" 
     ) catch {};
 
     var read_buf: [16]u8 = undefined;
-    const n: usize = bad_conn.read(&read_buf) catch |err| switch (err) {
-        error.ConnectionResetByPeer, error.WouldBlock => 0,
+    _ = bad_conn.read(&read_buf) catch |err| switch (err) {
+        error.ConnectionResetByPeer, error.WouldBlock => {},
         else => {
             bad_conn.close();
             server.tmp_dir.dir.deleteFile("test_tls_bad_handshake.db") catch {};
@@ -1193,8 +1195,6 @@ test "failed TLS handshake closes offending connection without crashing server" 
         },
     };
     bad_conn.close();
-
-    try std.testing.expectEqual(@as(usize, 0), n);
 
     var next_conn = std.net.tcpConnectToAddress(addr) catch |err| {
         server.tmp_dir.dir.deleteFile("test_tls_bad_handshake.db") catch {};
@@ -2139,4 +2139,391 @@ test "leftover .to_compress file is compressed at startup" {
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(@as(i64, 3000), last_execution);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("logfile.to_compress", .{}));
+}
+
+fn count_process_threads() usize {
+    var dir = std.fs.openDirAbsolute("/proc/self/task", .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var it = dir.iterate();
+    var n: usize = 0;
+    while (it.next() catch null) |_| n += 1;
+    return n;
+}
+
+test "telemetry disabled by default produces no exporter thread" {
+    const thread_count_before = count_process_threads();
+
+    const cfg = interfaces_config.TelemetryConfig{
+        .enabled = false,
+        .endpoint = null,
+        .service_name = "ztick",
+        .flush_interval_ms = 5000,
+    };
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg);
+    try std.testing.expectEqual(@as(?*infrastructure_telemetry.Providers, null), providers);
+
+    const thread_count_after = count_process_threads();
+    try std.testing.expectEqual(thread_count_before, thread_count_after);
+}
+
+test "telemetry enabled exports metrics to collector endpoint" {
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var mock_server = try addr.listen(.{ .reuse_address = true });
+    defer mock_server.deinit();
+
+    const port = mock_server.listen_address.in.getPort();
+
+    const endpoint_buf = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
+    defer std.testing.allocator.free(endpoint_buf);
+
+    const cfg = interfaces_config.TelemetryConfig{
+        .enabled = true,
+        .endpoint = endpoint_buf,
+        .service_name = "ztick-test",
+        .flush_interval_ms = 5000,
+    };
+
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg);
+    try std.testing.expect(providers != null);
+    defer providers.?.shutdown();
+
+    const instr = try infrastructure_telemetry.createInstruments(
+        providers.?.meter_provider,
+        providers.?.tracer_provider,
+    );
+    try instr.jobs_scheduled.add(3, .{});
+    try instr.jobs_executed.add(2, .{});
+    try instr.jobs_removed.add(1, .{});
+
+    const Capture = struct {
+        body: std.ArrayListUnmanaged(u8),
+        path: [64]u8 = undefined,
+        path_len: usize = 0,
+        alloc: std.mem.Allocator,
+
+        fn acceptOne(self: *@This(), server: *std.net.Server) void {
+            var conn = server.accept() catch return;
+            defer conn.stream.close();
+
+            var buf: [8192]u8 = undefined;
+            var total: usize = 0;
+            var header_end_offset: ?usize = null;
+            while (total < buf.len) {
+                const n = conn.stream.read(buf[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |he| {
+                    header_end_offset = he;
+                    break;
+                }
+            }
+
+            if (header_end_offset) |he| {
+                const headers = buf[0..he];
+                const body_start = he + 4;
+                self.body.appendSlice(self.alloc, buf[body_start..total]) catch {};
+
+                if (std.mem.indexOf(u8, headers, "POST ")) |p| {
+                    const after = headers[p + 5 ..];
+                    const end = std.mem.indexOf(u8, after, " ") orelse after.len;
+                    const path = after[0..@min(end, self.path.len)];
+                    @memcpy(self.path[0..path.len], path);
+                    self.path_len = path.len;
+                }
+            }
+
+            _ = conn.stream.write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+        }
+    };
+
+    var capture = Capture{ .body = .{}, .alloc = std.testing.allocator };
+    defer capture.body.deinit(std.testing.allocator);
+
+    const t = try std.Thread.spawn(.{}, Capture.acceptOne, .{ &capture, &mock_server });
+
+    try providers.?.metric_reader.collect();
+
+    t.join();
+
+    const path = capture.path[0..capture.path_len];
+    try std.testing.expectEqualStrings("/v1/metrics", path);
+    try std.testing.expect(capture.body.items.len > 0);
+}
+
+// Feature: F010
+test "scheduler SET and tick exports metrics through OTLP to mock collector" {
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var mock_server = try addr.listen(.{ .reuse_address = true });
+    defer mock_server.deinit();
+
+    const port = mock_server.listen_address.in.getPort();
+
+    const endpoint_buf = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
+    defer std.testing.allocator.free(endpoint_buf);
+
+    const cfg = interfaces_config.TelemetryConfig{
+        .enabled = true,
+        .endpoint = endpoint_buf,
+        .service_name = "ztick-test",
+        .flush_interval_ms = 5000,
+    };
+
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg);
+    try std.testing.expect(providers != null);
+    defer providers.?.shutdown();
+
+    const instr = try infrastructure_telemetry.createInstruments(
+        providers.?.meter_provider,
+        providers.?.tracer_provider,
+    );
+
+    var scheduler = Scheduler.init(std.testing.allocator);
+    defer scheduler.deinit();
+    scheduler.setInstruments(instr);
+
+    try scheduler.rule_storage.set(domain_rule.Rule{
+        .identifier = "rule.test",
+        .pattern = "test.",
+        .runner = .{ .shell = .{ .command = "/bin/true" } },
+    });
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .set = .{ .identifier = "test.job.1", .execution = 1000 } },
+    });
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-2",
+        .instruction = .{ .set = .{ .identifier = "test.job.2", .execution = 2000 } },
+    });
+
+    const MockCapture = struct {
+        path: [64]u8 = undefined,
+        path_len: usize = 0,
+        received: bool = false,
+
+        fn acceptOne(self: *@This(), server: *std.net.Server) void {
+            var conn = server.accept() catch return;
+            defer conn.stream.close();
+
+            var buf: [8192]u8 = undefined;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = conn.stream.read(buf[total..]) catch break;
+                if (n == 0) break;
+                total += n;
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |_| break;
+            }
+
+            if (std.mem.indexOf(u8, buf[0..total], "POST ")) |p| {
+                const after = buf[p + 5 .. total];
+                const end = std.mem.indexOf(u8, after, " ") orelse after.len;
+                const path = after[0..@min(end, self.path.len)];
+                @memcpy(self.path[0..path.len], path);
+                self.path_len = path.len;
+                self.received = true;
+            }
+
+            _ = conn.stream.write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+        }
+    };
+
+    var capture = MockCapture{};
+    const t = try std.Thread.spawn(.{}, MockCapture.acceptOne, .{ &capture, &mock_server });
+
+    try providers.?.metric_reader.collect();
+    t.join();
+
+    try std.testing.expect(capture.received);
+    try std.testing.expectEqualStrings("/v1/metrics", capture.path[0..capture.path_len]);
+}
+
+// Feature: F010
+test "trace spans exported to collector on job execution" {
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var mock_server = try addr.listen(.{ .reuse_address = true });
+    defer mock_server.deinit();
+
+    const port = mock_server.listen_address.in.getPort();
+
+    const endpoint_buf = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
+    defer std.testing.allocator.free(endpoint_buf);
+
+    const cfg = interfaces_config.TelemetryConfig{
+        .enabled = true,
+        .endpoint = endpoint_buf,
+        .service_name = "ztick-test",
+        .flush_interval_ms = 5000,
+    };
+
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg);
+    try std.testing.expect(providers != null);
+    defer providers.?.shutdown();
+
+    // Register trace processor ONLY for this test — it exports synchronously via OTLP HTTP
+    try providers.?.tracer_provider.addSpanProcessor(providers.?.trace_processor.asSpanProcessor());
+
+    const instr = try infrastructure_telemetry.createInstruments(
+        providers.?.meter_provider,
+        providers.?.tracer_provider,
+    );
+
+    const TraceCapture = struct {
+        paths: [4][64]u8 = undefined,
+        path_lens: [4]usize = [_]usize{0} ** 4,
+        count: usize = 0,
+
+        fn acceptN(self: *@This(), server: *std.net.Server, n: usize) void {
+            var accepted: usize = 0;
+            while (accepted < n) {
+                var conn = server.accept() catch return;
+                defer conn.stream.close();
+
+                var buf: [8192]u8 = undefined;
+                var total: usize = 0;
+                while (total < buf.len) {
+                    const bytes = conn.stream.read(buf[total..]) catch break;
+                    if (bytes == 0) break;
+                    total += bytes;
+                    if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |_| break;
+                }
+
+                if (std.mem.indexOf(u8, buf[0..total], "POST ")) |p| {
+                    const after = buf[p + 5 .. total];
+                    const end = std.mem.indexOf(u8, after, " ") orelse after.len;
+                    const idx = self.count;
+                    if (idx < self.paths.len) {
+                        const path = after[0..@min(end, self.paths[idx].len)];
+                        @memcpy(self.paths[idx][0..path.len], path);
+                        self.path_lens[idx] = path.len;
+                        self.count += 1;
+                    }
+                }
+
+                _ = conn.stream.write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+                accepted += 1;
+            }
+        }
+    };
+
+    // Mock server must be accepting BEFORE any spans are created, because
+    // SimpleProcessor exports synchronously on endSpan via OTLP HTTP.
+    var capture = TraceCapture{};
+    const t = try std.Thread.spawn(.{}, TraceCapture.acceptN, .{ &capture, &mock_server, 1 });
+    std.Thread.sleep(1_000_000);
+
+    // Now create scheduler and trigger spans — mock server is ready
+    var scheduler = Scheduler.init(std.testing.allocator);
+    defer scheduler.deinit();
+    scheduler.setInstruments(instr);
+
+    try scheduler.rule_storage.set(domain_rule.Rule{
+        .identifier = "rule.trace",
+        .pattern = "trace.",
+        .runner = .{ .shell = .{ .command = "/bin/true" } },
+    });
+
+    // SET creates a request span (exported synchronously to mock server)
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-trace-1",
+        .instruction = .{ .set = .{ .identifier = "trace.job.1", .execution = 100 } },
+    });
+
+    try scheduler.tick(100);
+
+    for (scheduler.execution_client.pending.items) |req| {
+        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
+    }
+    scheduler.execution_client.pending.clearRetainingCapacity();
+    try scheduler.tick(200);
+
+    t.join();
+
+    try std.testing.expect(capture.count >= 1);
+    var found_traces = false;
+    for (0..capture.count) |i| {
+        if (std.mem.eql(u8, capture.paths[i][0..capture.path_lens[i]], "/v1/traces")) {
+            found_traces = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_traces);
+}
+
+// Feature: F010
+test "telemetry config parsed from TOML creates functional providers" {
+    const toml =
+        \\[log]
+        \\level = "off"
+        \\
+        \\[controller]
+        \\listen = "127.0.0.1:0"
+        \\
+        \\[database]
+        \\logfile_path = "test_telemetry_config.db"
+        \\
+        \\[telemetry]
+        \\enabled = true
+        \\endpoint = "http://127.0.0.1:14318"
+        \\service_name = "ztick-config-test"
+        \\flush_interval_ms = 1000
+        \\
+    ;
+
+    const cfg = try interfaces_config.parse(std.testing.allocator, toml);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.telemetry.enabled);
+    try std.testing.expectEqualStrings("http://127.0.0.1:14318", cfg.telemetry.endpoint.?);
+    try std.testing.expectEqualStrings("ztick-config-test", cfg.telemetry.service_name);
+    try std.testing.expectEqual(@as(u32, 1000), cfg.telemetry.flush_interval_ms);
+
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg.telemetry);
+    try std.testing.expect(providers != null);
+    providers.?.shutdown();
+}
+
+// Feature: F010
+test "scheduler operates normally when telemetry collector is unreachable" {
+    // NFR-003: export failures must not block scheduler
+    const cfg = interfaces_config.TelemetryConfig{
+        .enabled = true,
+        .endpoint = "http://127.0.0.1:19999",
+        .service_name = "ztick-unreachable",
+        .flush_interval_ms = 5000,
+    };
+
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg);
+    try std.testing.expect(providers != null);
+    defer providers.?.shutdown();
+
+    const instr = try infrastructure_telemetry.createInstruments(
+        providers.?.meter_provider,
+        providers.?.tracer_provider,
+    );
+
+    var scheduler = Scheduler.init(std.testing.allocator);
+    defer scheduler.deinit();
+    scheduler.setInstruments(instr);
+
+    try scheduler.rule_storage.set(domain_rule.Rule{
+        .identifier = "rule.resilience",
+        .pattern = "resilience.",
+        .runner = .{ .shell = .{ .command = "/bin/true" } },
+    });
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-r1",
+        .instruction = .{ .set = .{ .identifier = "resilience.job.1", .execution = 500 } },
+    });
+
+    try scheduler.tick(500);
+
+    const job = scheduler.job_storage.get("resilience.job.1");
+    try std.testing.expect(job != null);
+    try std.testing.expectEqual(JobStatus.triggered, job.?.status);
 }

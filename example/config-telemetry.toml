@@ -1,0 +1,16 @@
+[log]
+level = "info"
+
+[controller]
+listen = "127.0.0.1:5678"
+
+[database]
+fsync_on_persist = false
+framerate = 512
+logfile_path = "ztick.log"
+
+[telemetry]
+enabled = true
+endpoint = "http://localhost:4318"
+service_name = "ztick"
+flush_interval_ms = 5000

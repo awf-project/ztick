@@ -61,6 +61,52 @@ Persistence and scheduling configuration.
 | `framerate` | integer | `512` | Scheduler tick rate in Hz (valid range: 1-65535) |
 | `compression_interval` | integer (seconds) | `3600` | Interval between background compression cycles in seconds; set to `0` to disable compression (logfile backend only; ignored for memory backend) |
 
+### `[telemetry]`
+
+Observability and monitoring configuration via OpenTelemetry.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable telemetry export to an OTLP collector. When disabled (default), no observability data is exported and telemetry instrumentation has zero overhead. |
+| `endpoint` | string | (required if enabled) | HTTP endpoint of the OpenTelemetry collector (e.g., `"http://localhost:4318"`). The collector must accept OTLP/HTTP JSON at `/v1/metrics`, `/v1/traces`, and `/v1/logs` paths. |
+| `service_name` | string | `"ztick"` | Logical name for this service in observability backends (appears as `service.name` resource attribute). |
+| `flush_interval_ms` | integer (milliseconds) | `5000` | Batch export interval in milliseconds. Accumulated metrics, traces, and logs are sent to the collector at this interval. |
+
+**Telemetry Features:**
+- **Metrics**: Job throughput (`ztick.jobs.scheduled`, `ztick.jobs.executed`, `ztick.jobs.removed`), execution latency (`ztick.execution.duration_ms`), connection counts (`ztick.connections.active`), rule counts (`ztick.rules.active`), and compression events (`ztick.persistence.compactions`).
+- **Traces**: `ztick.request` span (kind: server) covering TCP request lifecycle (receive → parse → dispatch → response), with attributes `ztick.command`, `ztick.request.id`, and `ztick.success`.
+- **Structured Logs**: Log records at warn level and above, correlated with traces via shared trace IDs.
+- **Resource Attributes**: All signals include `service.name` and `service.version` resource attributes.
+- **Resilience**: Export failures do not impact scheduler operation; ztick continues processing jobs normally when the collector is unreachable.
+
+**Configuration Examples:**
+
+```toml
+# Telemetry disabled (default — zero overhead)
+[telemetry]
+enabled = false
+
+# Telemetry enabled with local collector
+[telemetry]
+enabled = true
+endpoint = "http://localhost:4318"
+service_name = "my-ztick-instance"
+flush_interval_ms = 5000
+
+# Telemetry enabled with remote collector (Datadog, Grafana Agent, etc.)
+[telemetry]
+enabled = true
+endpoint = "http://otel-collector.observability.svc.cluster.local:4318"
+service_name = "ztick-prod"
+flush_interval_ms = 10000
+```
+
+**Collector Compatibility:**
+- Tested with OpenTelemetry Collector (`otelcontribcol`)
+- Compatible with any OTLP/HTTP JSON receiver (Datadog Agent, Grafana Agent, New Relic, etc.)
+- Metrics and traces are exported via OTLP/HTTP protobuf to `POST /v1/metrics` and `POST /v1/traces` respectively
+- Requires the collector to be reachable and healthy for export; unavailable collectors do not cause scheduler failures
+
 **Persistence Modes:**
 - `"logfile"` — (default) Store jobs and rules in an append-only binary logfile. Data persists across restarts. Use for production deployments where durability is critical.
 - `"memory"` — Store jobs and rules only in memory. No disk I/O occurs. Data is lost on shutdown. Useful for ephemeral deployments, CI environments, and testing where durability is not required.
@@ -94,6 +140,12 @@ logfile_path = "data/ztick.log"
 fsync_on_persist = false
 framerate = 100
 compression_interval = 1800
+
+[telemetry]
+enabled = true
+endpoint = "http://otel-collector:4318"
+service_name = "ztick-prod"
+flush_interval_ms = 10000
 ```
 
 ## Errors
@@ -102,6 +154,6 @@ compression_interval = 1800
 |-------|-------|
 | `InvalidLogLevel` | `level` is not one of the valid values |
 | `FramerateOutOfRange` | `framerate` is 0 or exceeds 65535 |
-| `UnknownSection` | Section name is not `log`, `controller`, or `database` |
+| `UnknownSection` | Section name is not `log`, `controller`, `database`, or `telemetry` |
 | `UnknownKey` | Key is not recognized within its section |
-| `InvalidValue` | Value cannot be parsed (e.g. non-boolean for `fsync_on_persist`), or only one of `tls_cert`/`tls_key` is set, or `persistence` is not `"logfile"` or `"memory"` |
+| `InvalidValue` | Value cannot be parsed (e.g. non-boolean for `fsync_on_persist`), or only one of `tls_cert`/`tls_key` is set, or `persistence` is not `"logfile"` or `"memory"`, or `telemetry.enabled = true` but `endpoint` is missing/malformed, or `flush_interval_ms` is not a valid u32 |

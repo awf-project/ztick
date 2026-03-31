@@ -4,9 +4,12 @@ Guide to compiling, testing, and packaging ztick from source.
 
 ## Prerequisites
 
-- **Zig 0.14.1** ([download](https://ziglang.org/download/))
+- **Zig 0.15.2** ([download](https://ziglang.org/download/))
 - **libssl-dev** (Debian/Ubuntu) or **openssl-devel** (Fedora/RHEL) — required for TLS support
 - **git** (optional, for cloning the repository)
+
+Zig package dependencies (fetched automatically by `zig build`):
+- **zig-o11y/opentelemetry-sdk** v0.1.1 — OpenTelemetry instrumentation ([ADR-0004](../ADR/0004-opentelemetry-sdk-dependency.md))
 
 ## Build Variants
 
@@ -170,7 +173,7 @@ Zig is not installed or not in PATH. Install from [ziglang.org](https://ziglang.
 Verify installation:
 
 ```bash
-zig version  # Should print 0.14.1
+zig version  # Should print 0.15.2
 ```
 
 ### "error: MemoryOutOfBounds"
