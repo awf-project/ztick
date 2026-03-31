@@ -143,6 +143,7 @@ logfile_path = "logfile"
 | `fsync_on_persist` | boolean | `true` | Flush writes to disk immediately (safer, slower; ignored for `persistence = "memory"`) |
 | `framerate` | integer | `512` | Evaluation frequency in Hz (valid range: 1-65535) |
 | `logfile_path` | string | `"logfile"` | Path to the binary logfile (ignored for `persistence = "memory"`) |
+| `compression_interval` | integer | `3600` | Background compression interval in seconds; `0` disables compression (logfile backend only) |
 
 #### Persistence Modes
 
@@ -172,6 +173,16 @@ Use in-memory persistence for **ephemeral deployments** where data does not need
 - Development and debugging with reduced I/O overhead
 
 When `persistence = "memory"` is set, `logfile_path` and `fsync_on_persist` are ignored and no files are created on disk. All jobs and rules are lost when ztick stops.
+
+#### Compression Scheduling
+
+When using logfile persistence, ztick automatically compresses the logfile on a periodic interval to reduce disk usage. The `compression_interval` setting controls how often compression runs:
+
+- `compression_interval = 3600` (default) — Compress once per hour
+- `compression_interval = 1800` — Compress every 30 minutes (for high-mutation workloads)
+- `compression_interval = 0` — Disable compression entirely
+
+Compression runs in the background without blocking job processing. Memory backend deployments ignore this setting and never compress.
 
 **Examples:**
 
@@ -208,6 +219,7 @@ persistence = "logfile"
 fsync_on_persist = true
 framerate = 512
 logfile_path = "logfile"
+compression_interval = 3600
 ```
 
 **Ephemeral deployment (CI/testing):**
@@ -240,6 +252,7 @@ persistence = "logfile"
 fsync_on_persist = true
 framerate = 512
 logfile_path = "logfile"
+compression_interval = 3600
 ```
 
 ## Configuration Best Practices
@@ -297,11 +310,13 @@ listen = "0.0.0.0:5678"
 persistence = "logfile"
 fsync_on_persist = false
 framerate = 1000
+compression_interval = 300
 ```
 
 - Errors only
 - Higher evaluation frequency
 - Relaxed persistence (batch writes for throughput)
+- Aggressive compression (every 5 minutes) for rapid logfile growth
 
 ## Troubleshooting
 

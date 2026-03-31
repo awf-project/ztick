@@ -6,6 +6,7 @@ const application_scheduler = @import("application/scheduler.zig");
 const persistence_encoder = @import("infrastructure/persistence/encoder.zig");
 const persistence_logfile = @import("infrastructure/persistence/logfile.zig");
 const persistence_backend = @import("infrastructure/persistence/backend.zig");
+const main = @import("main.zig");
 const protocol_parser = @import("infrastructure/protocol/parser.zig");
 
 const Scheduler = application_scheduler.Scheduler;
@@ -1976,4 +1977,166 @@ test "default persistence uses logfile when no persistence key configured" {
     const restored = scheduler2.job_storage.get("compat.job");
     try std.testing.expect(restored != null);
     try std.testing.expectEqual(JobStatus.planned, restored.?.status);
+}
+
+// Feature: F009
+
+test "compression produces deduplicated logfile after interval" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = .{ .logfile = .{
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    scheduler.compression_interval_ns = 1;
+
+    // Write 5 mutations for the same job ID — compression should deduplicate to exactly 1 entry
+    for (0..5) |i| {
+        const exec: i64 = @intCast(1000 + i);
+        _ = try scheduler.handle_query(Request{
+            .client = 1,
+            .identifier = "req-recurring",
+            .instruction = .{ .set = .{ .identifier = "recurring.job", .execution = exec } },
+        });
+    }
+
+    // Write a job that is SET then REMOVEd — should not appear in compressed output
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-transient-set",
+        .instruction = .{ .set = .{ .identifier = "transient.job", .execution = 9999 } },
+    });
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-transient-remove",
+        .instruction = .{ .remove = .{ .identifier = "transient.job" } },
+    });
+
+    try scheduler.tick(1);
+    try std.testing.expect(scheduler.active_process != null);
+
+    const proc = scheduler.active_process.?;
+    proc.thread.join();
+    proc.deinit();
+    scheduler.active_process = null;
+
+    const compressed_data = try tmp.dir.readFileAlloc(allocator, "logfile.compressed", std.math.maxInt(usize));
+    defer allocator.free(compressed_data);
+
+    const parsed = try persistence_logfile.parse(allocator, compressed_data);
+    defer {
+        for (parsed.entries) |e| allocator.free(e);
+        allocator.free(parsed.entries);
+    }
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+
+    var recurring_count: usize = 0;
+    var transient_found = false;
+    for (parsed.entries) |raw| {
+        const entry = try persistence_encoder.decode(arena, raw);
+        switch (entry) {
+            .job => |j| {
+                if (std.mem.eql(u8, j.identifier, "recurring.job")) recurring_count += 1;
+                if (std.mem.eql(u8, j.identifier, "transient.job")) transient_found = true;
+            },
+            .job_removal => |r| {
+                if (std.mem.eql(u8, r.identifier, "transient.job")) transient_found = true;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), recurring_count);
+    try std.testing.expect(!transient_found);
+}
+
+test "memory backend skips compression and produces no file artifacts" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    scheduler.compression_interval_ns = 1;
+
+    try scheduler.tick(1);
+
+    try std.testing.expectEqual(@as(?*@import("infrastructure/persistence/background.zig").Process, null), scheduler.active_process);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("logfile.to_compress", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("logfile.compressed", .{}));
+}
+
+test "leftover .to_compress file is compressed at startup" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .job = .{ .identifier = "startup.job", .execution = 1000, .status = .planned } },
+        .{ .job = .{ .identifier = "startup.job", .execution = 2000, .status = .planned } },
+        .{ .job = .{ .identifier = "startup.job", .execution = 3000, .status = .planned } },
+    });
+    defer allocator.free(logfile_data);
+
+    const to_compress = try tmp.dir.createFile("logfile.to_compress", .{});
+    try to_compress.writeAll(logfile_data);
+    to_compress.close();
+
+    main.compress_startup_leftover(allocator, .{ .logfile = .{
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } });
+
+    const compressed_data = try tmp.dir.readFileAlloc(allocator, "logfile.compressed", std.math.maxInt(usize));
+    defer allocator.free(compressed_data);
+
+    const parsed = try persistence_logfile.parse(allocator, compressed_data);
+    defer {
+        for (parsed.entries) |e| allocator.free(e);
+        allocator.free(parsed.entries);
+    }
+
+    var decode_arena = std.heap.ArenaAllocator.init(allocator);
+    defer decode_arena.deinit();
+    const arena = decode_arena.allocator();
+
+    var count: usize = 0;
+    var last_execution: i64 = 0;
+    for (parsed.entries) |raw| {
+        const entry = try persistence_encoder.decode(arena, raw);
+        switch (entry) {
+            .job => |j| {
+                if (std.mem.eql(u8, j.identifier, "startup.job")) {
+                    count += 1;
+                    last_execution = j.execution;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(i64, 3000), last_execution);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("logfile.to_compress", .{}));
 }

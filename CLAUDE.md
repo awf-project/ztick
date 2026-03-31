@@ -6,6 +6,7 @@
 - Each layer has a barrel export file (domain.zig, application.zig, infrastructure.zig, interfaces.zig); import layers through barrels only
 - All tagged union variants must declare payloads with `struct {}` syntax, even when empty, for consistent pattern matching and destructuring across the codebase
 - Logfile dump must never load entire file into memory; implement sequential frame reads to comply with NFR-001 scaling constraint
+- Use Process.execute() for all background operations; never manually construct Process structs in application layer to maintain API consistency
 
 ## Build System
 
@@ -67,10 +68,20 @@
 
 - When copying structs containing ArrayListUnmanaged or similar shared-backing types, ensure only the owning copy calls deinit; non-owning copies must be dropped without cleanup to prevent double-frees
 
+- Retain .to_compress file on failed atomic rename during compression; verify destination non-existence before overwrite to prevent silent data loss during file rotation
+
+- Use monotonic time or atomic counters for compression intervals; avoid wall-clock subtraction which wraps on NTP stepback causing infinite compression loops
+
+- Add generated compression artifacts (.compressed, .to_compress) to .gitignore; never stage test output files or temporary persistence artifacts
+
+- Always log failed background compression at ERROR level with .to_compress file path; retention of orphaned compression files is required for data recovery
+
 ## Test Conventions
 
 - Co-locate unit tests in test blocks within source files; use functional_tests.zig for integration tests
 - Verbose test names describe behavior (e.g., `test "tick processes query request and routes response"`)
+
+- Always use std.testing.tmpDir for test files; never hardcode /tmp paths which create race conditions across parallel test execution
 
 ## Review Standards
 
