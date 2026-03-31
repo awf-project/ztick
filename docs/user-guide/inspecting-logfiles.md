@@ -167,7 +167,7 @@ ztick -c /etc/ztick.conf
 ztick dump /path/to/logfile --follow --format json | jq 'select(.type=="rule_set")'
 
 # Terminal 3: Send jobs to ztick
-echo "SET test.job 1711612800000000000" | nc localhost 5678
+echo "SET test.job 1711612800000000000" | socat - TCP:localhost:5678
 ```
 
 ## Timestamps

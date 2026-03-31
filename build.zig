@@ -109,4 +109,45 @@ pub fn build(b: *std.Build) void {
     const fmt_check = b.addFmt(.{ .paths = &.{"src"}, .check = true });
     const fmt_check_step = b.step("fmt-check", "Check source formatting");
     fmt_check_step.dependOn(&fmt_check.step);
+
+    // Sanitizer test steps (safety checks + thread sanitizer)
+    const sanitize_step = b.step("test-sanitize", "Run all tests with sanitizers enabled");
+    for (layer_tests) |layer| {
+        const san_module = b.createModule(.{
+            .root_source_file = b.path(layer.path),
+            .target = target,
+            .optimize = .Debug,
+            .sanitize_c = .full,
+            .sanitize_thread = true,
+        });
+        san_module.addImport("opentelemetry", otel_module);
+        const san_test = b.addTest(.{ .root_module = san_module });
+        if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(san_test);
+        const run_san_test = b.addRunArtifact(san_test);
+        sanitize_step.dependOn(&run_san_test.step);
+    }
+    // main.zig sanitizer tests
+    const san_main_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .sanitize_c = .full,
+        .sanitize_thread = true,
+    });
+    san_main_module.addImport("opentelemetry", otel_module);
+    const san_main_tests = b.addTest(.{ .root_module = san_main_module });
+    if (tls_enabled) link_openssl(san_main_tests);
+    sanitize_step.dependOn(&b.addRunArtifact(san_main_tests).step);
+    // functional sanitizer tests
+    const san_func_module = b.createModule(.{
+        .root_source_file = b.path("src/functional_tests.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .sanitize_c = .full,
+        .sanitize_thread = true,
+    });
+    san_func_module.addImport("opentelemetry", otel_module);
+    const san_func_test = b.addTest(.{ .root_module = san_func_module });
+    if (tls_enabled) link_openssl(san_func_test);
+    sanitize_step.dependOn(&b.addRunArtifact(san_func_test).step);
 }

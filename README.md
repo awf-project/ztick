@@ -4,50 +4,35 @@ A time-based job scheduler written in Zig with hexagonal architecture, explicit 
 
 ## Features
 
-### Implemented
-
-- **Core scheduler**: Time-based job execution with TCP control protocol
-- **GET command**: Retrieve individual job state (`GET <job_id>`)
-- **QUERY command**: List jobs matching a prefix pattern, or all jobs (`QUERY [<pattern>]`)
-- **REMOVE / REMOVERULE commands**: Delete jobs and rules with persistent removal
-- **LISTRULES command**: Enumerate all configured rules (`LISTRULES`)
-- **Rules**: Match jobs by prefix and assign shell/AMQP runners
-- **Persistence**: Append-only logfile with binary encoding and automatic background compression
-- **Compression scheduling**: Time-based background compression to reduce disk usage on long-lived deployments
-- **Configuration**: TOML-based settings for logging, listen address, framerate, and telemetry
-- **Startup logging**: Runtime-configurable log levels with structured output for startup, connections, and execution lifecycle
-- **TLS support**: Optional TLS encryption for TCP protocol traffic using system OpenSSL
-- **Logfile dump**: Offline inspection of binary logfiles with text/JSON output, compact mode, and live tail
-- **In-memory persistence**: Optional ephemeral operation mode for CI/testing without disk I/O
-- **OpenTelemetry instrumentation**: Metrics, traces, and structured logs exported via OTLP/HTTP to observability collectors
+- **Core scheduler** — Time-based job execution with TCP control protocol
+- **Protocol commands** — `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, `LISTRULES`, `RULE SET`
+- **Rules** — Match jobs by prefix and assign shell runners
+- **Persistence** — Append-only logfile with binary encoding and automatic background compression
+- **In-memory persistence** — Ephemeral mode for CI/testing without disk I/O
+- **Configuration** — TOML-based settings for logging, listen address, framerate, and telemetry
+- **Startup logging** — Runtime-configurable log levels with structured output
+- **TLS support** — Optional TLS 1.3 encryption via system OpenSSL
+- **Logfile dump** — Offline inspection with text/JSON output, compact mode, and live tail
+- **OpenTelemetry** — Traces and metrics exported via OTLP/HTTP to observability collectors
 
 ## Quick Start
 
-### Build
-
 ```bash
-zig build
-zig build -Doptimize=ReleaseSafe  # optimized build
+make build                     # build
+make test                      # unit tests
+make test-functional           # functional tests
+make test-all                  # unit + functional tests
+make test-sanitize             # tests with sanitizers (safety + thread)
+make lint                      # check formatting
+make fmt                       # auto-format
+make clean                     # remove build artifacts
 ```
 
-### Run
+Run the server:
 
 ```bash
 zig build run                        # run with defaults (listens on 127.0.0.1:5678)
 zig build run -- -c /path/to/config  # run with config file
-```
-
-### Test
-
-```bash
-zig build test                 # all unit tests
-zig build test-all             # unit + functional tests
-zig build test-domain          # domain layer only
-zig build test-application     # application layer only
-zig build test-infrastructure  # infrastructure layer only
-zig build test-interfaces      # interfaces layer only
-zig build test-functional      # functional tests only
-zig build fmt-check            # check formatting
 ```
 
 ## Documentation
@@ -84,7 +69,7 @@ ztick follows **hexagonal architecture** with 4 strict layers:
 |---------|---------|
 | **Job** | Execution scheduled for a specific timestamp |
 | **Rule** | Pattern matching rule that selects jobs and specifies a runner |
-| **Runner** | Execution target (shell command, AMQP, HTTP) |
+| **Runner** | Execution target (shell command) |
 | **Execution** | Result of a triggered job (success/failure with metadata) |
 
 ## CLI
@@ -121,7 +106,7 @@ listen = "127.0.0.1:5678"  # TCP address for protocol server
 
 [database]
 persistence = "logfile"     # persistence backend: "logfile" (default) or "memory"
-logfile_path = "logfile"    # path to persistence logfile (logfile mode only)
+logfile_path = "ztick.log"  # path to persistence logfile (logfile mode only)
 fsync_on_persist = true     # fsync after each persist write (logfile mode only)
 framerate = 512             # scheduler tick rate (1-65535)
 compression_interval = 3600 # seconds between logfile compression (0 to disable, logfile mode only)
@@ -185,9 +170,13 @@ Three threads communicate via bounded channels:
 ## Development
 
 - **Zig**: 0.15.2+
+- **Build dependencies**: `libssl-dev` (Debian/Ubuntu) or `openssl-devel` (Fedora/RHEL) for TLS support
 - **Testing**: Co-located unit tests + functional tests in `src/functional_tests.zig`
-- **Formatting**: Enforced with `zig fmt` (`zig build fmt-check`)
+- **Sanitizers**: `make test-sanitize` runs with safety checks and thread sanitizer
+- **Formatting**: Enforced with `zig fmt` (`make lint`)
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
-See [LICENSE](LICENSE) file.
+Licensed under the [European Union Public Licence v1.2](LICENSE) (EUPL-1.2).

@@ -1,0 +1,7 @@
+{
+    "enable_build_on_save": true,
+    "build_on_save_step": "fmt-check",
+    "warn_style": true,
+    "highlight_global_builtin": true,
+    "dangerous_comptime_requests_enabled": false
+}

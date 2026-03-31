@@ -9,7 +9,20 @@ The ztick protocol is a simple line-based text protocol for communicating with t
 - **Parser**: Space-separated arguments with quoted string support
 - **Max line size**: 4096 bytes (fixed per-connection buffer)
 
-**TLS Support:** When ztick is configured with TLS certificates, the protocol is transparently encrypted over the same TCP connection. The protocol itself is unchanged — clients using TLS need only change their connection mechanism (e.g., use `openssl s_client` instead of `nc`). See [Configuration Reference](configuration.md) for TLS setup.
+**TLS Support:** When ztick is configured with TLS certificates, the protocol is transparently encrypted over the same TCP connection. The protocol itself is unchanged — clients using TLS need only change their connection mechanism (e.g., use `openssl s_client` instead of `socat`). See [Configuration Reference](configuration.md) for TLS setup.
+
+## TCP Client Tools
+
+Any tool that can open a TCP connection and send text works with ztick:
+
+| Tool | Plaintext | TLS | Example |
+|------|-----------|-----|---------|
+| **socat** (recommended) | `socat - TCP:host:port` | `socat - OPENSSL:host:port` | `echo 'r1 GET job.1' \| socat - TCP:localhost:5678` |
+| **openssl s_client** | N/A | `openssl s_client -connect host:port -quiet` | For TLS debugging and verification |
+| **curl** | `curl telnet://host:port` | N/A | Quick interactive sessions |
+| **bash built-in** | `cat > /dev/tcp/host/port` | N/A | No external dependencies |
+
+All documentation examples use `socat` as the default tool.
 
 ## Connection
 

@@ -12,7 +12,7 @@ Task-oriented how-to guides for common ztick operations.
 
 - **[Writing Rules](writing-rules.md)** — Match jobs and specify actions
   - Pattern matching and priority (longest match wins)
-  - Runner types (Shell, HTTP/AMQP)
+  - Runner types (Shell)
   - Rule management and removal with `REMOVERULE`
   - Best practices
 
@@ -33,37 +33,37 @@ Task-oriented how-to guides for common ztick operations.
 ### Create a Job
 
 ```bash
-echo 'SET my.job 1234567890' | nc localhost 5678
+echo 'SET my.job 1234567890' | socat - TCP:localhost:5678
 ```
 
 ### Create a Rule
 
 ```bash
-echo 'RULE SET my.job.* SHELL /bin/echo done' | nc localhost 5678
+echo 'RULE SET my.job.* SHELL /bin/echo done' | socat - TCP:localhost:5678
 ```
 
 ### View a Job
 
 ```bash
-echo 'GET my.job' | nc localhost 5678
+echo 'GET my.job' | socat - TCP:localhost:5678
 ```
 
 ### Query Jobs
 
 ```bash
-echo 'req-1 QUERY my.' | nc localhost 5678
+echo 'req-1 QUERY my.' | socat - TCP:localhost:5678
 ```
 
 ### Remove a Job
 
 ```bash
-echo 'req-1 REMOVE my.job' | nc localhost 5678
+echo 'req-1 REMOVE my.job' | socat - TCP:localhost:5678
 ```
 
 ### Remove a Rule
 
 ```bash
-echo 'req-1 REMOVERULE my.rule' | nc localhost 5678
+echo 'req-1 REMOVERULE my.rule' | socat - TCP:localhost:5678
 ```
 
 ### List Rules
@@ -87,14 +87,14 @@ ztick dump logfile --follow                 # live tail
 
 1. Create a rule:
    ```bash
-   echo 'RULE SET backup.daily SHELL /usr/bin/backup.sh' | nc localhost 5678
+   echo 'RULE SET backup.daily SHELL /usr/bin/backup.sh' | socat - TCP:localhost:5678
    ```
 
 2. Create jobs for each day:
    ```bash
    # Schedule for tomorrow at 2 AM
    TOMORROW_2AM=$(date -d "tomorrow 2:00" +%s)
-   echo "SET backup.daily $TOMORROW_2AM" | nc localhost 5678
+   echo "SET backup.daily $TOMORROW_2AM" | socat - TCP:localhost:5678
    ```
 
 ### Route Jobs by Priority
@@ -103,13 +103,13 @@ Use rule weights to prioritize:
 
 ```bash
 # Low priority catch-all
-echo 'RULE SET * SHELL /bin/log-event 1' | nc localhost 5678
+echo 'RULE SET * SHELL /bin/log-event 1' | socat - TCP:localhost:5678
 
 # High priority critical jobs
-echo 'RULE SET critical.* SHELL /bin/alert-admin 100' | nc localhost 5678
+echo 'RULE SET critical.* SHELL /bin/alert-admin 100' | socat - TCP:localhost:5678
 
 # Medium priority
-echo 'RULE SET important.* SHELL /bin/notify 50' | nc localhost 5678
+echo 'RULE SET important.* SHELL /bin/notify 50' | socat - TCP:localhost:5678
 ```
 
 ### Migrate from Another Scheduler
@@ -119,7 +119,7 @@ echo 'RULE SET important.* SHELL /bin/notify 50' | nc localhost 5678
 3. Batch-import via script:
    ```bash
    while read line; do
-     echo "$line" | nc localhost 5678
+     echo "$line" | socat - TCP:localhost:5678
    done < jobs.txt
    ```
 

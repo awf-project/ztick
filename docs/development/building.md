@@ -248,7 +248,7 @@ Start the scheduler:
 Test with protocol commands:
 
 ```bash
-echo 'SET test.job 1711612800' | nc localhost 5555
+echo 'SET test.job 1711612800' | socat - TCP:localhost:5555
 ```
 
 ## Performance Profiling
