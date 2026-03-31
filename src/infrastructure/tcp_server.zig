@@ -4,6 +4,7 @@ const parser = @import("protocol/parser.zig");
 const Channel = @import("channel.zig").Channel;
 const TlsContext = @import("tls_context.zig").TlsContext;
 const TlsStream = @import("tls_context.zig").TlsStream;
+const telemetry = @import("telemetry.zig");
 
 const query = domain.query;
 const instruction = domain.instruction;
@@ -76,9 +77,15 @@ pub const ResponseRouter = struct {
 pub const TcpServer = struct {
     allocator: std.mem.Allocator,
     address: []const u8,
+    /// Tracks live TCP connections via standalone atomic. Overlaps with the
+    /// `ztick.connections.active` OpenTelemetry gauge (`instruments.connections_active`);
+    /// both are incremented/decremented in lockstep. This atomic remains because
+    /// join_all() needs a direct read for shutdown draining, which the SDK gauge
+    /// does not support. Consolidate once the gauge exposes a read API.
     active_connections: std.atomic.Value(usize),
     running: *std.atomic.Value(bool),
     tls_context: ?*TlsContext,
+    instruments: ?telemetry.Instruments,
 
     pub fn init(allocator: std.mem.Allocator, address: []const u8, running: *std.atomic.Value(bool), tls_context: ?*TlsContext) TcpServer {
         return .{
@@ -87,7 +94,12 @@ pub const TcpServer = struct {
             .active_connections = std.atomic.Value(usize).init(0),
             .running = running,
             .tls_context = tls_context,
+            .instruments = null,
         };
+    }
+
+    pub fn setInstruments(self: *TcpServer, instr: telemetry.Instruments) void {
+        self.instruments = instr;
     }
 
     pub fn deinit(self: *TcpServer) void {
@@ -118,8 +130,10 @@ pub const TcpServer = struct {
             next_client_id +%= 1;
 
             _ = self.active_connections.fetchAdd(1, .release);
+            if (self.instruments) |instr| instr.connections_active.add(1, .{}) catch {};
             const thread = std.Thread.spawn(.{}, connection_worker, .{
                 &self.active_connections,
+                self.instruments,
                 self.allocator,
                 conn.stream,
                 conn.address,
@@ -129,6 +143,7 @@ pub const TcpServer = struct {
                 self.tls_context,
             }) catch {
                 _ = self.active_connections.fetchSub(1, .release);
+                if (self.instruments) |instr| instr.connections_active.add(-1, .{}) catch {};
                 conn.stream.close();
                 continue;
             };
@@ -150,6 +165,7 @@ pub const TcpServer = struct {
 
 fn connection_worker(
     active_connections: *std.atomic.Value(usize),
+    instruments: ?telemetry.Instruments,
     allocator: std.mem.Allocator,
     stream: std.net.Stream,
     address: std.net.Address,
@@ -159,6 +175,7 @@ fn connection_worker(
     tls_context: ?*TlsContext,
 ) void {
     defer _ = active_connections.fetchSub(1, .release);
+    defer if (instruments) |instr| instr.connections_active.add(-1, .{}) catch {};
     const conn: Connection = if (tls_context) |tls_ctx| blk: {
         const tls_stream = tls_ctx.accept(stream.handle) catch {
             stream.close();
@@ -1120,4 +1137,96 @@ test "handle_connection accepts plain Connection and exits cleanly" {
         &req_ch,
         &router,
     );
+}
+
+test "tcp server initializes with null instruments" {
+    var running = std.atomic.Value(bool).init(true);
+    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null);
+    defer server.deinit();
+    try std.testing.expectEqual(@as(?telemetry.Instruments, null), server.instruments);
+}
+
+test "tcp server setInstruments makes instruments non-null" {
+    const sdk = @import("opentelemetry");
+    var running = std.atomic.Value(bool).init(true);
+    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null);
+    defer server.deinit();
+
+    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator);
+    defer meter_provider.shutdown();
+    const tracer_provider = try sdk.trace.TracerProvider.init(
+        std.testing.allocator,
+        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(std.crypto.random) },
+    );
+    defer tracer_provider.shutdown();
+    const instruments = try telemetry.createInstruments(meter_provider, tracer_provider);
+
+    server.setInstruments(instruments);
+    try std.testing.expect(server.instruments != null);
+}
+
+test "connection_worker decrements active_connections on exit" {
+    const sdk = @import("opentelemetry");
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator);
+    defer meter_provider.shutdown();
+    const tracer_provider = try sdk.trace.TracerProvider.init(
+        std.testing.allocator,
+        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(std.crypto.random) },
+    );
+    defer tracer_provider.shutdown();
+    const instruments = try telemetry.createInstruments(meter_provider, tracer_provider);
+
+    var active = std.atomic.Value(usize).init(1);
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+
+    pair.write_stream.close();
+    connection_worker(
+        &active,
+        instruments,
+        std.testing.allocator,
+        std.net.Stream{ .handle = pair.read_fd },
+        addr,
+        200,
+        &req_ch,
+        &router,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), active.load(.acquire));
+}
+
+test "connection_worker with null instruments decrements active_connections on exit" {
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    var active = std.atomic.Value(usize).init(1);
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+
+    pair.write_stream.close();
+    connection_worker(
+        &active,
+        null,
+        std.testing.allocator,
+        std.net.Stream{ .handle = pair.read_fd },
+        addr,
+        201,
+        &req_ch,
+        &router,
+        null,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), active.load(.acquire));
 }

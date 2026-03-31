@@ -10,7 +10,7 @@
 
 ## Build System
 
-- Zig 0.14.0+ required; zero external dependencies (stdlib only); build.zig.zon `dependencies = .{}`
+- Zig 0.15.2; minimal dependencies — zig-o11y/opentelemetry-sdk for telemetry (ADR-0004), system OpenSSL for TLS (ADR-0003), stdlib for everything else
 - `make build`, `make test`, `make lint` wrap zig build with `--summary all`
 - Layer-specific test targets: `zig build test-domain`, `test-application`, `test-infrastructure`, `test-interfaces`, `test-functional`, `test-all`
 

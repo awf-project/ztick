@@ -26,7 +26,7 @@ ztick is a time-based job scheduler that needs:
 
 ## Decision
 
-**Build ztick in Zig 0.14.1**.
+**Build ztick in Zig** (currently 0.15.2).
 
 The scheduler's requirements align perfectly with Zig's strengths:
 

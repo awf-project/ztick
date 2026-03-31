@@ -1,6 +1,6 @@
 # ztick
 
-A time-based job scheduler written in Zig with hexagonal architecture, explicit memory management, and zero dependencies beyond the Zig standard library.
+A time-based job scheduler written in Zig with hexagonal architecture, explicit memory management, and minimal dependencies.
 
 ## Features
 
@@ -14,11 +14,12 @@ A time-based job scheduler written in Zig with hexagonal architecture, explicit 
 - **Rules**: Match jobs by prefix and assign shell/AMQP runners
 - **Persistence**: Append-only logfile with binary encoding and automatic background compression
 - **Compression scheduling**: Time-based background compression to reduce disk usage on long-lived deployments
-- **Configuration**: TOML-based settings for logging, listen address, and framerate
+- **Configuration**: TOML-based settings for logging, listen address, framerate, and telemetry
 - **Startup logging**: Runtime-configurable log levels with structured output for startup, connections, and execution lifecycle
 - **TLS support**: Optional TLS encryption for TCP protocol traffic using system OpenSSL
 - **Logfile dump**: Offline inspection of binary logfiles with text/JSON output, compact mode, and live tail
 - **In-memory persistence**: Optional ephemeral operation mode for CI/testing without disk I/O
+- **OpenTelemetry instrumentation**: Metrics, traces, and structured logs exported via OTLP/HTTP to observability collectors
 
 ## Quick Start
 
@@ -51,8 +52,9 @@ zig build fmt-check            # check formatting
 
 ## Documentation
 
+- **[User Guide](docs/user-guide/)** — How-to guides for common tasks
+- **[Reference](docs/reference/)** — Full configuration and protocol reference
 - **[ADRs](docs/ADR/)** — Architecture Decision Records
-- **[Configuration](docs/reference/configuration.md)** — Full configuration reference
 
 ## Architecture
 
@@ -125,7 +127,17 @@ framerate = 512             # scheduler tick rate (1-65535)
 compression_interval = 3600 # seconds between logfile compression (0 to disable, logfile mode only)
 ```
 
-All values are optional and fall back to the defaults shown above.
+### Telemetry
+
+```toml
+[telemetry]
+enabled = true                          # enable OTLP export (default: false)
+endpoint = "http://localhost:4318"      # OTLP/HTTP collector endpoint
+service_name = "ztick"                  # OpenTelemetry service name (default: "ztick")
+flush_interval_ms = 5000                # batch flush interval in milliseconds (default: 5000)
+```
+
+All values are optional and fall back to the defaults shown above. Telemetry is disabled by default; omitting the `[telemetry]` section or setting `enabled = false` incurs zero runtime overhead.
 
 Set `persistence = "memory"` for ephemeral operation (CI, testing, development) — no files are created or read. Data is lost on restart.
 
@@ -172,7 +184,7 @@ Three threads communicate via bounded channels:
 
 ## Development
 
-- **Zig**: 0.14.1+
+- **Zig**: 0.15.2+
 - **Testing**: Co-located unit tests + functional tests in `src/functional_tests.zig`
 - **Formatting**: Enforced with `zig fmt` (`zig build fmt-check`)
 

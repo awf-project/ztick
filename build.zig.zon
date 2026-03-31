@@ -2,8 +2,13 @@
     .name = .ztick,
     .fingerprint = 0x42ab48a3aed72398,
     .version = "0.1.0",
-    .minimum_zig_version = "0.14.0",
-    .dependencies = .{},
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .opentelemetry = .{
+            .url = "git+https://github.com/zig-o11y/opentelemetry-sdk?ref=v0.1.1#60d797fc6420e3875e61cbb63b6008fcd6e3102a",
+            .hash = "opentelemetry-0.0.1-U_uKJyFJDwDLwd8vv1ulDIoJKWYsLX_hEvebqryQzYdy",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

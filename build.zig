@@ -16,11 +16,19 @@ pub fn build(b: *std.Build) void {
         break :blk true;
     };
 
+    // OpenTelemetry SDK dependency (ADR-0004)
+    const otel_dep = b.dependency("opentelemetry", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const otel_module = otel_dep.module("sdk");
+
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    root_module.addImport("opentelemetry", otel_module);
 
     const exe = b.addExecutable(.{
         .name = "ztick",
@@ -53,6 +61,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        layer_module.addImport("opentelemetry", otel_module);
         const layer_test = b.addTest(.{ .root_module = layer_module });
         if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(layer_test);
         const run_layer_test = b.addRunArtifact(layer_test);
@@ -66,6 +75,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    main_test_module.addImport("opentelemetry", otel_module);
     const main_tests = b.addTest(.{ .root_module = main_test_module });
     if (tls_enabled) link_openssl(main_tests);
     const run_main_tests = b.addRunArtifact(main_tests);
@@ -77,6 +87,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    functional_module.addImport("opentelemetry", otel_module);
     const functional_test = b.addTest(.{
         .root_module = functional_module,
     });

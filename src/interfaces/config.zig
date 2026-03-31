@@ -14,6 +14,13 @@ pub const PersistenceMode = enum {
     memory,
 };
 
+pub const TelemetryConfig = struct {
+    enabled: bool,
+    endpoint: ?[]const u8,
+    service_name: []const u8,
+    flush_interval_ms: u32,
+};
+
 pub const ConfigError = error{
     InvalidLogLevel,
     FramerateOutOfRange,
@@ -33,12 +40,15 @@ pub const Config = struct {
     database_logfile_path: []const u8,
     database_persistence: PersistenceMode,
     database_compression_interval: u32,
+    telemetry: TelemetryConfig,
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.controller_listen);
         if (self.controller_tls_cert) |cert| allocator.free(cert);
         if (self.controller_tls_key) |key| allocator.free(key);
         allocator.free(self.database_logfile_path);
+        if (self.telemetry.endpoint) |ep| allocator.free(ep);
+        allocator.free(self.telemetry.service_name);
     }
 };
 
@@ -56,6 +66,12 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
     errdefer if (database_logfile_path) |lp| allocator.free(lp);
     var database_persistence: PersistenceMode = .logfile;
     var database_compression_interval: u32 = 3600;
+    var telemetry_enabled: bool = false;
+    var telemetry_endpoint: ?[]u8 = null;
+    errdefer if (telemetry_endpoint) |ep| allocator.free(ep);
+    var telemetry_service_name: ?[]u8 = null;
+    errdefer if (telemetry_service_name) |sn| allocator.free(sn);
+    var telemetry_flush_interval_ms: u32 = 5000;
 
     var current_section: []const u8 = "";
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -69,7 +85,8 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
             current_section = std.mem.trim(u8, line[1..end], " \t");
             if (!std.mem.eql(u8, current_section, "log") and
                 !std.mem.eql(u8, current_section, "controller") and
-                !std.mem.eql(u8, current_section, "database"))
+                !std.mem.eql(u8, current_section, "database") and
+                !std.mem.eql(u8, current_section, "telemetry"))
             {
                 return ConfigError.UnknownSection;
             }
@@ -96,6 +113,26 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
             } else if (std.mem.eql(u8, key, "tls_key")) {
                 if (controller_tls_key) |prev| allocator.free(prev);
                 controller_tls_key = try allocator.dupe(u8, unquote(raw_val));
+            } else {
+                return ConfigError.UnknownKey;
+            }
+        } else if (std.mem.eql(u8, current_section, "telemetry")) {
+            if (std.mem.eql(u8, key, "enabled")) {
+                if (std.mem.eql(u8, raw_val, "true")) {
+                    telemetry_enabled = true;
+                } else if (std.mem.eql(u8, raw_val, "false")) {
+                    telemetry_enabled = false;
+                } else {
+                    return ConfigError.InvalidValue;
+                }
+            } else if (std.mem.eql(u8, key, "endpoint")) {
+                if (telemetry_endpoint) |prev| allocator.free(prev);
+                telemetry_endpoint = try allocator.dupe(u8, unquote(raw_val));
+            } else if (std.mem.eql(u8, key, "service_name")) {
+                if (telemetry_service_name) |prev| allocator.free(prev);
+                telemetry_service_name = try allocator.dupe(u8, unquote(raw_val));
+            } else if (std.mem.eql(u8, key, "flush_interval_ms")) {
+                telemetry_flush_interval_ms = std.fmt.parseInt(u32, raw_val, 10) catch return ConfigError.InvalidValue;
             } else {
                 return ConfigError.UnknownKey;
             }
@@ -139,6 +176,12 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
         .database_logfile_path = database_logfile_path orelse try allocator.dupe(u8, "logfile"),
         .database_persistence = database_persistence,
         .database_compression_interval = database_compression_interval,
+        .telemetry = TelemetryConfig{
+            .enabled = telemetry_enabled,
+            .endpoint = telemetry_endpoint,
+            .service_name = telemetry_service_name orelse try allocator.dupe(u8, "ztick"),
+            .flush_interval_ms = telemetry_flush_interval_ms,
+        },
     };
 }
 
@@ -359,4 +402,68 @@ test "parse rejects overflow compression interval" {
         \\
     );
     try std.testing.expectError(ConfigError.InvalidValue, result);
+}
+
+test "telemetry defaults to disabled with ztick service name when section absent" {
+    const cfg = try parse(std.testing.allocator, "");
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(false, cfg.telemetry.enabled);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.telemetry.endpoint);
+    try std.testing.expectEqualStrings("ztick", cfg.telemetry.service_name);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.telemetry.flush_interval_ms);
+}
+
+test "parse telemetry enabled flag as true" {
+    const cfg = try parse(std.testing.allocator,
+        \\[telemetry]
+        \\enabled = true
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(true, cfg.telemetry.enabled);
+}
+
+test "parse telemetry endpoint from section" {
+    const cfg = try parse(std.testing.allocator,
+        \\[telemetry]
+        \\endpoint = "http://collector:4318"
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.telemetry.endpoint != null);
+    try std.testing.expectEqualStrings("http://collector:4318", cfg.telemetry.endpoint.?);
+}
+
+test "parse telemetry service_name from section" {
+    const cfg = try parse(std.testing.allocator,
+        \\[telemetry]
+        \\service_name = "my-service"
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("my-service", cfg.telemetry.service_name);
+}
+
+test "parse telemetry flush_interval_ms from section" {
+    const cfg = try parse(std.testing.allocator,
+        \\[telemetry]
+        \\flush_interval_ms = 10000
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 10000), cfg.telemetry.flush_interval_ms);
+}
+
+test "parse rejects unknown key in telemetry section" {
+    const result = parse(std.testing.allocator,
+        \\[telemetry]
+        \\unknown_key = true
+        \\
+    );
+    try std.testing.expectError(ConfigError.UnknownKey, result);
 }

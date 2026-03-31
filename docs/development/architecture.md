@@ -10,7 +10,8 @@ The codebase is organized into 4 layers, with a strict dependency direction (inw
 ┌─────────────────────────────────────────────────────┐
 │ Interfaces (CLI, Config)                            │
 ├─────────────────────────────────────────────────────┤
-│ Infrastructure (Adapters: TCP, Shell, Persistence)  │
+│ Infrastructure (Adapters: TCP, Shell, Persistence,  │
+│                 Telemetry)                          │
 ├─────────────────────────────────────────────────────┤
 │ Application (Scheduler, Storage, Query Handler)     │
 ├─────────────────────────────────────────────────────┤
@@ -75,6 +76,7 @@ pub fn tick(self: *Scheduler, now: i64) !void {
 - `ShellRunner` — Executes shell commands via `std.process`
 - `Encoder`/`Logfile` — Binary persistence (read/write jobs and rules)
 - `Parser` — Line protocol parsing
+- `Telemetry` — OpenTelemetry SDK initialization and OTLP export ([ADR-0004](../ADR/0004-opentelemetry-sdk-dependency.md))
 - `Channel` — Thread-safe bounded message passing
 - `Clock` — Framerate timing
 

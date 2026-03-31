@@ -19,6 +19,7 @@ const infrastructure_clock = @import("infrastructure/clock.zig");
 const infrastructure_shell_runner = @import("infrastructure/shell_runner.zig");
 const infrastructure_tcp_server = @import("infrastructure/tcp_server.zig");
 const infrastructure_tls_context = @import("infrastructure/tls_context.zig");
+const infrastructure_telemetry = @import("infrastructure/telemetry.zig");
 const infrastructure_persistence_background = @import("infrastructure/persistence/background.zig");
 const interfaces_config = @import("interfaces/config.zig");
 const interfaces_cli = @import("interfaces/cli.zig");
@@ -89,6 +90,7 @@ test {
     _ = infrastructure_shell_runner;
     _ = infrastructure_tcp_server;
     _ = infrastructure_tls_context;
+    _ = infrastructure_telemetry;
     _ = infrastructure_persistence_background;
     _ = interfaces_config;
     _ = interfaces_cli;
@@ -115,6 +117,7 @@ const ControllerContext = struct {
     response_router: *ResponseRouter,
     running: *std.atomic.Value(bool),
     tls_context: ?*infrastructure_tls_context.TlsContext,
+    instruments: ?infrastructure_telemetry.Instruments,
 };
 
 const DatabaseContext = struct {
@@ -127,6 +130,7 @@ const DatabaseContext = struct {
     response_router: *ResponseRouter,
     exec_request_ch: *Channel(execution.Request),
     exec_response_ch: *Channel(execution.Response),
+    instruments: ?infrastructure_telemetry.Instruments,
 };
 
 const ProcessorContext = struct {
@@ -137,6 +141,7 @@ const ProcessorContext = struct {
 
 fn run_controller(ctx: ControllerContext) void {
     var server = TcpServer.init(ctx.allocator, ctx.address, ctx.running, ctx.tls_context);
+    if (ctx.instruments) |instr| server.setInstruments(instr);
     defer server.deinit();
     server.start(ctx.request_ch, ctx.response_router) catch |err| {
         std.log.err("controller: start failed: {}", .{err});
@@ -163,6 +168,7 @@ fn run_database(ctx: DatabaseContext) void {
     var scheduler = Scheduler.init(ctx.allocator);
     scheduler.persistence = ctx.persistence;
     scheduler.compression_interval_ns = ctx.compression_interval_ns;
+    if (ctx.instruments) |instr| scheduler.setInstruments(instr);
     defer scheduler.deinit();
 
     scheduler.load(ctx.allocator) catch |err| {
@@ -389,6 +395,7 @@ test "controller context tls_context is null when no TLS cert is configured" {
         .response_router = &router,
         .running = &running,
         .tls_context = null,
+        .instruments = null,
     };
     try std.testing.expectEqual(@as(?*infrastructure_tls_context.TlsContext, null), ctx.tls_context);
 }
@@ -414,8 +421,131 @@ test "controller context tls_context is non-null when cert and key are configure
         .response_router = &router,
         .running = &running,
         .tls_context = &tls_ctx,
+        .instruments = null,
     };
     try std.testing.expect(ctx.tls_context != null);
+}
+
+test "DatabaseContext instruments field is null when telemetry is disabled" {
+    const allocator = std.testing.allocator;
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    var running = std.atomic.Value(bool).init(false);
+
+    const ctx = DatabaseContext{
+        .allocator = allocator,
+        .framerate = 60,
+        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+            .entries = .{},
+            .allocator = allocator,
+        } },
+        .compression_interval_ns = 0,
+        .running = &running,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+        .instruments = null,
+    };
+    try std.testing.expectEqual(@as(?infrastructure_telemetry.Instruments, null), ctx.instruments);
+}
+
+test "DatabaseContext instruments field holds Instruments when telemetry is enabled" {
+    const allocator = std.testing.allocator;
+
+    const otel = @import("opentelemetry");
+    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+    defer meter_provider.shutdown();
+    const tracer_provider = try otel.trace.TracerProvider.init(
+        allocator,
+        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+    );
+    defer tracer_provider.shutdown();
+
+    const instruments = try infrastructure_telemetry.createInstruments(meter_provider, tracer_provider);
+
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    var running = std.atomic.Value(bool).init(false);
+
+    const ctx = DatabaseContext{
+        .allocator = allocator,
+        .framerate = 60,
+        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+            .entries = .{},
+            .allocator = allocator,
+        } },
+        .compression_interval_ns = 0,
+        .running = &running,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+        .instruments = instruments,
+    };
+    try std.testing.expect(ctx.instruments != null);
+}
+
+test "tick with instrumented scheduler processes SET query and routes success response" {
+    const allocator = std.testing.allocator;
+
+    const otel = @import("opentelemetry");
+    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+    defer meter_provider.shutdown();
+    const tracer_provider = try otel.trace.TracerProvider.init(
+        allocator,
+        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+    );
+    defer tracer_provider.shutdown();
+
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var resp_ch = try Channel(query.Response).init(allocator, 4);
+    defer resp_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    router.register(1, &resp_ch);
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.setInstruments(try infrastructure_telemetry.createInstruments(meter_provider, tracer_provider));
+
+    const req = query.Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1_000_000_000 } },
+    };
+    try req_ch.send(req);
+
+    const ctx = TickContext{
+        .scheduler = &scheduler,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+    };
+    ctx.tick();
+
+    const resp = resp_ch.try_receive();
+    try std.testing.expect(resp != null);
+    try std.testing.expect(resp.?.success);
 }
 
 test "DatabaseContext carries persistence backend and compression interval" {
@@ -448,6 +578,7 @@ test "DatabaseContext carries persistence backend and compression interval" {
         .response_router = &router,
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
+        .instruments = null,
     };
     try std.testing.expect(logfile_ctx.persistence == .logfile);
     try std.testing.expectEqual(@as(i64, 3600 * std.time.ns_per_s), logfile_ctx.compression_interval_ns);
@@ -465,6 +596,7 @@ test "DatabaseContext carries persistence backend and compression interval" {
         .response_router = &router,
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
+        .instruments = null,
     };
     try std.testing.expect(memory_ctx.persistence == .memory);
 }
@@ -587,6 +719,24 @@ pub fn main() !void {
     std.log.info("log level: {s}", .{@tagName(cfg.log_level)});
     std.log.info("listening on {s}", .{cfg.controller_listen});
 
+    const telemetry_providers = try infrastructure_telemetry.setup(allocator, cfg.telemetry);
+    defer if (telemetry_providers) |p| p.shutdown();
+
+    if (telemetry_providers) |p| {
+        const otel = @import("opentelemetry");
+        try p.tracer_provider.addSpanProcessor(p.trace_processor.asSpanProcessor());
+        try p.logger_provider.addLogRecordProcessor(p.log_processor.asLogRecordProcessor());
+        try otel.logs.std_log_bridge.configure(.{
+            .provider = p.logger_provider,
+            .also_log_to_stderr = true,
+        });
+    }
+
+    const telemetry_instruments: ?infrastructure_telemetry.Instruments = if (telemetry_providers) |p|
+        try infrastructure_telemetry.createInstruments(p.meter_provider, p.tracer_provider)
+    else
+        null;
+
     const cwd = std.fs.cwd();
 
     var query_request_ch = try Channel(query.Request).init(allocator, 64);
@@ -617,6 +767,7 @@ pub fn main() !void {
         .response_router = &response_router,
         .running = &running,
         .tls_context = if (tls_ctx) |*ctx| ctx else null,
+        .instruments = telemetry_instruments,
     }});
 
     const backend: persistence_backend.PersistenceBackend = switch (cfg.database_persistence) {
@@ -642,6 +793,7 @@ pub fn main() !void {
         .response_router = &response_router,
         .exec_request_ch = &exec_request_ch,
         .exec_response_ch = &exec_response_ch,
+        .instruments = telemetry_instruments,
     }});
 
     const processor_thread = try std.Thread.spawn(.{}, run_processor, .{ProcessorContext{

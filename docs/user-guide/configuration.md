@@ -203,9 +203,64 @@ fsync_on_persist = true
 framerate = 1
 ```
 
+### `[telemetry]` — Observability
+
+Export metrics, traces, and logs to an OpenTelemetry collector for monitoring and debugging.
+
+```toml
+[telemetry]
+enabled = true
+endpoint = "http://localhost:4318"
+service_name = "ztick"
+flush_interval_ms = 5000
+```
+
+**Options:**
+
+| Option | Type | Default | Notes |
+|--------|------|---------|-------|
+| `enabled` | boolean | `false` | Enable telemetry export (zero overhead when disabled) |
+| `endpoint` | string | (required if enabled) | OTLP/HTTP collector URL (e.g., `http://localhost:4318`) |
+| `service_name` | string | `"ztick"` | Service name in observability backend |
+| `flush_interval_ms` | integer | `5000` | Batch export interval in milliseconds |
+
+**Telemetry is exported to:**
+- **Metrics** → `POST /v1/metrics` (job counts, execution latency, connection gauges)
+- **Traces** → `POST /v1/traces` (request spans with command, request ID, and success attributes)
+- **Logs** → `POST /v1/logs` (warn-level and above, with trace correlation)
+
+**Examples:**
+
+```toml
+# No monitoring (default)
+[telemetry]
+enabled = false
+
+# Local development with Jaeger/OpenTelemetry Collector
+[telemetry]
+enabled = true
+endpoint = "http://localhost:4318"
+service_name = "ztick-dev"
+flush_interval_ms = 5000
+
+# Production with Grafana Agent (remote backend)
+[telemetry]
+enabled = true
+endpoint = "http://grafana-agent.infra.svc.cluster.local:4318"
+service_name = "ztick-prod"
+flush_interval_ms = 10000
+
+# High-volume deployment (more frequent flushes)
+[telemetry]
+enabled = true
+endpoint = "http://otel-collector:4318"
+service_name = "ztick-high-volume"
+flush_interval_ms = 1000
+```
+
 ## Full Configuration Example
 
-**Persistent deployment:**
+**Persistent deployment with telemetry:**
 
 ```toml
 [log]
@@ -220,6 +275,12 @@ fsync_on_persist = true
 framerate = 512
 logfile_path = "logfile"
 compression_interval = 3600
+
+[telemetry]
+enabled = true
+endpoint = "http://localhost:4318"
+service_name = "ztick"
+flush_interval_ms = 5000
 ```
 
 **Ephemeral deployment (CI/testing):**
@@ -234,6 +295,9 @@ listen = "127.0.0.1:5678"
 [database]
 persistence = "memory"
 framerate = 512
+
+[telemetry]
+enabled = false
 ```
 
 ## Default Configuration
@@ -253,7 +317,14 @@ fsync_on_persist = true
 framerate = 512
 logfile_path = "logfile"
 compression_interval = 3600
+
+[telemetry]
+enabled = false
+service_name = "ztick"
+flush_interval_ms = 5000
 ```
+
+When telemetry is disabled (the default), all instrumentation and observability exports are disabled and have zero overhead.
 
 ## Configuration Best Practices
 
@@ -269,11 +340,25 @@ listen = "127.0.0.1:5678"
 [database]
 persistence = "memory"
 framerate = 512
+
+[telemetry]
+enabled = false
 ```
 
 - Higher verbosity for debugging
 - Default evaluation rate
 - In-memory persistence for quick iteration (no disk clutter)
+- Telemetry disabled by default (zero overhead in development)
+
+**Optional:** Enable telemetry to test with a local OpenTelemetry Collector:
+
+```toml
+[telemetry]
+enabled = true
+endpoint = "http://localhost:4318"
+service_name = "ztick-dev"
+flush_interval_ms = 5000
+```
 
 ### Production
 
@@ -291,11 +376,18 @@ persistence = "logfile"
 fsync_on_persist = true
 framerate = 512
 logfile_path = "/var/lib/ztick/logfile"
+
+[telemetry]
+enabled = true
+endpoint = "http://otel-collector.infra.svc.cluster.local:4318"
+service_name = "ztick-prod"
+flush_interval_ms = 10000
 ```
 
 - Minimal logging (errors and warnings only)
 - Listen on all interfaces with TLS encryption (port 5679)
 - Durable logfile persistence
+- Telemetry enabled for observability and alerting
 
 ### High-Volume
 
@@ -311,12 +403,19 @@ persistence = "logfile"
 fsync_on_persist = false
 framerate = 1000
 compression_interval = 300
+
+[telemetry]
+enabled = true
+endpoint = "http://otel-collector:4318"
+service_name = "ztick-high-volume"
+flush_interval_ms = 1000
 ```
 
 - Errors only
 - Higher evaluation frequency
 - Relaxed persistence (batch writes for throughput)
 - Aggressive compression (every 5 minutes) for rapid logfile growth
+- Telemetry enabled with frequent flushes (1s) to capture high-frequency events
 
 ## Troubleshooting
 
