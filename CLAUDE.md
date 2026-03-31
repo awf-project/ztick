@@ -65,6 +65,8 @@
 - For follow mode initial offset: subtract remaining partial-frame bytes from file length, not file length itself; starting at file end skips incomplete frames
 - Never silently ignore persistence decode errors; emit warnings to stderr with byte offset for each failure to aid debugging
 
+- When copying structs containing ArrayListUnmanaged or similar shared-backing types, ensure only the owning copy calls deinit; non-owning copies must be dropped without cleanup to prevent double-frees
+
 ## Test Conventions
 
 - Co-locate unit tests in test blocks within source files; use functional_tests.zig for integration tests

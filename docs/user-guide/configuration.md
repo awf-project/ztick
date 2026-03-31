@@ -129,6 +129,7 @@ Controls how jobs and rules are stored and when they are evaluated.
 
 ```toml
 [database]
+persistence = "logfile"
 fsync_on_persist = true
 framerate = 512
 logfile_path = "logfile"
@@ -138,9 +139,39 @@ logfile_path = "logfile"
 
 | Option | Type | Default | Notes |
 |--------|------|---------|-------|
-| `fsync_on_persist` | boolean | `true` | Flush writes to disk immediately (safer, slower) |
+| `persistence` | string | `"logfile"` | Persistence backend: `"logfile"` or `"memory"` |
+| `fsync_on_persist` | boolean | `true` | Flush writes to disk immediately (safer, slower; ignored for `persistence = "memory"`) |
 | `framerate` | integer | `512` | Evaluation frequency in Hz (valid range: 1-65535) |
-| `logfile_path` | string | `"logfile"` | Path to the binary logfile for job/rule persistence |
+| `logfile_path` | string | `"logfile"` | Path to the binary logfile (ignored for `persistence = "memory"`) |
+
+#### Persistence Modes
+
+**Logfile persistence (default):** `persistence = "logfile"`
+
+```toml
+[database]
+persistence = "logfile"
+logfile_path = "data/ztick.log"
+fsync_on_persist = true
+framerate = 512
+```
+
+Use logfile persistence for any deployment requiring **durability**. Jobs and rules are written to disk and survive restarts. Recommended for production systems.
+
+**In-memory persistence:** `persistence = "memory"`
+
+```toml
+[database]
+persistence = "memory"
+framerate = 512
+```
+
+Use in-memory persistence for **ephemeral deployments** where data does not need to survive restarts:
+- CI/testing environments where a fresh scheduler instance is preferred for each run
+- Temporary job scheduling without long-term history
+- Development and debugging with reduced I/O overhead
+
+When `persistence = "memory"` is set, `logfile_path` and `fsync_on_persist` are ignored and no files are created on disk. All jobs and rules are lost when ztick stops.
 
 **Examples:**
 
@@ -163,6 +194,8 @@ framerate = 1
 
 ## Full Configuration Example
 
+**Persistent deployment:**
+
 ```toml
 [log]
 level = "info"
@@ -171,9 +204,24 @@ level = "info"
 listen = "127.0.0.1:5678"
 
 [database]
+persistence = "logfile"
 fsync_on_persist = true
 framerate = 512
 logfile_path = "logfile"
+```
+
+**Ephemeral deployment (CI/testing):**
+
+```toml
+[log]
+level = "info"
+
+[controller]
+listen = "127.0.0.1:5678"
+
+[database]
+persistence = "memory"
+framerate = 512
 ```
 
 ## Default Configuration
@@ -188,6 +236,7 @@ level = "info"
 listen = "127.0.0.1:5678"
 
 [database]
+persistence = "logfile"
 fsync_on_persist = true
 framerate = 512
 logfile_path = "logfile"
@@ -205,13 +254,13 @@ level = "debug"
 listen = "127.0.0.1:5678"
 
 [database]
-fsync_on_persist = true
+persistence = "memory"
 framerate = 512
 ```
 
 - Higher verbosity for debugging
 - Default evaluation rate
-- Safe persistence
+- In-memory persistence for quick iteration (no disk clutter)
 
 ### Production
 
@@ -225,13 +274,15 @@ tls_cert = "/etc/ztick/cert.pem"
 tls_key = "/etc/ztick/key.pem"
 
 [database]
+persistence = "logfile"
 fsync_on_persist = true
 framerate = 512
+logfile_path = "/var/lib/ztick/logfile"
 ```
 
 - Minimal logging (errors and warnings only)
 - Listen on all interfaces with TLS encryption (port 5679)
-- Safe persistence
+- Durable logfile persistence
 
 ### High-Volume
 
@@ -243,13 +294,14 @@ level = "error"
 listen = "0.0.0.0:5678"
 
 [database]
+persistence = "logfile"
 fsync_on_persist = false
 framerate = 1000
 ```
 
 - Errors only
 - Higher evaluation frequency
-- Relaxed persistence (batch writes)
+- Relaxed persistence (batch writes for throughput)
 
 ## Troubleshooting
 

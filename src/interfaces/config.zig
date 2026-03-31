@@ -9,6 +9,11 @@ pub const LogLevel = enum {
     trace,
 };
 
+pub const PersistenceMode = enum {
+    logfile,
+    memory,
+};
+
 pub const ConfigError = error{
     InvalidLogLevel,
     FramerateOutOfRange,
@@ -26,6 +31,7 @@ pub const Config = struct {
     database_framerate: u16,
     /// Zig extension: configurable logfile path (Rust reference used hardcoded "logfile").
     database_logfile_path: []const u8,
+    database_persistence: PersistenceMode,
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.controller_listen);
@@ -47,6 +53,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
     var database_framerate: u16 = 512;
     var database_logfile_path: ?[]u8 = null;
     errdefer if (database_logfile_path) |lp| allocator.free(lp);
+    var database_persistence: PersistenceMode = .logfile;
 
     var current_section: []const u8 = "";
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -106,6 +113,8 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
             } else if (std.mem.eql(u8, key, "logfile_path")) {
                 if (database_logfile_path) |prev| allocator.free(prev);
                 database_logfile_path = try allocator.dupe(u8, unquote(raw_val));
+            } else if (std.mem.eql(u8, key, "persistence")) {
+                database_persistence = std.meta.stringToEnum(PersistenceMode, unquote(raw_val)) orelse return ConfigError.InvalidValue;
             } else {
                 return ConfigError.UnknownKey;
             }
@@ -124,6 +133,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
         .database_fsync_on_persist = database_fsync_on_persist,
         .database_framerate = database_framerate,
         .database_logfile_path = database_logfile_path orelse try allocator.dupe(u8, "logfile"),
+        .database_persistence = database_persistence,
     };
 }
 
@@ -247,6 +257,44 @@ test "parse rejects config with tls key but no tls cert" {
     const result = parse(std.testing.allocator,
         \\[controller]
         \\tls_key = "/etc/ztick/server.key"
+        \\
+    );
+    try std.testing.expectError(ConfigError.InvalidValue, result);
+}
+
+test "parse defaults persistence mode to logfile when key absent" {
+    const cfg = try parse(std.testing.allocator, "");
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(PersistenceMode.logfile, cfg.database_persistence);
+}
+
+test "parse sets persistence mode to memory when configured" {
+    const cfg = try parse(std.testing.allocator,
+        \\[database]
+        \\persistence = "memory"
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(PersistenceMode.memory, cfg.database_persistence);
+}
+
+test "parse sets persistence mode to logfile when explicitly configured" {
+    const cfg = try parse(std.testing.allocator,
+        \\[database]
+        \\persistence = "logfile"
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(PersistenceMode.logfile, cfg.database_persistence);
+}
+
+test "parse rejects unrecognized persistence value" {
+    const result = parse(std.testing.allocator,
+        \\[database]
+        \\persistence = "sqlite"
         \\
     );
     try std.testing.expectError(ConfigError.InvalidValue, result);

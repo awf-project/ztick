@@ -7,6 +7,7 @@ const domain_query = @import("domain/query.zig");
 const domain_execution = @import("domain/execution.zig");
 const persistence_encoder = @import("infrastructure/persistence/encoder.zig");
 const persistence_logfile = @import("infrastructure/persistence/logfile.zig");
+const persistence_backend = @import("infrastructure/persistence/backend.zig");
 const protocol_parser = @import("infrastructure/protocol/parser.zig");
 const application_job_storage = @import("application/job_storage.zig");
 const application_rule_storage = @import("application/rule_storage.zig");
@@ -76,6 +77,7 @@ test {
     _ = domain_execution;
     _ = persistence_encoder;
     _ = persistence_logfile;
+    _ = persistence_backend;
     _ = protocol_parser;
     _ = application_job_storage;
     _ = application_rule_storage;
@@ -118,9 +120,7 @@ const ControllerContext = struct {
 const DatabaseContext = struct {
     allocator: std.mem.Allocator,
     framerate: u16,
-    logfile_path: []const u8,
-    logfile_dir: std.fs.Dir,
-    fsync_on_persist: bool,
+    persistence: persistence_backend.PersistenceBackend,
     running: *std.atomic.Value(bool),
     request_ch: *Channel(query.Request),
     response_router: *ResponseRouter,
@@ -146,10 +146,10 @@ fn run_controller(ctx: ControllerContext) void {
 
 fn run_database(ctx: DatabaseContext) void {
     var scheduler = Scheduler.init(ctx.allocator);
-    scheduler.fsync_on_persist = ctx.fsync_on_persist;
+    scheduler.persistence = ctx.persistence;
     defer scheduler.deinit();
 
-    scheduler.load(ctx.allocator, ctx.logfile_dir, ctx.logfile_path) catch |err| {
+    scheduler.load(ctx.allocator) catch |err| {
         std.log.warn("database: load failed: {}", .{err});
     };
     std.log.info("loaded {d} jobs, {d} rules", .{
@@ -402,6 +402,114 @@ test "controller context tls_context is non-null when cert and key are configure
     try std.testing.expect(ctx.tls_context != null);
 }
 
+test "DatabaseContext holds logfile persistence backend" {
+    const allocator = std.testing.allocator;
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    var running = std.atomic.Value(bool).init(false);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const backend = persistence_backend.PersistenceBackend{ .logfile = .{
+        .logfile_path = "ztick.log",
+        .logfile_dir = tmp.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+
+    const ctx = DatabaseContext{
+        .allocator = allocator,
+        .framerate = 60,
+        .persistence = backend,
+        .running = &running,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+    };
+    try std.testing.expect(ctx.persistence == .logfile);
+}
+
+test "DatabaseContext holds memory persistence backend" {
+    const allocator = std.testing.allocator;
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    var running = std.atomic.Value(bool).init(false);
+
+    const backend = persistence_backend.PersistenceBackend{ .memory = .{
+        .entries = .{},
+        .allocator = allocator,
+    } };
+
+    const ctx = DatabaseContext{
+        .allocator = allocator,
+        .framerate = 60,
+        .persistence = backend,
+        .running = &running,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+    };
+    try std.testing.expect(ctx.persistence == .memory);
+}
+
+test "tick with memory backend persists SET mutation to backend entries" {
+    const allocator = std.testing.allocator;
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var resp_ch = try Channel(query.Response).init(allocator, 4);
+    defer resp_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    router.register(1, &resp_ch);
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = persistence_backend.PersistenceBackend{ .memory = .{
+        .entries = .{},
+        .allocator = allocator,
+    } };
+
+    const req = query.Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1_000_000_000 } },
+    };
+    try req_ch.send(req);
+
+    const ctx = TickContext{
+        .scheduler = &scheduler,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+    };
+    ctx.tick();
+
+    const resp = resp_ch.try_receive();
+    try std.testing.expect(resp != null);
+    try std.testing.expect(resp.?.success);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.persistence.?.memory.entries.items.len);
+}
+
 test "tick processes query request and routes response" {
     const allocator = std.testing.allocator;
     var req_ch = try Channel(query.Request).init(allocator, 4);
@@ -509,12 +617,23 @@ pub fn main() !void {
         .tls_context = if (tls_ctx) |*ctx| ctx else null,
     }});
 
+    const backend: persistence_backend.PersistenceBackend = switch (cfg.database_persistence) {
+        .logfile => .{ .logfile = .{
+            .logfile_path = cfg.database_logfile_path,
+            .logfile_dir = cwd,
+            .load_arena = null,
+            .fsync_on_persist = cfg.database_fsync_on_persist,
+        } },
+        .memory => .{ .memory = .{
+            .entries = .{},
+            .allocator = allocator,
+        } },
+    };
+
     const database_thread = try std.Thread.spawn(.{}, run_database, .{DatabaseContext{
         .allocator = allocator,
         .framerate = cfg.database_framerate,
-        .logfile_path = cfg.database_logfile_path,
-        .logfile_dir = cwd,
-        .fsync_on_persist = cfg.database_fsync_on_persist,
+        .persistence = backend,
         .running = &running,
         .request_ch = &query_request_ch,
         .response_router = &response_router,
