@@ -1,0 +1,9 @@
+[log]
+level = "info"
+
+[controller]
+listen = "127.0.0.1:5678"
+
+[database]
+persistence = memory
+framerate = 512

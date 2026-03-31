@@ -17,6 +17,7 @@ A time-based job scheduler written in Zig with hexagonal architecture, explicit 
 - **Startup logging**: Runtime-configurable log levels with structured output for startup, connections, and execution lifecycle
 - **TLS support**: Optional TLS encryption for TCP protocol traffic using system OpenSSL
 - **Logfile dump**: Offline inspection of binary logfiles with text/JSON output, compact mode, and live tail
+- **In-memory persistence**: Optional ephemeral operation mode for CI/testing without disk I/O
 
 ## Quick Start
 
@@ -116,12 +117,15 @@ level = "info"              # off, error, warn, info, debug, trace
 listen = "127.0.0.1:5678"  # TCP address for protocol server
 
 [database]
-logfile_path = "logfile"    # path to persistence logfile
-fsync_on_persist = true     # fsync after each persist write
+persistence = "logfile"     # persistence backend: "logfile" (default) or "memory"
+logfile_path = "logfile"    # path to persistence logfile (logfile mode only)
+fsync_on_persist = true     # fsync after each persist write (logfile mode only)
 framerate = 512             # scheduler tick rate (1-65535)
 ```
 
 All values are optional and fall back to the defaults shown above.
+
+Set `persistence = "memory"` for ephemeral operation (CI, testing, development) — no files are created or read. Data is lost on restart.
 
 ### TLS
 

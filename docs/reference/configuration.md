@@ -55,9 +55,14 @@ Persistence and scheduling configuration.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `logfile_path` | string | `"logfile"` | Path to the append-only persistence logfile |
-| `fsync_on_persist` | bool | `true` | Call fsync after each persistence write (safer, slower) |
+| `persistence` | string | `"logfile"` | Persistence backend: `"logfile"` (disk-backed, persistent) or `"memory"` (ephemeral, no disk I/O) |
+| `logfile_path` | string | `"logfile"` | Path to the append-only persistence logfile (ignored when `persistence = "memory"`) |
+| `fsync_on_persist` | bool | `true` | Call fsync after each persistence write (safer, slower; ignored when `persistence = "memory"`) |
 | `framerate` | integer | `512` | Scheduler tick rate in Hz (valid range: 1-65535) |
+
+**Persistence Modes:**
+- `"logfile"` — (default) Store jobs and rules in an append-only binary logfile. Data persists across restarts. Use for production deployments where durability is critical.
+- `"memory"` — Store jobs and rules only in memory. No disk I/O occurs. Data is lost on shutdown. Useful for ephemeral deployments, CI environments, and testing where durability is not required.
 
 **Framerate**:
 - `1` — Evaluate once per second (low CPU, long latency)
@@ -76,6 +81,7 @@ tls_cert = "/etc/ztick/cert.pem"
 tls_key = "/etc/ztick/key.pem"
 
 [database]
+persistence = "logfile"
 logfile_path = "data/ztick.log"
 fsync_on_persist = false
 framerate = 100
@@ -89,4 +95,4 @@ framerate = 100
 | `FramerateOutOfRange` | `framerate` is 0 |
 | `UnknownSection` | Section name is not `log`, `controller`, or `database` |
 | `UnknownKey` | Key is not recognized within its section |
-| `InvalidValue` | Value cannot be parsed (e.g. non-boolean for `fsync_on_persist`), or only one of `tls_cert`/`tls_key` is set |
+| `InvalidValue` | Value cannot be parsed (e.g. non-boolean for `fsync_on_persist`), or only one of `tls_cert`/`tls_key` is set, or `persistence` is not `"logfile"` or `"memory"` |

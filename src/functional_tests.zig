@@ -5,6 +5,7 @@ const domain_query = @import("domain/query.zig");
 const application_scheduler = @import("application/scheduler.zig");
 const persistence_encoder = @import("infrastructure/persistence/encoder.zig");
 const persistence_logfile = @import("infrastructure/persistence/logfile.zig");
+const persistence_backend = @import("infrastructure/persistence/backend.zig");
 const protocol_parser = @import("infrastructure/protocol/parser.zig");
 
 const Scheduler = application_scheduler.Scheduler;
@@ -1746,4 +1747,233 @@ test "dump command --follow --format json prints new entries as NDJSON" {
 
 test "dump command --follow exits 0 on SIGTERM" {
     try expect_follow_exits_cleanly_on_signal(std.testing.allocator, std.posix.SIG.TERM);
+}
+
+// Feature: F008
+
+test "memory backend processes SET command without creating files on disk" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var placeholder = try tmp_dir.dir.createFile("memory.db", .{});
+    placeholder.close();
+    const db_abs_path = try tmp_dir.dir.realpathAlloc(allocator, "memory.db");
+    defer allocator.free(db_abs_path);
+    try tmp_dir.dir.deleteFile("memory.db");
+
+    var config_buf: [1024]u8 = undefined;
+    const config_content = try std.fmt.bufPrint(
+        &config_buf,
+        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19880\"\n\n[database]\npersistence = \"memory\"\nlogfile_path = \"{s}\"\n",
+        .{db_abs_path},
+    );
+
+    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+    try config_file.writeAll(config_content);
+    config_file.close();
+
+    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    defer allocator.free(config_path);
+
+    var child = try spawn_ztick(allocator, config_path);
+    const stderr_file = child.stderr.?;
+    std.Thread.sleep(300_000_000);
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19880) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.SkipZigTest;
+    };
+
+    _ = stream.write("req-mem-1 SET app.mem.job 1595586600000000000\n") catch {
+        stream.close();
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.SkipZigTest;
+    };
+    std.Thread.sleep(500_000_000);
+    stream.close();
+    std.Thread.sleep(200_000_000);
+
+    var stderr_buf: [8192]u8 = undefined;
+    const stderr = drain_stderr(stderr_file, &stderr_buf);
+
+    _ = child.kill() catch {};
+    _ = child.wait() catch {};
+
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[DEBUG] instruction received: set") != null);
+    try std.testing.expectError(error.FileNotFound, tmp_dir.dir.access("memory.db", .{}));
+}
+
+test "memory backend starts with zero loaded jobs and rules" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+    try config_file.writeAll("[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n");
+    config_file.close();
+
+    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    defer allocator.free(config_path);
+
+    var child = try spawn_ztick(allocator, config_path);
+    const stderr_file = child.stderr.?;
+
+    std.Thread.sleep(300_000_000);
+
+    var stderr_buf: [4096]u8 = undefined;
+    const stderr = drain_stderr(stderr_file, &stderr_buf);
+
+    _ = child.kill() catch {};
+    _ = child.wait() catch {};
+
+    try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] loaded 0 jobs, 0 rules") != null);
+}
+
+test "memory backend SET and GET round-trip returns planned job" {
+    const allocator = std.testing.allocator;
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set",
+        .instruction = .{ .set = .{ .identifier = "mem.job.1", .execution = 1595586600000000000 } },
+    });
+
+    const get_resp = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-get",
+        .instruction = .{ .get = .{ .identifier = "mem.job.1" } },
+    });
+    defer if (get_resp.body) |b| allocator.free(b);
+
+    try std.testing.expect(get_resp.success);
+    try std.testing.expectEqualStrings("planned 1595586600000000000", get_resp.body.?);
+}
+
+test "memory backend data does not survive scheduler reload" {
+    const allocator = std.testing.allocator;
+
+    var scheduler = Scheduler.init(allocator);
+    scheduler.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set",
+        .instruction = .{ .set = .{ .identifier = "ephemeral.job", .execution = 5000 } },
+    });
+
+    const job_before = scheduler.job_storage.get("ephemeral.job");
+    try std.testing.expect(job_before != null);
+
+    scheduler.deinit();
+
+    // New scheduler with fresh memory backend — no data carried over
+    var scheduler2 = Scheduler.init(allocator);
+    defer scheduler2.deinit();
+    scheduler2.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    try scheduler2.load(allocator);
+
+    try std.testing.expectEqual(@as(?Job, null), scheduler2.job_storage.get("ephemeral.job"));
+}
+
+test "memory backend REMOVE command removes job from storage" {
+    const allocator = std.testing.allocator;
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set",
+        .instruction = .{ .set = .{ .identifier = "mem.removable.job", .execution = 9000 } },
+    });
+
+    try std.testing.expect(scheduler.job_storage.get("mem.removable.job") != null);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-remove",
+        .instruction = .{ .remove = .{ .identifier = "mem.removable.job" } },
+    });
+
+    try std.testing.expectEqual(@as(?Job, null), scheduler.job_storage.get("mem.removable.job"));
+}
+
+test "memory backend REMOVERULE command removes rule from storage" {
+    const allocator = std.testing.allocator;
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-ruleset",
+        .instruction = .{ .rule_set = .{ .identifier = "mem.rule.1", .pattern = "mem.", .runner = .{ .shell = .{ .command = "/bin/true" } } } },
+    });
+
+    try std.testing.expect(scheduler.rule_storage.get("mem.rule.1") != null);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-removerule",
+        .instruction = .{ .remove_rule = .{ .identifier = "mem.rule.1" } },
+    });
+
+    try std.testing.expectEqual(@as(?Rule, null), scheduler.rule_storage.get("mem.rule.1"));
+}
+
+test "default persistence uses logfile when no persistence key configured" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = .{ .logfile = .{
+        .logfile_path = "default.log",
+        .logfile_dir = tmp_dir.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set",
+        .instruction = .{ .set = .{ .identifier = "compat.job", .execution = 9000 } },
+    });
+
+    // Logfile backend creates the file on disk
+    try tmp_dir.dir.access("default.log", .{});
+
+    // New scheduler loads persisted data from same logfile
+    var scheduler2 = Scheduler.init(allocator);
+    defer scheduler2.deinit();
+    scheduler2.persistence = .{ .logfile = .{
+        .logfile_path = "default.log",
+        .logfile_dir = tmp_dir.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    try scheduler2.load(allocator);
+
+    const restored = scheduler2.job_storage.get("compat.job");
+    try std.testing.expect(restored != null);
+    try std.testing.expectEqual(JobStatus.planned, restored.?.status);
 }

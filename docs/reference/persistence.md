@@ -4,7 +4,7 @@ Specification of ztick's binary persistence format used for logfiles.
 
 ## Overview
 
-ztick persists jobs and rules to a binary logfile, enabling recovery after restarts. The format is designed for:
+ztick persists jobs and rules using a binary encoding format. The **logfile backend** writes entries to an append-only file for durability across restarts. The **memory backend** stores the same encoded bytes in an in-memory list for ephemeral operation (see [Configuration](configuration.md) for backend selection). The encoding format is designed for:
 
 - **Performance**: Efficient parsing and writing
 - **Durability**: Each entry has length prefix for robustness

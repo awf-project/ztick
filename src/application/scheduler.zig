@@ -11,17 +11,14 @@ const Rule = domain.rule.Rule;
 const Request = domain.query.Request;
 const Response = domain.query.Response;
 const Entry = persistence.encoder.Entry;
+const PersistenceBackend = persistence.backend.PersistenceBackend;
 
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
     job_storage: JobStorage,
     rule_storage: RuleStorage,
     execution_client: ExecutionClient,
-    logfile_path: ?[]const u8,
-    /// Borrowed: caller keeps this Dir open; Scheduler does not close it.
-    logfile_dir: ?std.fs.Dir,
-    load_arena: ?std.heap.ArenaAllocator,
-    fsync_on_persist: bool,
+    persistence: ?PersistenceBackend,
 
     pub fn init(allocator: std.mem.Allocator) Scheduler {
         return .{
@@ -29,10 +26,7 @@ pub const Scheduler = struct {
             .job_storage = JobStorage.init(allocator),
             .rule_storage = RuleStorage.init(allocator),
             .execution_client = ExecutionClient.init(allocator),
-            .logfile_path = null,
-            .logfile_dir = null,
-            .load_arena = null,
-            .fsync_on_persist = true,
+            .persistence = null,
         };
     }
 
@@ -40,40 +34,29 @@ pub const Scheduler = struct {
         self.job_storage.deinit();
         self.rule_storage.deinit();
         self.execution_client.deinit();
-        if (self.load_arena) |*arena| arena.deinit();
+        if (self.persistence) |*b| b.deinit();
     }
 
-    pub fn load(self: *Scheduler, allocator: std.mem.Allocator, dir: std.fs.Dir, path: []const u8) !void {
-        self.logfile_path = path;
-        self.logfile_dir = dir;
+    pub fn load(self: *Scheduler, allocator: std.mem.Allocator) !void {
+        if (self.persistence == null) return;
 
-        const file = dir.openFile(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return,
-            else => return err,
-        };
-        defer file.close();
-
-        const data = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-        defer allocator.free(data);
-
-        const result = try persistence.logfile.parse(allocator, data);
+        const raw_entries = try self.persistence.?.load(allocator);
         defer {
-            for (result.entries) |e| allocator.free(e);
-            allocator.free(result.entries);
+            for (raw_entries) |e| allocator.free(e);
+            allocator.free(raw_entries);
         }
 
-        if (self.load_arena) |*existing| {
-            self.job_storage.deinit();
-            self.job_storage = JobStorage.init(self.allocator);
-            self.rule_storage.deinit();
-            self.rule_storage = RuleStorage.init(self.allocator);
-            existing.deinit();
-        }
-        self.load_arena = std.heap.ArenaAllocator.init(allocator);
-        const arena = self.load_arena.?.allocator();
+        self.job_storage.jobs.clearRetainingCapacity();
+        self.job_storage.to_execute.clearRetainingCapacity();
+        self.rule_storage.rules.clearRetainingCapacity();
 
-        for (result.entries) |entry_data| {
-            const entry = persistence.encoder.decode(arena, entry_data) catch continue;
+        const decode_alloc = self.persistence.?.reset_decode_arena(allocator);
+
+        for (raw_entries) |raw| {
+            const entry = persistence.encoder.decode(decode_alloc, raw) catch |err| {
+                std.log.warn("persistence: failed to decode entry: {}", .{err});
+                continue;
+            };
             try self.replay_entry(entry);
         }
     }
@@ -92,49 +75,25 @@ pub const Scheduler = struct {
         const response = try handler.handle(request);
         errdefer if (response.body) |b| self.allocator.free(b);
 
-        if (response.success and self.logfile_path != null) {
-            try self.append_to_logfile(request);
+        if (response.success and self.persistence != null) {
+            try self.append_to_persistence(request);
         }
 
         return response;
     }
 
-    fn append_to_logfile(self: *Scheduler, request: Request) !void {
-        const dir = self.logfile_dir.?;
-        const path = self.logfile_path.?;
-        const entry: Entry = switch (request.instruction) {
-            .set => |args| .{ .job = .{
-                .identifier = args.identifier,
-                .execution = args.execution,
-                .status = .planned,
-            } },
-            .rule_set => |args| .{ .rule = .{
-                .identifier = args.identifier,
-                .pattern = args.pattern,
-                .runner = args.runner,
-            } },
-            .remove => |args| .{ .job_removal = .{ .identifier = args.identifier } },
-            .remove_rule => |args| .{ .rule_removal = .{ .identifier = args.identifier } },
-            .get, .query, .list_rules => return,
+    fn append_to_persistence(self: *Scheduler, request: Request) !void {
+        const maybe_entry: ?Entry = switch (request.instruction) {
+            .set => |s| .{ .job = .{ .identifier = s.identifier, .execution = s.execution, .status = .planned } },
+            .rule_set => |r| .{ .rule = .{ .identifier = r.identifier, .pattern = r.pattern, .runner = r.runner } },
+            .remove => |r| .{ .job_removal = .{ .identifier = r.identifier } },
+            .remove_rule => |r| .{ .rule_removal = .{ .identifier = r.identifier } },
+            .get, .query, .list_rules => null,
         };
-
+        const entry = maybe_entry orelse return;
         const encoded = try persistence.encoder.encode(self.allocator, entry);
         defer self.allocator.free(encoded);
-
-        const framed = try persistence.logfile.encode(self.allocator, encoded);
-        defer self.allocator.free(framed);
-
-        // Direct append is crash-safe: length-prefixed framing makes partial writes
-        // detectable by the parser. Atomic rename is used for full file replacement
-        // (see background.compress), not incremental appends.
-        const file = dir.openFile(path, .{ .mode = .write_only }) catch |err| switch (err) {
-            error.FileNotFound => try dir.createFile(path, .{}),
-            else => return err,
-        };
-        defer file.close();
-        try file.seekFromEnd(0);
-        try file.writeAll(framed);
-        if (self.fsync_on_persist) try file.sync();
+        try self.persistence.?.append(encoded);
     }
 
     pub fn tick(self: *Scheduler, current_time: i64) !void {
@@ -268,7 +227,13 @@ test "load and handle_query round-trip through logfile" {
     {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
-        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+        scheduler.persistence = PersistenceBackend{ .logfile = .{
+            .logfile_path = tmp_path,
+            .logfile_dir = std.fs.cwd(),
+            .load_arena = null,
+            .fsync_on_persist = false,
+        } };
+        try scheduler.load(allocator);
 
         _ = try scheduler.handle_query(Request{
             .client = 1,
@@ -290,7 +255,13 @@ test "load and handle_query round-trip through logfile" {
     {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
-        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+        scheduler.persistence = PersistenceBackend{ .logfile = .{
+            .logfile_path = tmp_path,
+            .logfile_dir = std.fs.cwd(),
+            .load_arena = null,
+            .fsync_on_persist = false,
+        } };
+        try scheduler.load(allocator);
 
         const job = scheduler.job_storage.get("job.1");
         try std.testing.expect(job != null);
@@ -416,7 +387,13 @@ test "handle_query with query instruction does not persist to logfile" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+    scheduler.persistence = PersistenceBackend{ .logfile = .{
+        .logfile_path = tmp_path,
+        .logfile_dir = std.fs.cwd(),
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    try scheduler.load(allocator);
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -454,7 +431,13 @@ test "handle_query with get instruction does not persist to logfile" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+    scheduler.persistence = PersistenceBackend{ .logfile = .{
+        .logfile_path = tmp_path,
+        .logfile_dir = std.fs.cwd(),
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    try scheduler.load(allocator);
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -494,7 +477,13 @@ test "double load deinits previous arena without leak" {
     {
         var writer = Scheduler.init(allocator);
         defer writer.deinit();
-        try writer.load(allocator, std.fs.cwd(), tmp_path);
+        writer.persistence = PersistenceBackend{ .logfile = .{
+            .logfile_path = tmp_path,
+            .logfile_dir = std.fs.cwd(),
+            .load_arena = null,
+            .fsync_on_persist = false,
+        } };
+        try writer.load(allocator);
 
         _ = try writer.handle_query(Request{
             .client = 1,
@@ -506,9 +495,15 @@ test "double load deinits previous arena without leak" {
     {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
+        scheduler.persistence = PersistenceBackend{ .logfile = .{
+            .logfile_path = tmp_path,
+            .logfile_dir = std.fs.cwd(),
+            .load_arena = null,
+            .fsync_on_persist = false,
+        } };
 
-        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
-        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+        try scheduler.load(allocator);
+        try scheduler.load(allocator);
 
         const job = scheduler.job_storage.get("job.1");
         try std.testing.expect(job != null);
@@ -533,7 +528,13 @@ test "handle_query with remove instruction persists to logfile" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+    scheduler.persistence = PersistenceBackend{ .logfile = .{
+        .logfile_path = tmp_path,
+        .logfile_dir = std.fs.cwd(),
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    try scheduler.load(allocator);
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -569,7 +570,13 @@ test "remove job round-trip through logfile" {
     {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
-        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+        scheduler.persistence = PersistenceBackend{ .logfile = .{
+            .logfile_path = tmp_path,
+            .logfile_dir = std.fs.cwd(),
+            .load_arena = null,
+            .fsync_on_persist = false,
+        } };
+        try scheduler.load(allocator);
 
         _ = try scheduler.handle_query(Request{
             .client = 1,
@@ -586,7 +593,13 @@ test "remove job round-trip through logfile" {
     {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
-        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+        scheduler.persistence = PersistenceBackend{ .logfile = .{
+            .logfile_path = tmp_path,
+            .logfile_dir = std.fs.cwd(),
+            .load_arena = null,
+            .fsync_on_persist = false,
+        } };
+        try scheduler.load(allocator);
 
         try std.testing.expectEqual(@as(?Job, null), scheduler.job_storage.get("job.1"));
     }
@@ -610,7 +623,13 @@ test "remove_rule round-trip through logfile" {
     {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
-        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+        scheduler.persistence = PersistenceBackend{ .logfile = .{
+            .logfile_path = tmp_path,
+            .logfile_dir = std.fs.cwd(),
+            .load_arena = null,
+            .fsync_on_persist = false,
+        } };
+        try scheduler.load(allocator);
 
         _ = try scheduler.handle_query(Request{
             .client = 1,
@@ -631,7 +650,13 @@ test "remove_rule round-trip through logfile" {
     {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
-        try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+        scheduler.persistence = PersistenceBackend{ .logfile = .{
+            .logfile_path = tmp_path,
+            .logfile_dir = std.fs.cwd(),
+            .load_arena = null,
+            .fsync_on_persist = false,
+        } };
+        try scheduler.load(allocator);
 
         try std.testing.expectEqual(@as(?Rule, null), scheduler.rule_storage.get("rule.1"));
     }
@@ -654,7 +679,13 @@ test "handle_query with list_rules instruction does not persist to logfile" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    try scheduler.load(allocator, std.fs.cwd(), tmp_path);
+    scheduler.persistence = PersistenceBackend{ .logfile = .{
+        .logfile_path = tmp_path,
+        .logfile_dir = std.fs.cwd(),
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    try scheduler.load(allocator);
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -755,6 +786,115 @@ test "tick updates all job statuses when multiple execution results arrive in si
     try std.testing.expect(job_b != null);
     try std.testing.expectEqual(domain.job.JobStatus.executed, job_a.?.status);
     try std.testing.expectEqual(domain.job.JobStatus.failed, job_b.?.status);
+}
+
+test "load with memory backend on empty backend loads nothing" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    try scheduler.load(allocator);
+
+    try std.testing.expectEqual(@as(?Job, null), scheduler.job_storage.get("any.job"));
+}
+
+test "handle_query with set instruction round-trips through memory backend" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    try scheduler.load(allocator);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
+    });
+
+    try scheduler.load(allocator);
+
+    const job = scheduler.job_storage.get("job.1");
+    try std.testing.expect(job != null);
+    try std.testing.expectEqual(@as(i64, 1595586600_000000000), job.?.execution);
+    try std.testing.expectEqual(domain.job.JobStatus.planned, job.?.status);
+}
+
+test "load and handle_query round-trip through memory backend" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    try scheduler.load(allocator);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
+    });
+
+    _ = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-2",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.1",
+            .pattern = "job.",
+            .runner = .{ .shell = .{ .command = "echo hello" } },
+        } },
+    });
+
+    try scheduler.load(allocator);
+
+    const job = scheduler.job_storage.get("job.1");
+    try std.testing.expect(job != null);
+    try std.testing.expectEqual(@as(i64, 1595586600_000000000), job.?.execution);
+    try std.testing.expectEqual(domain.job.JobStatus.planned, job.?.status);
+
+    const rule = scheduler.rule_storage.get("rule.1");
+    try std.testing.expect(rule != null);
+    try std.testing.expectEqualStrings("job.", rule.?.pattern);
+    try std.testing.expectEqualStrings("echo hello", rule.?.runner.shell.command);
+}
+
+test "double load with memory backend works without leak" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    try scheduler.load(allocator);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1000 } },
+    });
+
+    try scheduler.load(allocator);
+    try scheduler.load(allocator);
+
+    const job = scheduler.job_storage.get("job.1");
+    try std.testing.expect(job != null);
+    try std.testing.expectEqual(@as(i64, 1000), job.?.execution);
 }
 
 fn get_file_size(path: []const u8) !u64 {
