@@ -121,6 +121,7 @@ const DatabaseContext = struct {
     allocator: std.mem.Allocator,
     framerate: u16,
     persistence: persistence_backend.PersistenceBackend,
+    compression_interval_ns: i64,
     running: *std.atomic.Value(bool),
     request_ch: *Channel(query.Request),
     response_router: *ResponseRouter,
@@ -144,14 +145,31 @@ fn run_controller(ctx: ControllerContext) void {
     server.join_all();
 }
 
+pub fn compress_startup_leftover(allocator: std.mem.Allocator, backend: persistence_backend.PersistenceBackend) void {
+    const lf = switch (backend) {
+        .logfile => |lf| lf,
+        .memory => return,
+    };
+    const dir = lf.logfile_dir orelse return;
+    const filenames = infrastructure_persistence_background.Filenames{};
+    const f = dir.openFile(filenames.source, .{}) catch return;
+    f.close();
+    infrastructure_persistence_background.compress(allocator, dir, filenames) catch {
+        std.log.warn("startup: leftover .to_compress compression failed", .{});
+    };
+}
+
 fn run_database(ctx: DatabaseContext) void {
     var scheduler = Scheduler.init(ctx.allocator);
     scheduler.persistence = ctx.persistence;
+    scheduler.compression_interval_ns = ctx.compression_interval_ns;
     defer scheduler.deinit();
 
     scheduler.load(ctx.allocator) catch |err| {
         std.log.warn("database: load failed: {}", .{err});
     };
+
+    compress_startup_leftover(ctx.allocator, ctx.persistence);
     std.log.info("loaded {d} jobs, {d} rules", .{
         scheduler.job_storage.jobs.count(),
         scheduler.rule_storage.rules.count(),
@@ -208,12 +226,10 @@ test "config log levels map to matching standard log levels" {
 }
 
 test "config error level maps to standard err level" {
-    // Config.LogLevel uses @"error"; std.log.Level uses .err
     try std.testing.expectEqual(std.log.Level.err, log_level_to_std(.@"error").?);
 }
 
 test "config trace level maps to standard debug level" {
-    // std.log has no trace level; trace maps to the most permissive level
     try std.testing.expectEqual(std.log.Level.debug, log_level_to_std(.trace).?);
 }
 
@@ -402,7 +418,7 @@ test "controller context tls_context is non-null when cert and key are configure
     try std.testing.expect(ctx.tls_context != null);
 }
 
-test "DatabaseContext holds logfile persistence backend" {
+test "DatabaseContext carries persistence backend and compression interval" {
     const allocator = std.testing.allocator;
     var req_ch = try Channel(query.Request).init(allocator, 4);
     defer req_ch.deinit();
@@ -417,54 +433,40 @@ test "DatabaseContext holds logfile persistence backend" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const backend = persistence_backend.PersistenceBackend{ .logfile = .{
-        .logfile_path = "ztick.log",
-        .logfile_dir = tmp.dir,
-        .load_arena = null,
-        .fsync_on_persist = false,
-    } };
-
-    const ctx = DatabaseContext{
+    const logfile_ctx = DatabaseContext{
         .allocator = allocator,
         .framerate = 60,
-        .persistence = backend,
+        .persistence = persistence_backend.PersistenceBackend{ .logfile = .{
+            .logfile_path = "ztick.log",
+            .logfile_dir = tmp.dir,
+            .load_arena = null,
+            .fsync_on_persist = false,
+        } },
+        .compression_interval_ns = 3600 * std.time.ns_per_s,
         .running = &running,
         .request_ch = &req_ch,
         .response_router = &router,
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
     };
-    try std.testing.expect(ctx.persistence == .logfile);
-}
+    try std.testing.expect(logfile_ctx.persistence == .logfile);
+    try std.testing.expectEqual(@as(i64, 3600 * std.time.ns_per_s), logfile_ctx.compression_interval_ns);
 
-test "DatabaseContext holds memory persistence backend" {
-    const allocator = std.testing.allocator;
-    var req_ch = try Channel(query.Request).init(allocator, 4);
-    defer req_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
-    defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
-    defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
-    defer router.deinit();
-    var running = std.atomic.Value(bool).init(false);
-
-    const backend = persistence_backend.PersistenceBackend{ .memory = .{
-        .entries = .{},
-        .allocator = allocator,
-    } };
-
-    const ctx = DatabaseContext{
+    const memory_ctx = DatabaseContext{
         .allocator = allocator,
         .framerate = 60,
-        .persistence = backend,
+        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+            .entries = .{},
+            .allocator = allocator,
+        } },
+        .compression_interval_ns = 0,
         .running = &running,
         .request_ch = &req_ch,
         .response_router = &router,
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
     };
-    try std.testing.expect(ctx.persistence == .memory);
+    try std.testing.expect(memory_ctx.persistence == .memory);
 }
 
 test "tick with memory backend persists SET mutation to backend entries" {
@@ -634,6 +636,7 @@ pub fn main() !void {
         .allocator = allocator,
         .framerate = cfg.database_framerate,
         .persistence = backend,
+        .compression_interval_ns = @as(i64, cfg.database_compression_interval) * std.time.ns_per_s,
         .running = &running,
         .request_ch = &query_request_ch,
         .response_router = &response_router,

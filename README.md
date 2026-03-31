@@ -12,7 +12,8 @@ A time-based job scheduler written in Zig with hexagonal architecture, explicit 
 - **REMOVE / REMOVERULE commands**: Delete jobs and rules with persistent removal
 - **LISTRULES command**: Enumerate all configured rules (`LISTRULES`)
 - **Rules**: Match jobs by prefix and assign shell/AMQP runners
-- **Persistence**: Append-only logfile with binary encoding and compression
+- **Persistence**: Append-only logfile with binary encoding and automatic background compression
+- **Compression scheduling**: Time-based background compression to reduce disk usage on long-lived deployments
 - **Configuration**: TOML-based settings for logging, listen address, and framerate
 - **Startup logging**: Runtime-configurable log levels with structured output for startup, connections, and execution lifecycle
 - **TLS support**: Optional TLS encryption for TCP protocol traffic using system OpenSSL
@@ -121,6 +122,7 @@ persistence = "logfile"     # persistence backend: "logfile" (default) or "memor
 logfile_path = "logfile"    # path to persistence logfile (logfile mode only)
 fsync_on_persist = true     # fsync after each persist write (logfile mode only)
 framerate = 512             # scheduler tick rate (1-65535)
+compression_interval = 3600 # seconds between logfile compression (0 to disable, logfile mode only)
 ```
 
 All values are optional and fall back to the defaults shown above.

@@ -12,6 +12,7 @@ const Request = domain.query.Request;
 const Response = domain.query.Response;
 const Entry = persistence.encoder.Entry;
 const PersistenceBackend = persistence.backend.PersistenceBackend;
+const Process = persistence.background.Process;
 
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
@@ -19,6 +20,9 @@ pub const Scheduler = struct {
     rule_storage: RuleStorage,
     execution_client: ExecutionClient,
     persistence: ?PersistenceBackend,
+    compression_interval_ns: i64,
+    last_compression_ns: i64,
+    active_process: ?*Process,
 
     pub fn init(allocator: std.mem.Allocator) Scheduler {
         return .{
@@ -27,10 +31,16 @@ pub const Scheduler = struct {
             .rule_storage = RuleStorage.init(allocator),
             .execution_client = ExecutionClient.init(allocator),
             .persistence = null,
+            .compression_interval_ns = 0,
+            .last_compression_ns = 0,
+            .active_process = null,
         };
     }
 
     pub fn deinit(self: *Scheduler) void {
+        if (self.active_process) |proc| {
+            proc.deinit();
+        }
         self.job_storage.deinit();
         self.rule_storage.deinit();
         self.execution_client.deinit();
@@ -126,6 +136,62 @@ pub const Scheduler = struct {
                 try self.job_storage.set(failed);
             }
         }
+
+        try self.maybe_trigger_compression(current_time);
+    }
+
+    fn maybe_trigger_compression(self: *Scheduler, current_time: i64) !void {
+        if (self.active_process) |proc| {
+            switch (proc.status()) {
+                .running => {},
+                .success => {
+                    proc.deinit();
+                    self.active_process = null;
+                },
+                .failure => {
+                    std.log.warn("compression: background compression failed, retaining .to_compress for next cycle", .{});
+                    proc.deinit();
+                    self.active_process = null;
+                },
+            }
+        }
+
+        const backend = self.persistence orelse return;
+        switch (backend) {
+            .memory => return,
+            .logfile => |lf| {
+                if (self.compression_interval_ns == 0) return;
+                if (self.active_process != null) return;
+                if (current_time < self.last_compression_ns) return;
+                if (current_time - self.last_compression_ns < self.compression_interval_ns) return;
+
+                const dir = lf.logfile_dir orelse return;
+                const path = lf.logfile_path orelse return;
+
+                if (dir.statFile("logfile.to_compress")) |_| {
+                    std.log.warn("compression: skipping cycle, leftover logfile.to_compress still present", .{});
+                    return;
+                } else |_| {}
+
+                try std.fs.rename(dir, path, dir, "logfile.to_compress");
+
+                const proc = try self.allocator.create(Process);
+                errdefer self.allocator.destroy(proc);
+                proc.* = .{ .allocator = self.allocator, .thread = undefined, .result = null, .mutex = .{} };
+
+                proc.thread = try std.Thread.spawn(.{}, struct {
+                    fn run(p: *Process, alloc: std.mem.Allocator, compress_dir: std.fs.Dir) void {
+                        const r = persistence.background.compress(alloc, compress_dir, .{});
+                        p.mutex.lock();
+                        defer p.mutex.unlock();
+                        p.result = r;
+                    }
+                }.run, .{ proc, self.allocator, dir });
+
+                self.active_process = proc;
+                self.last_compression_ns = current_time;
+            },
+        }
     }
 };
 
@@ -216,20 +282,20 @@ test "load and handle_query round-trip through logfile" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const tmp_path = "/tmp/ztick-test-scheduler-roundtrip.log";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        file.close();
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
     {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
         scheduler.persistence = PersistenceBackend{ .logfile = .{
-            .logfile_path = tmp_path,
-            .logfile_dir = std.fs.cwd(),
+            .logfile_path = "logfile",
+            .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
         } };
@@ -256,8 +322,8 @@ test "load and handle_query round-trip through logfile" {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
         scheduler.persistence = PersistenceBackend{ .logfile = .{
-            .logfile_path = tmp_path,
-            .logfile_dir = std.fs.cwd(),
+            .logfile_path = "logfile",
+            .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
         } };
@@ -378,18 +444,19 @@ test "handle_query with query instruction does not persist to logfile" {
     }
     const allocator = gpa.allocator();
 
-    const tmp_path = "/tmp/ztick-test-scheduler-query-no-persist.log";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        file.close();
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = PersistenceBackend{ .logfile = .{
-        .logfile_path = tmp_path,
-        .logfile_dir = std.fs.cwd(),
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
     } };
@@ -401,7 +468,7 @@ test "handle_query with query instruction does not persist to logfile" {
         .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
     });
 
-    const size_after_set = try get_file_size(tmp_path);
+    const size_after_set = try get_file_size_in(tmp.dir, "logfile");
     try std.testing.expect(size_after_set > 0);
 
     const response = try scheduler.handle_query(Request{
@@ -411,7 +478,7 @@ test "handle_query with query instruction does not persist to logfile" {
     });
     defer if (response.body) |b| allocator.free(b);
 
-    try std.testing.expectEqual(size_after_set, try get_file_size(tmp_path));
+    try std.testing.expectEqual(size_after_set, try get_file_size_in(tmp.dir, "logfile"));
 }
 
 test "handle_query with get instruction does not persist to logfile" {
@@ -422,18 +489,19 @@ test "handle_query with get instruction does not persist to logfile" {
     }
     const allocator = gpa.allocator();
 
-    const tmp_path = "/tmp/ztick-test-scheduler-get-no-persist.log";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        file.close();
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = PersistenceBackend{ .logfile = .{
-        .logfile_path = tmp_path,
-        .logfile_dir = std.fs.cwd(),
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
     } };
@@ -445,7 +513,7 @@ test "handle_query with get instruction does not persist to logfile" {
         .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
     });
 
-    const size_after_set = try get_file_size(tmp_path);
+    const size_after_set = try get_file_size_in(tmp.dir, "logfile");
     try std.testing.expect(size_after_set > 0);
 
     const response = try scheduler.handle_query(Request{
@@ -455,7 +523,7 @@ test "handle_query with get instruction does not persist to logfile" {
     });
     defer if (response.body) |b| allocator.free(b);
 
-    try std.testing.expectEqual(size_after_set, try get_file_size(tmp_path));
+    try std.testing.expectEqual(size_after_set, try get_file_size_in(tmp.dir, "logfile"));
 }
 
 test "double load deinits previous arena without leak" {
@@ -466,20 +534,20 @@ test "double load deinits previous arena without leak" {
     }
     const allocator = gpa.allocator();
 
-    const tmp_path = "/tmp/ztick-test-scheduler-double-load.log";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        file.close();
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
     {
         var writer = Scheduler.init(allocator);
         defer writer.deinit();
         writer.persistence = PersistenceBackend{ .logfile = .{
-            .logfile_path = tmp_path,
-            .logfile_dir = std.fs.cwd(),
+            .logfile_path = "logfile",
+            .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
         } };
@@ -496,8 +564,8 @@ test "double load deinits previous arena without leak" {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
         scheduler.persistence = PersistenceBackend{ .logfile = .{
-            .logfile_path = tmp_path,
-            .logfile_dir = std.fs.cwd(),
+            .logfile_path = "logfile",
+            .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
         } };
@@ -519,18 +587,19 @@ test "handle_query with remove instruction persists to logfile" {
     }
     const allocator = gpa.allocator();
 
-    const tmp_path = "/tmp/ztick-test-scheduler-remove-persist.log";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        file.close();
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = PersistenceBackend{ .logfile = .{
-        .logfile_path = tmp_path,
-        .logfile_dir = std.fs.cwd(),
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
     } };
@@ -541,7 +610,7 @@ test "handle_query with remove instruction persists to logfile" {
         .identifier = "req-set",
         .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
     });
-    const size_after_set = try get_file_size(tmp_path);
+    const size_after_set = try get_file_size_in(tmp.dir, "logfile");
 
     _ = try scheduler.handle_query(Request{
         .client = 2,
@@ -549,7 +618,7 @@ test "handle_query with remove instruction persists to logfile" {
         .instruction = .{ .remove = .{ .identifier = "job.1" } },
     });
 
-    try std.testing.expect(try get_file_size(tmp_path) > size_after_set);
+    try std.testing.expect(try get_file_size_in(tmp.dir, "logfile") > size_after_set);
 }
 
 test "remove job round-trip through logfile" {
@@ -560,19 +629,20 @@ test "remove job round-trip through logfile" {
     }
     const allocator = gpa.allocator();
 
-    const tmp_path = "/tmp/ztick-test-scheduler-remove-roundtrip.log";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        file.close();
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
     {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
         scheduler.persistence = PersistenceBackend{ .logfile = .{
-            .logfile_path = tmp_path,
-            .logfile_dir = std.fs.cwd(),
+            .logfile_path = "logfile",
+            .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
         } };
@@ -594,8 +664,8 @@ test "remove job round-trip through logfile" {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
         scheduler.persistence = PersistenceBackend{ .logfile = .{
-            .logfile_path = tmp_path,
-            .logfile_dir = std.fs.cwd(),
+            .logfile_path = "logfile",
+            .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
         } };
@@ -613,19 +683,20 @@ test "remove_rule round-trip through logfile" {
     }
     const allocator = gpa.allocator();
 
-    const tmp_path = "/tmp/ztick-test-scheduler-removerule-roundtrip.log";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        file.close();
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
     {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
         scheduler.persistence = PersistenceBackend{ .logfile = .{
-            .logfile_path = tmp_path,
-            .logfile_dir = std.fs.cwd(),
+            .logfile_path = "logfile",
+            .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
         } };
@@ -651,8 +722,8 @@ test "remove_rule round-trip through logfile" {
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
         scheduler.persistence = PersistenceBackend{ .logfile = .{
-            .logfile_path = tmp_path,
-            .logfile_dir = std.fs.cwd(),
+            .logfile_path = "logfile",
+            .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
         } };
@@ -670,18 +741,19 @@ test "handle_query with list_rules instruction does not persist to logfile" {
     }
     const allocator = gpa.allocator();
 
-    const tmp_path = "/tmp/ztick-test-scheduler-listrules-no-persist.log";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     {
-        const file = try std.fs.cwd().createFile(tmp_path, .{});
-        file.close();
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
     }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = PersistenceBackend{ .logfile = .{
-        .logfile_path = tmp_path,
-        .logfile_dir = std.fs.cwd(),
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
     } };
@@ -697,7 +769,7 @@ test "handle_query with list_rules instruction does not persist to logfile" {
         } },
     });
 
-    const size_after_rule_set = try get_file_size(tmp_path);
+    const size_after_rule_set = try get_file_size_in(tmp.dir, "logfile");
     try std.testing.expect(size_after_rule_set > 0);
 
     const response = try scheduler.handle_query(Request{
@@ -707,7 +779,7 @@ test "handle_query with list_rules instruction does not persist to logfile" {
     });
     defer if (response.body) |b| allocator.free(b);
 
-    try std.testing.expectEqual(size_after_rule_set, try get_file_size(tmp_path));
+    try std.testing.expectEqual(size_after_rule_set, try get_file_size_in(tmp.dir, "logfile"));
 }
 
 test "tick marks job as failed after failed execution result" {
@@ -897,9 +969,278 @@ test "double load with memory backend works without leak" {
     try std.testing.expectEqual(@as(i64, 1000), job.?.execution);
 }
 
-fn get_file_size(path: []const u8) !u64 {
-    const file = try std.fs.cwd().openFile(path, .{});
+fn get_file_size_in(dir: std.fs.Dir, path: []const u8) !u64 {
+    const file = try dir.openFile(path, .{});
     defer file.close();
     const stat = try file.stat();
     return stat.size;
+}
+
+test "fresh scheduler disables compression by default" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try std.testing.expectEqual(@as(i64, 0), scheduler.compression_interval_ns);
+}
+
+test "fresh scheduler has no prior compression timestamp" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try std.testing.expectEqual(@as(i64, 0), scheduler.last_compression_ns);
+}
+
+test "fresh scheduler has no active compression process" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try std.testing.expectEqual(@as(?*Process, null), scheduler.active_process);
+}
+
+test "tick triggers compression after interval elapses for logfile backend" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
+    }
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    defer {
+        if (scheduler.active_process) |proc| {
+            proc.thread.join();
+            proc.deinit();
+            scheduler.active_process = null;
+        }
+    }
+    scheduler.persistence = PersistenceBackend{ .logfile = .{
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    scheduler.compression_interval_ns = 1000;
+
+    try scheduler.tick(1000);
+
+    try std.testing.expect(scheduler.active_process != null);
+    try std.testing.expectEqual(@as(i64, 1000), scheduler.last_compression_ns);
+}
+
+test "tick renames logfile to .to_compress before spawning compression" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
+    }
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    defer {
+        if (scheduler.active_process) |proc| {
+            proc.thread.join();
+            proc.deinit();
+            scheduler.active_process = null;
+        }
+    }
+    scheduler.persistence = PersistenceBackend{ .logfile = .{
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    scheduler.compression_interval_ns = 1000;
+
+    try scheduler.tick(1000);
+
+    _ = try tmp.dir.statFile("logfile.to_compress");
+}
+
+test "tick skips compression when backend is memory" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    scheduler.compression_interval_ns = 1000;
+
+    try scheduler.tick(1000);
+
+    try std.testing.expectEqual(@as(?*Process, null), scheduler.active_process);
+}
+
+test "tick skips compression when interval is zero" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
+    }
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = PersistenceBackend{ .logfile = .{
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    scheduler.compression_interval_ns = 0;
+
+    try scheduler.tick(1000);
+
+    try std.testing.expectEqual(@as(?*Process, null), scheduler.active_process);
+}
+
+test "tick cleans up completed compression process" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.compression_interval_ns = 1000;
+
+    const TaskResult = persistence.background.TaskResult;
+    const proc = try Process.execute(allocator, struct {
+        fn run() TaskResult {
+            return {};
+        }
+    }.run);
+    proc.thread.join();
+    scheduler.active_process = proc;
+
+    try scheduler.tick(999);
+
+    const was_cleaned_up = scheduler.active_process == null;
+
+    // Free whatever the stub left behind to prevent GPA leak
+    if (scheduler.active_process) |p| {
+        p.deinit();
+        scheduler.active_process = null;
+    }
+
+    try std.testing.expect(was_cleaned_up);
+}
+
+test "tick skips compression when process is already running" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
+    }
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = PersistenceBackend{ .logfile = .{
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    scheduler.compression_interval_ns = 1000;
+
+    const running_proc = try allocator.create(Process);
+    running_proc.* = .{ .allocator = allocator, .thread = undefined, .result = null, .mutex = .{} };
+    scheduler.active_process = running_proc;
+
+    try scheduler.tick(1000);
+
+    const still_same = scheduler.active_process == running_proc;
+
+    // Manual cleanup: thread is undefined (no real thread was spawned)
+    if (scheduler.active_process) |p| {
+        p.deinit();
+        scheduler.active_process = null;
+    }
+
+    try std.testing.expect(still_same);
+}
+
+test "deinit frees active compression process allocation without joining thread" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const status = gpa.deinit();
+        std.debug.assert(status == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+
+    const proc = try allocator.create(Process);
+    proc.* = .{ .allocator = allocator, .thread = undefined, .result = null, .mutex = .{} };
+    scheduler.active_process = proc;
+
+    scheduler.deinit();
+}
+
+test "tick logs warning and retains .to_compress when compression fails" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("logfile.to_compress", .{});
+        f.close();
+    }
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = PersistenceBackend{ .logfile = .{
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    scheduler.compression_interval_ns = 1_000_000_000;
+
+    const TaskResult = persistence.background.TaskResult;
+    const proc = try allocator.create(Process);
+    proc.* = .{ .allocator = allocator, .thread = undefined, .result = @as(TaskResult, error.Failure), .mutex = .{} };
+    scheduler.active_process = proc;
+
+    try scheduler.tick(500_000_000);
+
+    try std.testing.expectEqual(@as(?*Process, null), scheduler.active_process);
+    _ = try tmp.dir.statFile("logfile.to_compress");
 }

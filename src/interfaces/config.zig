@@ -32,6 +32,7 @@ pub const Config = struct {
     /// Zig extension: configurable logfile path (Rust reference used hardcoded "logfile").
     database_logfile_path: []const u8,
     database_persistence: PersistenceMode,
+    database_compression_interval: u32,
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.controller_listen);
@@ -54,6 +55,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
     var database_logfile_path: ?[]u8 = null;
     errdefer if (database_logfile_path) |lp| allocator.free(lp);
     var database_persistence: PersistenceMode = .logfile;
+    var database_compression_interval: u32 = 3600;
 
     var current_section: []const u8 = "";
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -115,6 +117,8 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
                 database_logfile_path = try allocator.dupe(u8, unquote(raw_val));
             } else if (std.mem.eql(u8, key, "persistence")) {
                 database_persistence = std.meta.stringToEnum(PersistenceMode, unquote(raw_val)) orelse return ConfigError.InvalidValue;
+            } else if (std.mem.eql(u8, key, "compression_interval")) {
+                database_compression_interval = std.fmt.parseInt(u32, raw_val, 10) catch return ConfigError.InvalidValue;
             } else {
                 return ConfigError.UnknownKey;
             }
@@ -134,6 +138,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
         .database_framerate = database_framerate,
         .database_logfile_path = database_logfile_path orelse try allocator.dupe(u8, "logfile"),
         .database_persistence = database_persistence,
+        .database_compression_interval = database_compression_interval,
     };
 }
 
@@ -295,6 +300,62 @@ test "parse rejects unrecognized persistence value" {
     const result = parse(std.testing.allocator,
         \\[database]
         \\persistence = "sqlite"
+        \\
+    );
+    try std.testing.expectError(ConfigError.InvalidValue, result);
+}
+
+test "parse defaults compression interval to 3600 when key absent" {
+    const cfg = try parse(std.testing.allocator, "");
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 3600), cfg.database_compression_interval);
+}
+
+test "parse sets compression interval from database section" {
+    const cfg = try parse(std.testing.allocator,
+        \\[database]
+        \\compression_interval = 120
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 120), cfg.database_compression_interval);
+}
+
+test "parse accepts compression interval of zero to disable compression" {
+    const cfg = try parse(std.testing.allocator,
+        \\[database]
+        \\compression_interval = 0
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), cfg.database_compression_interval);
+}
+
+test "parse rejects non-numeric compression interval" {
+    const result = parse(std.testing.allocator,
+        \\[database]
+        \\compression_interval = hourly
+        \\
+    );
+    try std.testing.expectError(ConfigError.InvalidValue, result);
+}
+
+test "parse rejects negative compression interval" {
+    const result = parse(std.testing.allocator,
+        \\[database]
+        \\compression_interval = -1
+        \\
+    );
+    try std.testing.expectError(ConfigError.InvalidValue, result);
+}
+
+test "parse rejects overflow compression interval" {
+    const result = parse(std.testing.allocator,
+        \\[database]
+        \\compression_interval = 4294967296
         \\
     );
     try std.testing.expectError(ConfigError.InvalidValue, result);

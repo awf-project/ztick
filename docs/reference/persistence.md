@@ -300,12 +300,80 @@ On startup, ztick reads the entire logfile:
 
 If a frame is incomplete (e.g., truncated write from a crash), the parser stops and returns the remaining unparsed bytes — it does not skip ahead. If a complete frame contains invalid data, decoding returns `InvalidData` and loading stops. This means corruption at any point truncates the log at that position; entries after the corruption are lost.
 
+## Background Compression
+
+ztick automatically compresses logfiles on a periodic interval to reduce disk usage on long-lived deployments. Compression runs in a background thread and deduplicates repeated mutations on the same job or rule IDs, keeping only the final state.
+
+### Compression Scheduling
+
+- **Interval**: Configured via `compression_interval` in the `[database]` section (default: 3600 seconds / 1 hour)
+- **Trigger**: Compression starts after the configured interval has elapsed since the last compression
+- **Skipping**: If a compression is already in progress, the next interval is skipped to prevent overlapping compressions
+- **Disabling**: Set `compression_interval = 0` to disable compression entirely
+
+### Compression Behavior
+
+**Logfile backend:**
+- Active logfile is atomically renamed to `.to_compress`
+- Fresh logfile is created for new writes (no gaps in append operations)
+- Background compression deduplicates the `.to_compress` file into `logfile.compressed`
+- On restart, ztick loads from either the compressed file or the active logfile (whichever is newer)
+
+**Memory backend:**
+- Compression scheduling is completely inactive — no threads spawned, no file operations
+- This ensures zero overhead for ephemeral deployments
+
+### Deduplication Rules
+
+During compression:
+- Only the **final state** of each job or rule ID is kept
+- If a job was SET, REMOVED, then SET again, the compressed file contains one entry with the final SET state
+- If a job's final state is REMOVED, it is excluded entirely from the compressed file
+- This reduces logfile size from O(n mutations) to O(n IDs)
+
+### Recovery
+
+If compression is interrupted (e.g., by shutdown):
+- The active logfile remains intact and accessible
+- Any partial `.to_compress` files are compressed at the next startup before the periodic timer begins
+- Data integrity is guaranteed by the append-only design
+
+### Example: 24-Hour Disk Usage
+
+With default compression:
+- 10,000 mutations on 100 job IDs per day
+- Without compression: ~300 KB per day → ~109 MB per year
+- With compression (1-hour interval): ~10 KB per day after deduplication → ~3.6 MB per year
+
+### Configuration
+
+**Default (once per hour):**
+```toml
+[database]
+persistence = "logfile"
+compression_interval = 3600
+```
+
+**Aggressive (for high-mutation workloads):**
+```toml
+[database]
+persistence = "logfile"
+compression_interval = 300  # 5 minutes
+```
+
+**Disabled:**
+```toml
+[database]
+persistence = "logfile"
+compression_interval = 0
+```
+
 ## Performance Characteristics
 
 - **Write latency**: ~1-10 us per entry (buffered)
 - **Read latency**: ~1-10 us per entry (sequential scan)
 - **Durability**: With fsync enabled, guaranteed to disk after each write
-- **Compression**: Background process can compress old logfiles
+- **Compression latency**: Background process does not block tick loop; compression latency depends on logfile size but is typically 10-100 ms
 
 ## Logfile Size
 
@@ -319,7 +387,12 @@ Typical entry sizes:
 | Rule (long pattern, long command) | 100-200 bytes |
 | Job/Rule Removal | 10-30 bytes |
 
-With 10,000 jobs and 100 rules, expect ~300 KB logfile.
+With 10,000 jobs and 100 rules, expect ~300 KB logfile without compression.
+
+**Compressed logfile sizes** depend on your workload:
+- Stable jobs (few mutations): ~10-20 KB (67-93% reduction)
+- Active jobs (many mutations): ~50-100 KB (50-80% reduction)
+- See [Background Compression](#background-compression) above for disk usage examples
 
 ## See Also
 

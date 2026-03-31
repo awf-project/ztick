@@ -3,6 +3,7 @@ zig-out/
 zig-cache/
 .zig-cache/
 logfile
+logfile.compressed
 ztick.log
 
 # IDE

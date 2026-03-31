@@ -59,10 +59,18 @@ Persistence and scheduling configuration.
 | `logfile_path` | string | `"logfile"` | Path to the append-only persistence logfile (ignored when `persistence = "memory"`) |
 | `fsync_on_persist` | bool | `true` | Call fsync after each persistence write (safer, slower; ignored when `persistence = "memory"`) |
 | `framerate` | integer | `512` | Scheduler tick rate in Hz (valid range: 1-65535) |
+| `compression_interval` | integer (seconds) | `3600` | Interval between background compression cycles in seconds; set to `0` to disable compression (logfile backend only; ignored for memory backend) |
 
 **Persistence Modes:**
 - `"logfile"` — (default) Store jobs and rules in an append-only binary logfile. Data persists across restarts. Use for production deployments where durability is critical.
 - `"memory"` — Store jobs and rules only in memory. No disk I/O occurs. Data is lost on shutdown. Useful for ephemeral deployments, CI environments, and testing where durability is not required.
+
+**Compression Interval**:
+- `0` — Disable automatic compression entirely
+- `3600` — Default, compress once per hour
+- `60` — Compress every minute (high-mutation workloads)
+
+Compression runs in a background thread and does not block the scheduler tick loop. When the persistence backend is `"memory"`, compression is completely inactive regardless of this setting. If a leftover `.to_compress` file exists at startup (from a previously interrupted compression), it is compressed before the periodic timer begins. If a compression cycle is still running when the next interval triggers, the cycle is skipped.
 
 **Framerate**:
 - `1` — Evaluate once per second (low CPU, long latency)
@@ -85,6 +93,7 @@ persistence = "logfile"
 logfile_path = "data/ztick.log"
 fsync_on_persist = false
 framerate = 100
+compression_interval = 1800
 ```
 
 ## Errors
@@ -92,7 +101,7 @@ framerate = 100
 | Error | Cause |
 |-------|-------|
 | `InvalidLogLevel` | `level` is not one of the valid values |
-| `FramerateOutOfRange` | `framerate` is 0 |
+| `FramerateOutOfRange` | `framerate` is 0 or exceeds 65535 |
 | `UnknownSection` | Section name is not `log`, `controller`, or `database` |
 | `UnknownKey` | Key is not recognized within its section |
 | `InvalidValue` | Value cannot be parsed (e.g. non-boolean for `fsync_on_persist`), or only one of `tls_cert`/`tls_key` is set, or `persistence` is not `"logfile"` or `"memory"` |
