@@ -1,0 +1,13 @@
+{
+  "monorepo": false,
+  "language": "unknown",
+  "domain": "cli",
+  "task_type": "feature",
+  "agents": "",
+  "skills": "",
+  "build_command": "make build",
+  "test_command": "make test",
+  "lint_command": "make lint",
+  "integration_tests_needed": true,
+  "integration_tests_reason": "TLS support is a new user-facing feature requiring multi-component coordination (Config→main→TcpServer), security-sensitive certificate/handshake handling, external system integration (OpenSSL), and backward-compatibility guarantees that demand end-to-end testing."
+}

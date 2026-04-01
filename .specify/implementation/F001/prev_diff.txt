@@ -1,0 +1,7 @@
+## Previous Component Changes
+ec3270f wip(F001): T006
+
+docs/reference/protocol.md        | 46 ++++++++++++++++++++++++++++++++++++---
+ src/functional_tests.zig          | 44 +++++++++++++++++++++++++++++++++++++
+ src/infrastructure/tcp_server.zig | 23 +++++++++++++++++---
+ 3 files changed, 107 insertions(+), 6 deletions(-)

@@ -1,0 +1,18 @@
+## Previous Component Changes
+4abbf35 feat(persistence): add in-memory persistence backend
+
+CLAUDE.md                                  |   2 +
+ README.md                                  |   8 +-
+ config-memory.toml                         |   9 +
+ docs/reference/configuration.md            |  12 +-
+ docs/reference/persistence.md              |   2 +-
+ docs/user-guide/configuration.md           |  64 ++-
+ logfile.compressed                         | Bin 0 -> 37 bytes
+ src/application/scheduler.zig              | 637 +++++++++++++++++++++++++----
+ src/functional_tests.zig                   | 336 +++++++++++++++
+ src/infrastructure/persistence.zig         |   1 +
+ src/infrastructure/persistence/backend.zig | 282 +++++++++++++
+ src/infrastructure/persistence/encoder.zig |   2 +-
+ src/interfaces/config.zig                  |  91 +++++
+ src/main.zig                               | 185 ++++++++-
+ 14 files changed, 1526 insertions(+), 105 deletions(-)

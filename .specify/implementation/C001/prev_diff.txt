@@ -1,0 +1,13 @@
+## Previous Component Changes
+0b4b218 wip(C001): T054
+
+.specify/implementation/C001/prev_diff.txt    |  6 +--
+ .specify/implementation/C001/tasks.md         | 22 ++++-----
+ build.zig                                     | 24 +++-------
+ src/application/execution_client.zig          | 44 +++++++++++++++++-
+ src/application/scheduler.zig                 | 64 ++++++++++++++++++++++++---
+ src/functional_tests.zig                      | 32 ++++++++------
+ src/infrastructure/persistence/background.zig |  4 +-
+ src/interfaces/cli.zig                        | 15 +++----
+ src/main.zig                                  | 24 ++++++----
+ 9 files changed, 162 insertions(+), 73 deletions(-)

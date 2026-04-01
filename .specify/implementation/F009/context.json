@@ -1,0 +1,13 @@
+{
+  "monorepo": false,
+  "language": "unknown",
+  "domain": "api",
+  "task_type": "feature",
+  "agents": "web:api-designer",
+  "skills": "",
+  "build_command": "make build",
+  "test_command": "make test",
+  "lint_command": "make lint",
+  "integration_tests_needed": true,
+  "integration_tests_reason": "F009 is a new user-facing feature involving multi-component coordination (scheduler tick loop, persistence backend, compression process, configuration system) with multiple acceptance scenarios and edge cases requiring end-to-end testing."
+}

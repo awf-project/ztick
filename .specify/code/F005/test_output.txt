@@ -1,0 +1,3 @@
+=== Testing item: T008 (iteration 1) ===
+=== Test command: make test ===
+zig build test --summary all

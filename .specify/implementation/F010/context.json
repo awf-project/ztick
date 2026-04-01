@@ -1,0 +1,13 @@
+{
+  "monorepo": false,
+  "language": "unknown",
+  "domain": "cli",
+  "task_type": "feature",
+  "agents": "",
+  "skills": "",
+  "build_command": "make build",
+  "test_command": "make test",
+  "lint_command": "make lint",
+  "integration_tests_needed": true,
+  "integration_tests_reason": "New user-facing feature requiring external system integration, multi-component coordination across threads, and end-to-end HTTP export validation against mock OTLP collector."
+}

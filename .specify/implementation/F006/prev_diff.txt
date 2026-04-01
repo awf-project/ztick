@@ -1,0 +1,24 @@
+## Previous Component Changes
+29f7073 feat(logging): add F005 startup logging with configurable levels
+
+.github/workflows/ci.yaml               |   6 +-
+ .gitignore                              |   2 +
+ Makefile                                |   5 +-
+ README.md                               |  10 +-
+ build.zig                               |  26 ++
+ config.toml                             |  10 +
+ docs/ADR/0003-openssl-tls-dependency.md |  64 +++++
+ docs/reference/configuration.md         |  18 +-
+ docs/tutorials/getting-started.md       |  22 +-
+ src/application/execution_client.zig    |  35 +++
+ src/application/scheduler.zig           |  79 ++++++
+ src/functional_tests.zig                | 452 ++++++++++++++++++++++++++++++++
+ src/infrastructure.zig                  |   1 +
+ src/infrastructure/channel.zig          |  13 +
+ src/infrastructure/tcp_server.zig       | 400 ++++++++++++++++++++++++++--
+ src/infrastructure/tls_context.zig      | 118 +++++++++
+ src/interfaces/config.zig               |  59 +++++
+ src/main.zig                            | 209 ++++++++++++++-
+ test/fixtures/tls/cert.pem              |  19 ++
+ test/fixtures/tls/key.pem               |  28 ++
+ 20 files changed, 1529 insertions(+), 47 deletions(-)

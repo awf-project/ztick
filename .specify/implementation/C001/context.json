@@ -1,0 +1,13 @@
+{
+  "monorepo": false,
+  "language": "unknown",
+  "domain": "data",
+  "task_type": "chore",
+  "agents": "web:postgres-pro",
+  "skills": "",
+  "build_command": "",
+  "test_command": "",
+  "lint_command": "",
+  "integration_tests_needed": true,
+  "integration_tests_reason": "Full system rewrite requires integration tests to validate feature parity between Rust and Zig implementations and verify no regressions across the entire system."
+}

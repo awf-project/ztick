@@ -1,0 +1,20 @@
+## Previous Component Changes
+1e4333e feat(protocol): add REMOVE and REMOVERULE commands
+
+CLAUDE.md                                     |   2 +
+ README.md                                     |   3 +-
+ docs/reference/README.md                      |  16 +-
+ docs/reference/persistence.md                 |  35 +++-
+ docs/reference/protocol.md                    | 133 +++++++++++-
+ docs/user-guide/README.md                     |  32 ++-
+ docs/user-guide/creating-jobs.md              |  21 +-
+ docs/user-guide/writing-rules.md              |  21 +-
+ src/application/job_storage.zig               |  58 ++++++
+ src/application/query_handler.zig             | 209 +++++++++++++++++++
+ src/application/scheduler.zig                 | 169 ++++++++++++++-
+ src/domain/instruction.zig                    |  24 +++
+ src/functional_tests.zig                      | 288 +++++++++++++++++++++++---
+ src/infrastructure/persistence/background.zig |  90 ++++++++
+ src/infrastructure/persistence/encoder.zig    |  65 +++++-
+ src/infrastructure/tcp_server.zig             | 208 ++++++++++++++++++-
+ 16 files changed, 1294 insertions(+), 80 deletions(-)

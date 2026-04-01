@@ -28,6 +28,11 @@ Task-oriented how-to guides for common ztick operations.
   - Compact mode for effective state
   - Live tail with `--follow`
 
+- **[Monitoring Health](monitoring-health.md)** — Check server status and execution pipeline
+  - Server health metrics with `STAT`
+  - Understanding metric categories
+  - Scripting health checks
+
 ## Quick Reference
 
 ### Create a Job
@@ -70,6 +75,12 @@ echo 'req-1 REMOVERULE my.rule' | socat - TCP:localhost:5678
 
 ```bash
 echo 'req-1 LISTRULES' | socat - TCP:localhost:5678
+```
+
+### Check Server Health
+
+```bash
+echo 'req-1 STAT' | socat - TCP:localhost:5678
 ```
 
 ### Inspect Logfile

@@ -86,6 +86,7 @@ pub const QueryHandler = struct {
                 const body = try body_buf.toOwnedSlice(self.allocator);
                 return Response{ .request = request, .success = true, .body = body };
             },
+            .stat => unreachable,
         };
 
         return Response{ .request = request, .success = success };

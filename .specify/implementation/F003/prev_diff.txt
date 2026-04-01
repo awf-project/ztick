@@ -1,0 +1,11 @@
+## Previous Component Changes
+6a3dec5 wip(F003): T003
+
+docs/reference/protocol.md                    |  66 +++++++++-
+ src/application/query_handler.zig             |  98 ++++++++++++++-
+ src/application/scheduler.zig                 | 127 +++++++++++++++++++-
+ src/functional_tests.zig                      | 166 ++++++++++++++++++++++++++
+ src/infrastructure/persistence/background.zig |  86 +++++++++++++
+ src/infrastructure/persistence/encoder.zig    |  60 ++++++++++
+ src/infrastructure/tcp_server.zig             |  76 +++++++++++-
+ 7 files changed, 669 insertions(+), 10 deletions(-)

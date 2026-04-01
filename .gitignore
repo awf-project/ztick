@@ -22,4 +22,4 @@ ztick.log
 test_debug_log.db
 
 .grepai/
-.specify/
+.specify/test_timing

@@ -46,7 +46,7 @@ Every command follows this structure:
 ```
 
 - `request_id` — A client-chosen identifier echoed back in the response (e.g., `req-1`, `cmd-42`)
-- `instruction` — The operation to perform (`SET`, `GET`, `QUERY`, `LISTRULES`, `REMOVE`, `REMOVERULE`, or `RULE SET`)
+- `instruction` — The operation to perform (`SET`, `GET`, `QUERY`, `LISTRULES`, `STAT`, `REMOVE`, `REMOVERULE`, or `RULE SET`)
 - `args` — Instruction-specific arguments
 
 ## Response Format
@@ -63,7 +63,7 @@ Every command follows this structure:
 
 The `request_id` matches the one sent in the command, allowing clients to correlate responses.
 
-Write commands (`SET`, `RULE SET`) and delete commands (`REMOVE`, `REMOVERULE`) return a status-only response. Read commands (`GET`) return a response with additional data in the body after the status. List commands (`QUERY`, `LISTRULES`) return multiple lines followed by a terminal `OK` line.
+Write commands (`SET`, `RULE SET`) and delete commands (`REMOVE`, `REMOVERULE`) return a status-only response. Read commands (`GET`) return a response with additional data in the body after the status. List commands (`QUERY`, `LISTRULES`, `STAT`) return multiple lines followed by a terminal `OK` line.
 
 ## Error Handling
 
@@ -74,7 +74,7 @@ Write commands (`SET`, `RULE SET`) and delete commands (`REMOVE`, `REMOVERULE`) 
 | Unrecognized command | Silently ignored, no response sent (see below) |
 | Out of memory | Connection closed |
 
-**Important**: Only `SET`, `GET`, `QUERY`, `LISTRULES`, `REMOVE`, `REMOVERULE`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
+**Important**: Only `SET`, `GET`, `QUERY`, `LISTRULES`, `STAT`, `REMOVE`, `REMOVERULE`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
 
 ## Commands
 
@@ -222,6 +222,68 @@ echo 'req-3 LISTRULES foo' | socat - TCP:localhost:5678
 
 **Notes**: LISTRULES is a read-only command — it does not generate any persistence log entry. Results are returned in unspecified order (hashmap iteration order).
 
+### STAT
+
+Return server health metrics as key-value pairs.
+
+**Syntax**:
+```
+<request_id> STAT
+```
+
+**Parameters**: None. Extra trailing arguments are silently ignored.
+
+**Response**:
+- One line per metric: `<request_id> <key> <value>\n`
+- Terminal line: `<request_id> OK\n`
+
+| Metric | Description |
+|--------|-------------|
+| `uptime_ns` | Server uptime in nanoseconds since startup |
+| `connections` | Number of active TCP connections |
+| `jobs_total` | Total number of jobs in storage |
+| `jobs_planned` | Count of jobs with status `planned` |
+| `jobs_triggered` | Count of jobs with status `triggered` |
+| `jobs_executed` | Count of jobs with status `executed` |
+| `jobs_failed` | Count of jobs with status `failed` |
+| `rules_total` | Total number of rules in storage |
+| `executions_pending` | Number of jobs queued for execution |
+| `executions_inflight` | Number of jobs currently being executed |
+| `persistence` | Backend type: `logfile` or `memory` |
+| `compression` | Compression process status: `idle`, `running`, `success`, or `failure` |
+| `auth_enabled` | `1` if authentication is configured, `0` otherwise |
+| `tls_enabled` | `1` if TLS is configured, `0` otherwise |
+| `framerate` | Configured scheduler tick rate |
+
+**Examples**:
+```bash
+# Get server health metrics
+echo 'req-1 STAT' | socat - TCP:localhost:5678
+# Response:
+# req-1 uptime_ns 60000000000
+# req-1 connections 1
+# req-1 jobs_total 42
+# req-1 jobs_planned 30
+# req-1 jobs_triggered 2
+# req-1 jobs_executed 8
+# req-1 jobs_failed 2
+# req-1 rules_total 5
+# req-1 executions_pending 0
+# req-1 executions_inflight 0
+# req-1 persistence logfile
+# req-1 compression idle
+# req-1 auth_enabled 0
+# req-1 tls_enabled 0
+# req-1 framerate 512
+# req-1 OK
+
+# Extra arguments are ignored
+echo 'req-2 STAT verbose' | socat - TCP:localhost:5678
+# Response: same as STAT without arguments
+```
+
+**Notes**: STAT is a read-only command — it does not generate any persistence log entry. STAT is namespace-independent: any authenticated client can call it regardless of namespace. When authentication is enabled, STAT requires authentication like any other command.
+
 ### REMOVE
 
 Delete a scheduled job.
@@ -363,13 +425,22 @@ echo 'r6 LISTRULES' | socat - TCP:localhost:5678
 # r6 rule.backup backup. shell /usr/bin/backup.sh
 # r6 OK
 
-# Remove the weekly backup job
-echo 'r7 REMOVE backup.weekly' | socat - TCP:localhost:5678
+# Check server health
+echo 'r7 STAT' | socat - TCP:localhost:5678
+# r7 uptime_ns 120000000000
+# r7 connections 1
+# r7 jobs_total 1
+# r7 jobs_planned 1
+# ... (15 metrics total)
 # r7 OK
 
-# Remove the backup rule
-echo 'r8 REMOVERULE rule.backup' | socat - TCP:localhost:5678
+# Remove the weekly backup job
+echo 'r8 REMOVE backup.weekly' | socat - TCP:localhost:5678
 # r8 OK
+
+# Remove the backup rule
+echo 'r9 REMOVERULE rule.backup' | socat - TCP:localhost:5678
+# r9 OK
 ```
 
 ### Batch Operations
@@ -418,6 +489,14 @@ sock.send(b'r4 LISTRULES\n')
 print(sock.recv(4096).decode())
 # r4 rule.app app. shell /bin/echo hello
 # r4 OK
+
+# Check server health
+sock.send(b'r5 STAT\n')
+print(sock.recv(4096).decode())
+# r5 uptime_ns 5000000000
+# r5 connections 1
+# ... (15 metrics total)
+# r5 OK
 
 sock.close()
 ```

@@ -1,0 +1,11 @@
+## Previous Component Changes
+c47c13e wip(F005): T007
+
+docs/reference/configuration.md      |  18 +--
+ docs/tutorials/getting-started.md    |  22 ++-
+ src/application/execution_client.zig |  37 ++++-
+ src/application/scheduler.zig        |  79 +++++++++++
+ src/functional_tests.zig             | 166 ++++++++++++++++++++++
+ src/infrastructure/tcp_server.zig    | 265 ++++++++++++++++++++++++++++++++++-
+ src/main.zig                         | 152 +++++++++++++++++++-
+ 7 files changed, 718 insertions(+), 21 deletions(-)

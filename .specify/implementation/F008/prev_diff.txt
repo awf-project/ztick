@@ -1,0 +1,20 @@
+## Previous Component Changes
+e7ab883 feat(dump): add logfile dump command for offline inspection
+
+CLAUDE.md                                  |   4 +
+ README.md                                  |  18 +
+ docs/README.md                             |   1 +
+ docs/reference/README.md                   |   9 +
+ docs/user-guide/README.md                  |  15 +
+ docs/user-guide/inspecting-logfiles.md     | 197 ++++++++
+ src/application/scheduler.zig              | 319 +++++++++----
+ src/functional_tests.zig                   | 741 +++++++++++++++++++++++++++++
+ src/infrastructure/persistence.zig         |   1 +
+ src/infrastructure/persistence/backend.zig | 268 +++++++++++
+ src/infrastructure/persistence/encoder.zig |   2 +-
+ src/interfaces.zig                         |   1 +
+ src/interfaces/cli.zig                     | 167 +++++--
+ src/interfaces/config.zig                  |  48 ++
+ src/interfaces/dump.zig                    | 374 +++++++++++++++
+ src/main.zig                               | 176 ++++++-
+ 16 files changed, 2209 insertions(+), 132 deletions(-)

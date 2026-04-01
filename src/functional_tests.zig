@@ -2527,3 +2527,305 @@ test "scheduler operates normally when telemetry collector is unreachable" {
     try std.testing.expect(job != null);
     try std.testing.expectEqual(JobStatus.triggered, job.?.status);
 }
+
+// Feature: F012
+
+test "stat command returns all 15 metric keys in response body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var connections = std.atomic.Value(usize).init(1);
+    scheduler.setStatContext(std.time.nanoTimestamp() - 1_000_000_000, &connections, false, false, 100);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-stat",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    const body = response.body.?;
+    try std.testing.expect(std.mem.indexOf(u8, body, "uptime_ns ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "connections ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_total ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_planned ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_triggered ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_executed ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_failed ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "rules_total ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "executions_pending ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "executions_inflight ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "persistence ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "compression ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "auth_enabled ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tls_enabled ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "framerate ") != null);
+}
+
+test "stat command reports correct job counts after storage mutations" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var connections = std.atomic.Value(usize).init(0);
+    scheduler.setStatContext(0, &connections, false, false, 1);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set-1",
+        .instruction = .{ .set = .{ .identifier = "job.planned.1", .execution = 9_000_000_000_000_000_000 } },
+    });
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set-2",
+        .instruction = .{ .set = .{ .identifier = "job.planned.2", .execution = 9_000_000_000_000_000_001 } },
+    });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-stat-counts",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    const body = response.body.?;
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_total 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_planned 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_executed 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_failed 0\n") != null);
+}
+
+test "stat command does not append entries to logfile" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("stat_nopersist.db", .{});
+        f.close();
+    }
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = @import("infrastructure/persistence/backend.zig").PersistenceBackend{ .logfile = .{
+        .logfile_path = "stat_nopersist.db",
+        .logfile_dir = tmp.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    try scheduler.load(allocator);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set",
+        .instruction = .{ .set = .{ .identifier = "baseline.job", .execution = 1595586600_000000000 } },
+    });
+
+    const stat_before = try tmp.dir.statFile("stat_nopersist.db");
+
+    var connections = std.atomic.Value(usize).init(0);
+    scheduler.setStatContext(0, &connections, false, false, 1);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-stat-nopersist",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    const stat_after = try tmp.dir.statFile("stat_nopersist.db");
+    try std.testing.expectEqual(stat_before.size, stat_after.size);
+}
+
+test "stat command reports auth_enabled 1 when authentication is configured" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var connections = std.atomic.Value(usize).init(0);
+    scheduler.setStatContext(0, &connections, true, false, 1);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-stat-auth",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "auth_enabled 1\n") != null);
+}
+
+test "stat command succeeds and reports auth_enabled 0 when auth is not configured" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var connections = std.atomic.Value(usize).init(0);
+    scheduler.setStatContext(0, &connections, false, false, 1);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-stat-noauth",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "auth_enabled 0\n") != null);
+}
+
+test "stat command over TCP returns multi-line response with all keys ending with OK" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19886\"\n\n[database]\npersistence = \"memory\"\n");
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19886) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    _ = stream.write("req-1 STAT\n") catch return error.SkipZigTest;
+
+    std.Thread.sleep(300_000_000);
+
+    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = stream.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const response = buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 uptime_ns ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 connections ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 jobs_total ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 jobs_planned ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 jobs_triggered ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 jobs_executed ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 jobs_failed ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 rules_total ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 executions_pending ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 executions_inflight ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 persistence ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 compression ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 auth_enabled ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 tls_enabled ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 framerate ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 OK\n") != null);
+}
+
+test "stat command over TCP rejects unauthenticated client when auth is enabled" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tokens_file = try tmp_dir.dir.createFile("tokens.txt", .{});
+    try tokens_file.writeAll("secret-token\n");
+    tokens_file.close();
+
+    const tokens_path = try tmp_dir.dir.realpathAlloc(allocator, "tokens.txt");
+    defer allocator.free(tokens_path);
+
+    const config = try std.fmt.allocPrint(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19888\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n", .{tokens_path});
+    defer allocator.free(config);
+
+    var server = try TestServer.start(allocator, config);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19888) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    _ = stream.write("req-unauth STAT\n") catch return error.SkipZigTest;
+
+    std.Thread.sleep(300_000_000);
+
+    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = stream.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const response = buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-unauth ERROR\n") != null);
+}
+
+test "stat command over TCP reports connections reflecting active connection count" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19887\"\n\n[database]\npersistence = \"memory\"\n");
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19887) catch unreachable;
+
+    var conn1 = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer conn1.close();
+    var conn2 = std.net.tcpConnectToAddress(addr) catch {
+        conn1.close();
+        return error.SkipZigTest;
+    };
+    defer conn2.close();
+    var conn3 = std.net.tcpConnectToAddress(addr) catch {
+        conn1.close();
+        conn2.close();
+        return error.SkipZigTest;
+    };
+    defer conn3.close();
+
+    std.Thread.sleep(200_000_000);
+
+    _ = conn1.write("req-stat-conn STAT\n") catch return error.SkipZigTest;
+
+    std.Thread.sleep(300_000_000);
+
+    const flags = std.posix.fcntl(conn1.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(conn1.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = conn1.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const response = buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-conn connections 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-conn OK\n") != null);
+}

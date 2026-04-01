@@ -1,0 +1,10 @@
+## Previous Component Changes
+ae7bb13 wip(F002): T002
+
+src/application/job_storage.zig            |  66 +++++++++++++++++
+ src/application/query_handler.zig          | 106 ++++++++++++++++++++++++++-
+ src/application/scheduler.zig              | 105 +++++++++++++++++++++++++--
+ src/functional_tests.zig                   | 111 +++++++++++++++++++++++++++++
+ src/infrastructure/persistence/encoder.zig |   2 +-
+ src/infrastructure/tcp_server.zig          | 104 ++++++++++++++++++++++++---
+ 6 files changed, 479 insertions(+), 15 deletions(-)

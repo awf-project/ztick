@@ -1,0 +1,13 @@
+{
+  "monorepo": false,
+  "language": "unknown",
+  "domain": "cli",
+  "task_type": "feature",
+  "agents": "",
+  "skills": "",
+  "build_command": "make build",
+  "test_command": "make test",
+  "lint_command": "make lint",
+  "integration_tests_needed": true,
+  "integration_tests_reason": "New protocol command coordinating multiple scheduler subsystems with security-sensitive auth enforcement."
+}

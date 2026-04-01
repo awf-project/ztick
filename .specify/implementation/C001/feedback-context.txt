@@ -1,0 +1,68 @@
+Issue: C001
+
+## Project Context
+Language: unknown, Domain: data
+
+## Components Implemented
+- T001 (code): Create project structure: `build.zig`, `build.zig.zon`, directory tree (`src/domain/`, `src/application/`, `src/infrastr
+- T002 (code): Implement Job entity and JobStatus enum in `src/domain/job.zig` with co-located tests (set/get, get_to_execute time filt
+- T003 (code): Implement Rule type in `src/domain/rule.zig` with co-located tests (supports() pattern matching with weight, non-matchin
+- T004 (code): Implement Runner tagged union in `src/domain/runner.zig`, Instruction enum in `src/domain/instruction.zig`, Query reques
+- T005 (code): Implement binary encoder/decoder in `src/infrastructure/persistence/encoder.zig` with co-located tests (encode/decode ro
+- T006 (code): Implement logfile entry parser in `src/infrastructure/persistence/logfile.zig` with co-located tests (4-byte length-pref
+- T007 (code): Implement KCP protocol streaming parser in `src/infrastructure/protocol/parser.zig` with co-located tests (simple/quoted
+- T008 (code): Implement JobStorage (HashMap + sorted Vec) in `src/application/job_storage.zig` with co-located tests (CRUD, status fil
+- T009 (code): Implement RuleStorage in `src/application/rule_storage.zig` with co-located tests (CRUD, pattern-based pairing with prio
+- T010 (code): Implement QueryHandler in `src/application/query_handler.zig` with co-located tests (process Instructions into Query res
+- T011 (code): Implement ExecutionClient (UUID-based tracking) in `src/application/execution_client.zig`
+- T012 (code): Implement Scheduler (Database tick loop service) in `src/application/scheduler.zig` + barrel `src/application.zig`
+- T013 (code): Implement Channel (bounded, Mutex+Condition) in `src/infrastructure/channel.zig` and framerate Clock in `src/infrastruct
+- T014 (code): Implement Shell runner (subprocess execution) in `src/infrastructure/shell_runner.zig` and TCP server (Controller adapte
+- T015 (code): Implement background compression in `src/infrastructure/persistence/background.zig` + barrel `src/infrastructure.zig`
+- T016 (code): Implement minimal TOML config parser in `src/interfaces/config.zig` with co-located tests (3 sections: log.level, contro
+- T017 (code): Implement CLI entry point in `src/interfaces/cli.zig` (-c/--config arg parsing) + barrel `src/interfaces.zig`
+- T018 (code): Wire main.zig: spawn Controller, Database, Processor threads with Channel-based message routing in `src/main.zig`
+- T019 (edit): Finalize `build.zig` with all module paths, test steps per layer (`zig build test` runs all co-located tests), and Relea
+- T020 (edit): Fix Clock.start: implement framerate loop with sleep, call callback repeatedly instead of once
+- T021 (edit): Fix TcpServer.start: implement accept loop, parse KCP frames, route requests/responses via channels. Remove premature de
+- T022 (edit): Fix runDatabase in main.zig: implement tick loop using Clock, drain exec_response_ch, poll request_ch, send responses to
+- T023 (edit): Fix ExecutionClient.pull_results: read actual execution responses, match by identifier, report real success/failure
+- T024 (edit): Fix background.zig: add deinit method, accept allocator parameter in execute, remove unused Status.lost variant
+- T025 (edit): Fix parser.zig: return ParseResult with empty args slice for zero-argument KCP commands
+- T026 (edit): Fix config.zig: add errdefer to free controller_listen allocation on subsequent parse error
+- T027 (edit): Cleanup: remove dead Storage struct from domain/job.zig, rename parseArgs to parse_args in cli.zig, remove redundant tes
+- T028 (edit): Implement TcpServer.start accept loop: accept connections, parse KCP frames via protocol/parser.zig, route query.Request
+- T029 (edit): Fix main.zig daemon lifecycle: join all 3 thread handles, block main() until threads exit, ensure defer deinit on channe
+- T030 (edit): Fix tick loop: move triggered-drain so pull_results can match responses. Add Channel(T).tryReceive() method, remove abst
+- T031 (edit): Fix background.zig compress() safety: accept dir path param, use Dir handle instead of cwd(), atomic rename pattern, nam
+- T032 (edit): Wire persistence into Scheduler: import persistence modules, add load(path) for startup logfile restore, add logfile app
+- T033 (edit): Add 3 co-located test blocks to domain/job.zig: field access, JobStatus enum values, status byte mapping (port from Rust
+- T034 (edit): Merge Encodable and Decoded into single Entry type in encoder.zig, update encode/decode signatures and all callers
+- T035 (edit): Normalize all private function names to snake_case: parser.zig (parseToken, parseSimpleString, parseQuotedString), encod
+- T036 (edit): Remove unnecessary comments from functional_tests.zig: file header block and section divider comments
+- T037 (edit): Fix config.zig errdefer: free controller_listen allocation on subsequent parse error to prevent memory leak
+- T038 (edit): Wire persistence into Scheduler: add load(allocator, path) method to read logfile and restore state into JobStorage/Rule
+- T039 (edit): Add direct unit tests for Channel(T).try_receive() in channel.zig: returns null on empty, returns value after send, non-
+- T040 (edit): Fix TcpServer.start: implement real accept loop — accept connections, parse KCP via protocol/parser.zig, route query.Req
+- T041 (edit): Call scheduler.load() from run_database() in main.zig: restore persisted state on startup. Pass logfile_path from config
+- T042 (edit): Fix iterator invalidation in Scheduler.tick(): copy borrowed slice from get_to_execute() into owned allocation before mu
+- T043 (edit): Fix append_to_logfile() file creation: replace openFile(.write_only) with openFile + fallback createFile so first write 
+- T044 (edit): Fix handle_query error propagation in main.zig: capture error result, send Response with actual success/failure instead 
+- T045 (edit): Fix Channel.send() deadlock on close: add self.closed check in while loop condition, return error/sentinel when closed t
+- T046 (edit): Fix daemon shutdown hang: close exec_request_ch before processor_thread.join(), replace manual sequential deinit with de
+- T047 (edit): Fix background.zig: add allocator param to Process.execute() instead of hardcoded page_allocator, add deinit method, pas
+- T048 (edit): Fix parser.zig: return ParseResult with empty args for zero-argument KCP commands instead of ParseError.Invalid. Add co-
+- T049 (edit): Fix scheduler.zig: accept std.fs.Dir param in load() and append_to_logfile() instead of std.fs.cwd(). Update call sites 
+- T050 (edit): Wire database_fsync_on_persist into logfile flush path in append_to_logfile, or remove from Config and parser if unused
+- T051 (edit): Rename Args.parse_args to Args.parse_slice in cli.zig for naming consistency. Update 5 test call sites
+- T052 (edit): Remove unnecessary errdefer guards in decode_inner in encoder.zig that guard allocations immediately followed by return 
+- T053 (edit): Fix TcpServer.start: implement real accept loop — accept connections, parse KCP via protocol/parser.zig, route query.Req
+- T054 (edit): Fix daemon shutdown: set running to false after controller_thread.join(), close query_request_ch, ensure exec_request_ch
+- T055 (edit): Fix drain_pending double execution: track sent items and clear only sent prefix on ChannelClosed. Add isolated unit test
+- T056 (edit): Fix Scheduler.load() arena leak: deinit existing load_arena before overwriting. Add test for double load()
+- T057 (edit): Fix handle_query discarded Response: propagate Response to caller or change QueryHandler.handle() to return void
+- T058 (edit): Abstract persistence behind application-level port so scheduler no longer imports infrastructure/persistence directly. R
+- T059 (edit): Fix std.fs.cwd() in run_database: open Dir in main() before spawning threads, pass through DatabaseContext
+- T060 (edit): Document logfile_dir ownership contract in scheduler.zig or eliminate dangling handle risk
+- T061 (edit): Remove unused
+[... truncated at 8KB]

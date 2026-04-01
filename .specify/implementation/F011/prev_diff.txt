@@ -1,0 +1,8 @@
+## Previous Component Changes
+a45fe7f wip(F011): T006
+
+logfile.to_compress               | Bin 0 -> 31 bytes
+ src/functional_tests.zig          | 366 ++++++++++++++++++++++++++++++
+ src/infrastructure/tcp_server.zig | 462 +++++++++++++++++++++++++++++++++++++-
+ src/main.zig                      |  52 ++++-
+ 4 files changed, 873 insertions(+), 7 deletions(-)

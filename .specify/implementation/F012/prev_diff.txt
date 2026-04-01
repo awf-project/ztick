@@ -1,0 +1,31 @@
+## Previous Component Changes
+3e48ba2 chore(dev): add project infrastructure and memory safety tooling
+
+.editorconfig                          |  18 ++
+ .github/CODE_OF_CONDUCT.md             |  53 +++++
+ .github/FUNDING.yml                    |   1 +
+ .github/SECURITY.md                    |  77 +++++++
+ .github/workflows/ci.yaml              |  24 ++-
+ .zls.json                              |   7 +
+ CHANGELOG.md                           |  58 ++++++
+ CONTRIBUTING.md                        | 151 ++++++++++++++
+ LICENSE                                | 287 ++++++++++++++++++++++++++
+ Makefile                               |  17 +-
+ README.md                              |  65 +++---
+ build.zig                              |  41 ++++
+ docs/development/building.md           |   2 +-
+ docs/reference/protocol.md             | 108 +++++++++-
+ docs/tutorials/getting-started.md      |   4 +-
+ docs/user-guide/README.md              |  26 +--
+ docs/user-guide/inspecting-logfiles.md |   2 +-
+ renovate.json                          |   6 +
+ src/application/query_handler.zig      |   1 +
+ src/application/scheduler.zig          | 359 ++++++++++++++++++++++++++++++++-
+ src/domain.zig                         |   1 +
+ src/domain/instruction.zig             |  12 ++
+ src/domain/server_stats.zig            | 141 +++++++++++++
+ src/functional_tests.zig               | 302 +++++++++++++++++++++++++++
+ src/infrastructure/tcp_server.zig      | 301 ++++++++++++++++++++++++---
+ src/main.zig                           | 147 +++++++++++++-
+ test_timing                            | Bin 0 -> 4188725 bytes
+ 27 files changed, 2112 insertions(+), 99 deletions(-)

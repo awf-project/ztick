@@ -1,0 +1,31 @@
+## Previous Component Changes
+c2955e6 feat(tls): add optional TLS encryption to TCP protocol server
+
+.github/workflows/ci.yaml               |   13 +
+ .gitignore                              |    1 +
+ README.md                               |   34 +
+ build.zig                               |   16 +
+ config-tls.toml                         |   12 +
+ docs/ADR/0003-openssl-tls-dependency.md |   64 ++
+ docs/ADR/README.md                      |    1 +
+ docs/README.md                          |    2 +-
+ docs/development/building.md            |    1 +
+ docs/reference/README.md                |    2 +
+ docs/reference/configuration.md         |   16 +-
+ docs/reference/protocol.md              |   15 +-
+ docs/tutorials/getting-started.md       |    5 +-
+ docs/user-guide/README.md               |    2 +-
+ docs/user-guide/configuration.md        |   57 +-
+ src/functional_tests.zig                | 1071 +++++++++++++++++++++++++++++++
+ src/infrastructure.zig                  |    1 +
+ src/infrastructure/protocol/parser.zig  |    1 -
+ src/infrastructure/tcp_server.zig       |  157 ++++-
+ src/infrastructure/tls_context.zig      |  115 ++++
+ src/interfaces.zig                      |    1 +
+ src/interfaces/cli.zig                  |  167 ++++-
+ src/interfaces/config.zig               |   59 ++
+ src/interfaces/dump.zig                 |  359 +++++++++++
+ src/main.zig                            |   96 ++-
+ test/fixtures/tls/.gitignore            |    1 +
+ test/fixtures/tls/README.md             |   28 +
+ 27 files changed, 2220 insertions(+), 77 deletions(-)

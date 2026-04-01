@@ -93,6 +93,7 @@ pub fn build(b: *std.Build) void {
     });
     if (tls_enabled) link_openssl(functional_test);
     const run_functional = b.addRunArtifact(functional_test);
+    run_functional.step.dependOn(b.getInstallStep());
     const functional_step = b.step("test-functional", "Run functional tests");
     functional_step.dependOn(&run_functional.step);
 
@@ -149,5 +150,7 @@ pub fn build(b: *std.Build) void {
     san_func_module.addImport("opentelemetry", otel_module);
     const san_func_test = b.addTest(.{ .root_module = san_func_module });
     if (tls_enabled) link_openssl(san_func_test);
-    sanitize_step.dependOn(&b.addRunArtifact(san_func_test).step);
+    const run_san_func = b.addRunArtifact(san_func_test);
+    run_san_func.step.dependOn(b.getInstallStep());
+    sanitize_step.dependOn(&run_san_func.step);
 }

@@ -1,0 +1,13 @@
+{
+  "monorepo": false,
+  "language": "unknown",
+  "domain": "cli",
+  "task_type": "feature",
+  "agents": "",
+  "skills": "",
+  "build_command": "make build",
+  "test_command": "make test",
+  "lint_command": "make lint",
+  "integration_tests_needed": true,
+  "integration_tests_reason": "New user-facing CLI feature with multiple output formats and interactive modes (dump, --format, --compact, --follow) requires end-to-end testing of logfile parsing, format conversion, and live tail functionality."
+}

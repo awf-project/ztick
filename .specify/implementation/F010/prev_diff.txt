@@ -1,0 +1,15 @@
+## Previous Component Changes
+defc53e wip(F010): T002
+
+docs/ADR/README.md                |   1 +
+ docs/development/architecture.md  |   4 +-
+ docs/development/building.md      |   7 +-
+ example/config-telemetry.toml     |  16 +++
+ src/application/scheduler.zig     | 232 ++++++++++++++++++++++++++++++++++++++
+ src/functional_tests.zig          | 111 ++++++++++++++++++
+ src/infrastructure.zig            |   1 +
+ src/infrastructure/tcp_server.zig | 109 ++++++++++++++++++
+ src/infrastructure/telemetry.zig  | 215 +++++++++++++++++++++++++++++++++++
+ src/interfaces/config.zig         | 109 +++++++++++++++++-
+ src/main.zig                      | 137 ++++++++++++++++++++++
+ 11 files changed, 938 insertions(+), 4 deletions(-)
