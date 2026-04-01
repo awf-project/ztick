@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **STAT command** — Server health metrics query with 15 key-value metrics (uptime, connection count, job/rule counts, execution pipeline state, persistence backend, compression status, auth/TLS configuration)
 - EUPL v1.2 license file
 - `.editorconfig` for consistent code formatting
 

@@ -24,6 +24,7 @@ pub const Instruction = union(enum) {
         identifier: []const u8,
     },
     list_rules: struct {},
+    stat: struct {},
 };
 
 test "set instruction stores identifier and execution timestamp" {
@@ -78,4 +79,9 @@ test "remove_rule instruction stores identifier" {
 test "list_rules instruction is active tag" {
     const instr = Instruction{ .list_rules = .{} };
     try std.testing.expectEqual(std.meta.Tag(Instruction).list_rules, std.meta.activeTag(instr));
+}
+
+test "stat instruction is active tag" {
+    const instr = Instruction{ .stat = .{} };
+    try std.testing.expectEqual(std.meta.Tag(Instruction).stat, std.meta.activeTag(instr));
 }

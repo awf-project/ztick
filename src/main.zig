@@ -118,6 +118,7 @@ const ControllerContext = struct {
     running: *std.atomic.Value(bool),
     tls_context: ?*infrastructure_tls_context.TlsContext,
     instruments: ?infrastructure_telemetry.Instruments,
+    active_connections: *std.atomic.Value(usize),
 };
 
 const DatabaseContext = struct {
@@ -131,6 +132,10 @@ const DatabaseContext = struct {
     exec_request_ch: *Channel(execution.Request),
     exec_response_ch: *Channel(execution.Response),
     instruments: ?infrastructure_telemetry.Instruments,
+    startup_ns: i128,
+    active_connections: *std.atomic.Value(usize),
+    auth_enabled: bool,
+    tls_enabled: bool,
 };
 
 const ProcessorContext = struct {
@@ -140,7 +145,7 @@ const ProcessorContext = struct {
 };
 
 fn run_controller(ctx: ControllerContext) void {
-    var server = TcpServer.init(ctx.allocator, ctx.address, ctx.running, ctx.tls_context);
+    var server = TcpServer.init(ctx.allocator, ctx.address, ctx.running, ctx.tls_context, ctx.active_connections);
     if (ctx.instruments) |instr| server.setInstruments(instr);
     defer server.deinit();
     server.start(ctx.request_ch, ctx.response_router) catch |err| {
@@ -169,6 +174,7 @@ fn run_database(ctx: DatabaseContext) void {
     scheduler.persistence = ctx.persistence;
     scheduler.compression_interval_ns = ctx.compression_interval_ns;
     if (ctx.instruments) |instr| scheduler.setInstruments(instr);
+    scheduler.setStatContext(ctx.startup_ns, ctx.active_connections, ctx.auth_enabled, ctx.tls_enabled, ctx.framerate);
     defer scheduler.deinit();
 
     scheduler.load(ctx.allocator) catch |err| {
@@ -388,6 +394,7 @@ test "controller context tls_context is null when no TLS cert is configured" {
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
 
+    var active = std.atomic.Value(usize).init(0);
     const ctx = ControllerContext{
         .allocator = allocator,
         .address = "127.0.0.1:0",
@@ -396,6 +403,7 @@ test "controller context tls_context is null when no TLS cert is configured" {
         .running = &running,
         .tls_context = null,
         .instruments = null,
+        .active_connections = &active,
     };
     try std.testing.expectEqual(@as(?*infrastructure_tls_context.TlsContext, null), ctx.tls_context);
 }
@@ -414,6 +422,7 @@ test "controller context tls_context is non-null when cert and key are configure
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
 
+    var active = std.atomic.Value(usize).init(0);
     const ctx = ControllerContext{
         .allocator = allocator,
         .address = "127.0.0.1:0",
@@ -422,6 +431,7 @@ test "controller context tls_context is non-null when cert and key are configure
         .running = &running,
         .tls_context = &tls_ctx,
         .instruments = null,
+        .active_connections = &active,
     };
     try std.testing.expect(ctx.tls_context != null);
 }
@@ -437,6 +447,7 @@ test "DatabaseContext instruments field is null when telemetry is disabled" {
     var router = ResponseRouter.init(allocator);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
+    var ac = std.atomic.Value(usize).init(0);
 
     const ctx = DatabaseContext{
         .allocator = allocator,
@@ -452,6 +463,10 @@ test "DatabaseContext instruments field is null when telemetry is disabled" {
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
         .instruments = null,
+        .startup_ns = 0,
+        .active_connections = &ac,
+        .auth_enabled = false,
+        .tls_enabled = false,
     };
     try std.testing.expectEqual(@as(?infrastructure_telemetry.Instruments, null), ctx.instruments);
 }
@@ -479,6 +494,7 @@ test "DatabaseContext instruments field holds Instruments when telemetry is enab
     var router = ResponseRouter.init(allocator);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
+    var ac = std.atomic.Value(usize).init(0);
 
     const ctx = DatabaseContext{
         .allocator = allocator,
@@ -494,6 +510,10 @@ test "DatabaseContext instruments field holds Instruments when telemetry is enab
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
         .instruments = instruments,
+        .startup_ns = 0,
+        .active_connections = &ac,
+        .auth_enabled = false,
+        .tls_enabled = false,
     };
     try std.testing.expect(ctx.instruments != null);
 }
@@ -562,6 +582,7 @@ test "DatabaseContext carries persistence backend and compression interval" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    var ac = std.atomic.Value(usize).init(0);
 
     const logfile_ctx = DatabaseContext{
         .allocator = allocator,
@@ -579,6 +600,10 @@ test "DatabaseContext carries persistence backend and compression interval" {
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
         .instruments = null,
+        .startup_ns = 0,
+        .active_connections = &ac,
+        .auth_enabled = false,
+        .tls_enabled = false,
     };
     try std.testing.expect(logfile_ctx.persistence == .logfile);
     try std.testing.expectEqual(@as(i64, 3600 * std.time.ns_per_s), logfile_ctx.compression_interval_ns);
@@ -597,8 +622,120 @@ test "DatabaseContext carries persistence backend and compression interval" {
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
         .instruments = null,
+        .startup_ns = 0,
+        .active_connections = &ac,
+        .auth_enabled = false,
+        .tls_enabled = false,
     };
     try std.testing.expect(memory_ctx.persistence == .memory);
+}
+
+test "DatabaseContext carries startup_ns for STAT uptime calculation" {
+    const allocator = std.testing.allocator;
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    var running = std.atomic.Value(bool).init(false);
+    var ac = std.atomic.Value(usize).init(0);
+
+    const boot_ns: i128 = 1_700_000_000_000_000_000;
+    const ctx = DatabaseContext{
+        .allocator = allocator,
+        .framerate = 512,
+        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+            .entries = .{},
+            .allocator = allocator,
+        } },
+        .compression_interval_ns = 0,
+        .running = &running,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+        .instruments = null,
+        .startup_ns = boot_ns,
+        .active_connections = &ac,
+        .auth_enabled = false,
+        .tls_enabled = false,
+    };
+    try std.testing.expectEqual(boot_ns, ctx.startup_ns);
+    try std.testing.expectEqual(@as(u16, 512), ctx.framerate);
+}
+
+test "DatabaseContext carries active_connections pointer for STAT connection count" {
+    const allocator = std.testing.allocator;
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    var running = std.atomic.Value(bool).init(false);
+    var ac = std.atomic.Value(usize).init(3);
+
+    const ctx = DatabaseContext{
+        .allocator = allocator,
+        .framerate = 60,
+        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+            .entries = .{},
+            .allocator = allocator,
+        } },
+        .compression_interval_ns = 0,
+        .running = &running,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+        .instruments = null,
+        .startup_ns = 0,
+        .active_connections = &ac,
+        .auth_enabled = false,
+        .tls_enabled = false,
+    };
+    try std.testing.expectEqual(@as(usize, 3), ctx.active_connections.load(.acquire));
+}
+
+test "DatabaseContext carries auth_enabled and tls_enabled flags for STAT reporting" {
+    const allocator = std.testing.allocator;
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    var running = std.atomic.Value(bool).init(false);
+    var ac = std.atomic.Value(usize).init(0);
+
+    const ctx = DatabaseContext{
+        .allocator = allocator,
+        .framerate = 60,
+        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+            .entries = .{},
+            .allocator = allocator,
+        } },
+        .compression_interval_ns = 0,
+        .running = &running,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+        .instruments = null,
+        .startup_ns = 0,
+        .active_connections = &ac,
+        .auth_enabled = true,
+        .tls_enabled = true,
+    };
+    try std.testing.expect(ctx.auth_enabled);
+    try std.testing.expect(ctx.tls_enabled);
 }
 
 test "tick with memory backend persists SET mutation to backend entries" {
@@ -737,6 +874,9 @@ pub fn main() !void {
     else
         null;
 
+    const startup_ns = std.time.nanoTimestamp();
+    var active_connections = std.atomic.Value(usize).init(0);
+
     const cwd = std.fs.cwd();
 
     var query_request_ch = try Channel(query.Request).init(allocator, 64);
@@ -768,6 +908,7 @@ pub fn main() !void {
         .running = &running,
         .tls_context = if (tls_ctx) |*ctx| ctx else null,
         .instruments = telemetry_instruments,
+        .active_connections = &active_connections,
     }});
 
     const backend: persistence_backend.PersistenceBackend = switch (cfg.database_persistence) {
@@ -794,6 +935,10 @@ pub fn main() !void {
         .exec_request_ch = &exec_request_ch,
         .exec_response_ch = &exec_response_ch,
         .instruments = telemetry_instruments,
+        .startup_ns = startup_ns,
+        .active_connections = &active_connections,
+        .auth_enabled = false,
+        .tls_enabled = cfg.controller_tls_cert != null,
     }});
 
     const processor_thread = try std.Thread.spawn(.{}, run_processor, .{ProcessorContext{

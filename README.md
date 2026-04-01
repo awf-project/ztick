@@ -5,7 +5,7 @@ A time-based job scheduler written in Zig with hexagonal architecture, explicit 
 ## Features
 
 - **Core scheduler** — Time-based job execution with TCP control protocol
-- **Protocol commands** — `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, `LISTRULES`, `RULE SET`
+- **Protocol commands** — `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, `LISTRULES`, `RULE SET`, `STAT`
 - **Rules** — Match jobs by prefix and assign shell runners
 - **Persistence** — Append-only logfile with binary encoding and automatic background compression
 - **In-memory persistence** — Ephemeral mode for CI/testing without disk I/O

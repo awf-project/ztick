@@ -77,21 +77,20 @@ pub const ResponseRouter = struct {
 pub const TcpServer = struct {
     allocator: std.mem.Allocator,
     address: []const u8,
-    /// Tracks live TCP connections via standalone atomic. Overlaps with the
-    /// `ztick.connections.active` OpenTelemetry gauge (`instruments.connections_active`);
-    /// both are incremented/decremented in lockstep. This atomic remains because
-    /// join_all() needs a direct read for shutdown draining, which the SDK gauge
-    /// does not support. Consolidate once the gauge exposes a read API.
-    active_connections: std.atomic.Value(usize),
+    /// Tracks live TCP connections. Shared with the scheduler so STAT can report
+    /// the live count. Overlaps with the `ztick.connections.active` OpenTelemetry
+    /// gauge; both are incremented/decremented in lockstep. The pointer is kept
+    /// separate because join_all() needs a direct read for shutdown draining.
+    active_connections: *std.atomic.Value(usize),
     running: *std.atomic.Value(bool),
     tls_context: ?*TlsContext,
     instruments: ?telemetry.Instruments,
 
-    pub fn init(allocator: std.mem.Allocator, address: []const u8, running: *std.atomic.Value(bool), tls_context: ?*TlsContext) TcpServer {
+    pub fn init(allocator: std.mem.Allocator, address: []const u8, running: *std.atomic.Value(bool), tls_context: ?*TlsContext, active_connections: *std.atomic.Value(usize)) TcpServer {
         return .{
             .allocator = allocator,
             .address = address,
-            .active_connections = std.atomic.Value(usize).init(0),
+            .active_connections = active_connections,
             .running = running,
             .tls_context = tls_context,
             .instruments = null,
@@ -132,7 +131,7 @@ pub const TcpServer = struct {
             _ = self.active_connections.fetchAdd(1, .release);
             if (self.instruments) |instr| instr.connections_active.add(1, .{}) catch {};
             const thread = std.Thread.spawn(.{}, connection_worker, .{
-                &self.active_connections,
+                self.active_connections,
                 self.instruments,
                 self.allocator,
                 conn.stream,
@@ -240,28 +239,44 @@ fn handle_connection(
                 for (result.args) |arg| allocator.free(arg);
                 allocator.free(result.args);
 
-                const request = query.Request{
-                    .client = client_id,
-                    .identifier = result.command,
-                    .instruction = instr,
+                const requires_ns_auth = switch (instr) {
+                    .stat => false,
+                    else => true,
                 };
-
-                request_channel.send(request) catch {
-                    // Send failed — we still own the strings, free them
+                if (requires_ns_auth and !is_namespace_authorized(client_id, instr)) {
+                    const msg = std.fmt.allocPrint(allocator, "{s} ERROR\n", .{result.command}) catch {
+                        allocator.free(result.command);
+                        free_instruction_strings(allocator, instr);
+                        return;
+                    };
+                    defer allocator.free(msg);
+                    _ = conn.write(msg) catch {};
                     allocator.free(result.command);
                     free_instruction_strings(allocator, instr);
-                    return;
-                };
-
-                if (response_channel.receive()) |resp| {
-                    write_response(allocator, conn, resp) catch {};
-                    // Free only the request_id (result.command) — not stored by scheduler.
-                    // Instruction strings (job id, pattern, runner args) are now owned
-                    // by the scheduler's storage and must not be freed here.
-                    allocator.free(resp.request.identifier);
-                    if (resp.body) |body| allocator.free(body);
                 } else {
-                    return; // channel closed
+                    const request = query.Request{
+                        .client = client_id,
+                        .identifier = result.command,
+                        .instruction = instr,
+                    };
+
+                    request_channel.send(request) catch {
+                        // Send failed — we still own the strings, free them
+                        allocator.free(result.command);
+                        free_instruction_strings(allocator, instr);
+                        return;
+                    };
+
+                    if (response_channel.receive()) |resp| {
+                        write_response(allocator, conn, resp) catch {};
+                        // Free only the request_id (result.command) — not stored by scheduler.
+                        // Instruction strings (job id, pattern, runner args) are now owned
+                        // by the scheduler's storage and must not be freed here.
+                        allocator.free(resp.request.identifier);
+                        if (resp.body) |body| allocator.free(body);
+                    } else {
+                        return; // channel closed
+                    }
                 }
             } else {
                 // Send ERROR for recognized commands missing required arguments (QUERY, REMOVE, REMOVERULE)
@@ -328,6 +343,10 @@ fn build_instruction(allocator: std.mem.Allocator, result: parser.ParseResult) e
 
     if (result.args.len >= 1 and std.mem.eql(u8, result.args[0], "LISTRULES")) {
         return .{ .list_rules = .{} };
+    }
+
+    if (result.args.len >= 1 and std.mem.eql(u8, result.args[0], "STAT")) {
+        return .{ .stat = .{} };
     }
 
     return null;
@@ -430,6 +449,12 @@ fn is_leap_year(year: u16) bool {
     return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
 }
 
+fn is_namespace_authorized(client_id: u128, instr: instruction.Instruction) bool {
+    _ = client_id;
+    _ = instr;
+    return true;
+}
+
 fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Instruction) void {
     switch (instr) {
         .set => |s| {
@@ -460,12 +485,13 @@ fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Ins
             allocator.free(r.identifier);
         },
         .list_rules => {},
+        .stat => {},
     }
 }
 
 fn write_response(allocator: std.mem.Allocator, conn: Connection, resp: query.Response) !void {
     switch (resp.request.instruction) {
-        .query, .list_rules => {
+        .query, .list_rules, .stat => {
             if (!resp.success) {
                 const msg = try std.fmt.allocPrint(allocator, "{s} ERROR\n", .{resp.request.identifier});
                 defer allocator.free(msg);
@@ -554,7 +580,8 @@ test "parse_timestamp returns zero on invalid input" {
 
 test "tcp server init stores address" {
     var running = std.atomic.Value(bool).init(true);
-    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null);
+    var active = std.atomic.Value(usize).init(0);
+    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active);
     defer server.deinit();
     try std.testing.expectEqualStrings("127.0.0.1:5678", server.address);
 }
@@ -1141,7 +1168,8 @@ test "handle_connection accepts plain Connection and exits cleanly" {
 
 test "tcp server initializes with null instruments" {
     var running = std.atomic.Value(bool).init(true);
-    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null);
+    var active = std.atomic.Value(usize).init(0);
+    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active);
     defer server.deinit();
     try std.testing.expectEqual(@as(?telemetry.Instruments, null), server.instruments);
 }
@@ -1149,7 +1177,8 @@ test "tcp server initializes with null instruments" {
 test "tcp server setInstruments makes instruments non-null" {
     const sdk = @import("opentelemetry");
     var running = std.atomic.Value(bool).init(true);
-    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null);
+    var active = std.atomic.Value(usize).init(0);
+    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active);
     defer server.deinit();
 
     const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator);
@@ -1203,6 +1232,131 @@ test "connection_worker decrements active_connections on exit" {
     try std.testing.expectEqual(@as(usize, 0), active.load(.acquire));
 }
 
+test "build_instruction parses STAT command" {
+    var args = [_][]u8{@constCast("STAT")};
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    switch (instr) {
+        .stat => {},
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction parses STAT command ignoring trailing args" {
+    var args = [_][]u8{ @constCast("STAT"), @constCast("ignored") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    switch (instr) {
+        .stat => {},
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "free_instruction_strings does not leak for stat instruction" {
+    const instr = instruction.Instruction{ .stat = .{} };
+    free_instruction_strings(std.testing.allocator, instr);
+}
+
+test "write_response formats stat multi-line metrics body with request_id prefix" {
+    const pair = try make_socket_pair();
+    defer std.posix.close(pair.read_fd);
+
+    const req = query.Request{
+        .client = 0,
+        .identifier = "req-1",
+        .instruction = .{ .stat = .{} },
+    };
+    const resp = query.Response{
+        .request = req,
+        .success = true,
+        .body = "uptime_ns 60000000000\nconnections 1\njobs_total 5\n",
+    };
+
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
+    pair.write_stream.close();
+
+    var buf: [512]u8 = undefined;
+    const n = try std.posix.read(pair.read_fd, &buf);
+    const output = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, output, "req-1 uptime_ns 60000000000\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "req-1 connections 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "req-1 jobs_total 5\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "req-1 OK\n"));
+}
+
+test "write_response formats stat error response as ERROR line" {
+    const pair = try make_socket_pair();
+    defer std.posix.close(pair.read_fd);
+
+    const req = query.Request{
+        .client = 0,
+        .identifier = "req-1",
+        .instruction = .{ .stat = .{} },
+    };
+    const resp = query.Response{
+        .request = req,
+        .success = false,
+        .body = null,
+    };
+
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
+    pair.write_stream.close();
+
+    var buf: [64]u8 = undefined;
+    const n = try std.posix.read(pair.read_fd, &buf);
+    try std.testing.expectEqualStrings("req-1 ERROR\n", buf[0..n]);
+}
+
+test "handle_connection forwards STAT instruction to request channel" {
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    try pair.write_stream.writeAll("r3 STAT\n");
+    pair.write_stream.close();
+
+    const Context = struct {
+        received_tag: []const u8 = "",
+
+        fn respond(self: *@This(), rch: *Channel(query.Request), rtr: *ResponseRouter) void {
+            if (rch.receive()) |req| {
+                self.received_tag = @tagName(req.instruction);
+                const resp = query.Response{ .request = req, .success = true };
+                rtr.route(resp);
+            }
+        }
+    };
+
+    var ctx = Context{};
+    const t = try std.Thread.spawn(.{}, Context.respond, .{ &ctx, &req_ch, &router });
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    handle_connection(
+        std.testing.allocator,
+        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
+        addr,
+        44,
+        &req_ch,
+        &router,
+    );
+
+    t.join();
+
+    try std.testing.expectEqualStrings("stat", ctx.received_tag);
+}
+
 test "connection_worker with null instruments decrements active_connections on exit" {
     const pair = try make_socket_pair();
 
@@ -1229,4 +1383,88 @@ test "connection_worker with null instruments decrements active_connections on e
     );
 
     try std.testing.expectEqual(@as(usize, 0), active.load(.acquire));
+}
+
+test "handle_connection forwards stat bypassing namespace authorization without sending error" {
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    try pair.write_stream.writeAll("r99 STAT\n");
+    pair.write_stream.close();
+
+    const Context = struct {
+        forwarded: bool = false,
+
+        fn respond(self: *@This(), rch: *Channel(query.Request), rtr: *ResponseRouter) void {
+            if (rch.receive()) |req| {
+                self.forwarded = std.mem.eql(u8, @tagName(req.instruction), "stat");
+                const resp = query.Response{ .request = req, .success = true, .body = null };
+                rtr.route(resp);
+            }
+        }
+    };
+
+    var ctx = Context{};
+    const t = try std.Thread.spawn(.{}, Context.respond, .{ &ctx, &req_ch, &router });
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    handle_connection(
+        std.testing.allocator,
+        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
+        addr,
+        202,
+        &req_ch,
+        &router,
+    );
+
+    t.join();
+
+    try std.testing.expect(ctx.forwarded);
+}
+
+test "handle_connection forwards non-stat instruction through namespace authorization check" {
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    try pair.write_stream.writeAll("r100 QUERY jobs\n");
+    pair.write_stream.close();
+
+    const Context = struct {
+        forwarded: bool = false,
+
+        fn respond(self: *@This(), rch: *Channel(query.Request), rtr: *ResponseRouter) void {
+            if (rch.receive()) |req| {
+                self.forwarded = std.mem.eql(u8, @tagName(req.instruction), "query");
+                free_instruction_strings(std.testing.allocator, req.instruction);
+                rtr.route(query.Response{ .request = req, .success = true, .body = null });
+            }
+        }
+    };
+
+    var ctx = Context{};
+    const t = try std.Thread.spawn(.{}, Context.respond, .{ &ctx, &req_ch, &router });
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    handle_connection(
+        std.testing.allocator,
+        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
+        addr,
+        203,
+        &req_ch,
+        &router,
+    );
+
+    t.join();
+
+    try std.testing.expect(ctx.forwarded);
 }

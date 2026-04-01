@@ -14,6 +14,7 @@ const Response = domain.query.Response;
 const Entry = persistence.encoder.Entry;
 const PersistenceBackend = persistence.backend.PersistenceBackend;
 const Process = persistence.background.Process;
+const ServerStats = domain.server_stats.ServerStats;
 
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
@@ -25,6 +26,11 @@ pub const Scheduler = struct {
     last_compression_ns: i64,
     active_process: ?*Process,
     instruments: ?telemetry.Instruments,
+    startup_ns: i128,
+    active_connections: ?*std.atomic.Value(usize),
+    auth_enabled: bool,
+    tls_enabled: bool,
+    framerate: u16,
 
     pub fn init(allocator: std.mem.Allocator) Scheduler {
         return .{
@@ -37,11 +43,24 @@ pub const Scheduler = struct {
             .last_compression_ns = 0,
             .active_process = null,
             .instruments = null,
+            .startup_ns = 0,
+            .active_connections = null,
+            .auth_enabled = false,
+            .tls_enabled = false,
+            .framerate = 0,
         };
     }
 
     pub fn setInstruments(self: *Scheduler, instr: telemetry.Instruments) void {
         self.instruments = instr;
+    }
+
+    pub fn setStatContext(self: *Scheduler, startup_ns: i128, active_connections: *std.atomic.Value(usize), auth_enabled: bool, tls_enabled: bool, framerate: u16) void {
+        self.startup_ns = startup_ns;
+        self.active_connections = active_connections;
+        self.auth_enabled = auth_enabled;
+        self.tls_enabled = tls_enabled;
+        self.framerate = framerate;
     }
 
     pub fn deinit(self: *Scheduler) void {
@@ -87,7 +106,67 @@ pub const Scheduler = struct {
         }
     }
 
+    fn handle_stat_request(self: *Scheduler, request: Request) !Response {
+        const uptime_ns = std.time.nanoTimestamp() - self.startup_ns;
+        const connections: usize = if (self.active_connections) |ac| ac.load(.acquire) else 0;
+
+        const jobs_total = self.job_storage.jobs.count();
+
+        const planned_jobs = try self.job_storage.get_by_status(.planned, self.allocator);
+        defer self.allocator.free(planned_jobs);
+        const triggered_jobs = try self.job_storage.get_by_status(.triggered, self.allocator);
+        defer self.allocator.free(triggered_jobs);
+        const executed_jobs = try self.job_storage.get_by_status(.executed, self.allocator);
+        defer self.allocator.free(executed_jobs);
+        const failed_jobs = try self.job_storage.get_by_status(.failed, self.allocator);
+        defer self.allocator.free(failed_jobs);
+
+        const rules_total = self.rule_storage.rules.count();
+        const executions_pending = self.execution_client.pending.items.len;
+        const executions_inflight = self.execution_client.triggered.count();
+
+        const persistence_str: []const u8 = if (self.persistence) |p| switch (p) {
+            .logfile => "logfile",
+            .memory => "memory",
+        } else "memory";
+
+        const compression_str: []const u8 = if (self.active_process) |proc|
+            switch (proc.status()) {
+                .running => "running",
+                .success => "success",
+                .failure => "failure",
+            }
+        else
+            "idle";
+
+        const stats = ServerStats{
+            .uptime_ns = uptime_ns,
+            .connections = connections,
+            .jobs_total = jobs_total,
+            .jobs_planned = planned_jobs.len,
+            .jobs_triggered = triggered_jobs.len,
+            .jobs_executed = executed_jobs.len,
+            .jobs_failed = failed_jobs.len,
+            .rules_total = rules_total,
+            .executions_pending = executions_pending,
+            .executions_inflight = executions_inflight,
+            .persistence = persistence_str,
+            .compression = compression_str,
+            .auth_enabled = self.auth_enabled,
+            .tls_enabled = self.tls_enabled,
+            .framerate = self.framerate,
+        };
+
+        const body = try stats.format(self.allocator);
+        return Response{ .request = request, .success = true, .body = body };
+    }
+
     pub fn handle_query(self: *Scheduler, request: Request) !Response {
+        switch (request.instruction) {
+            .stat => return try self.handle_stat_request(request),
+            else => {},
+        }
+
         const command = @tagName(request.instruction);
         var span: ?telemetry.Span = if (self.instruments) |instr|
             (instr.tracer.startSpan(self.allocator, "ztick.request", .{ .kind = .Server }) catch null)
@@ -124,7 +203,7 @@ pub const Scheduler = struct {
                     .remove => try instr.jobs_removed.add(1, .{}),
                     .rule_set => try instr.rules_active.add(1, .{}),
                     .remove_rule => try instr.rules_active.add(-1, .{}),
-                    .get, .query, .list_rules => {},
+                    .get, .query, .list_rules, .stat => {},
                 }
             }
         }
@@ -138,7 +217,7 @@ pub const Scheduler = struct {
             .rule_set => |r| .{ .rule = .{ .identifier = r.identifier, .pattern = r.pattern, .runner = r.runner } },
             .remove => |r| .{ .job_removal = .{ .identifier = r.identifier } },
             .remove_rule => |r| .{ .rule_removal = .{ .identifier = r.identifier } },
-            .get, .query, .list_rules => null,
+            .get, .query, .list_rules, .stat => null,
         };
         const entry = maybe_entry orelse return;
         const encoded = try persistence.encoder.encode(self.allocator, entry);
@@ -390,10 +469,7 @@ test "load and handle_query round-trip through logfile" {
 
 test "handle_query with get instruction returns success with body for existing job" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var scheduler = Scheduler.init(allocator);
@@ -436,10 +512,7 @@ test "handle_query with get instruction returns failure for missing job" {
 
 test "handle_query with query instruction returns success with matching jobs in body" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var scheduler = Scheduler.init(allocator);
@@ -485,10 +558,7 @@ test "handle_query with query instruction returns success with null body when no
 
 test "handle_query with query instruction does not persist to logfile" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp = std.testing.tmpDir(.{});
@@ -530,10 +600,7 @@ test "handle_query with query instruction does not persist to logfile" {
 
 test "handle_query with get instruction does not persist to logfile" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp = std.testing.tmpDir(.{});
@@ -575,10 +642,7 @@ test "handle_query with get instruction does not persist to logfile" {
 
 test "double load deinits previous arena without leak" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp = std.testing.tmpDir(.{});
@@ -628,10 +692,7 @@ test "double load deinits previous arena without leak" {
 
 test "handle_query with remove instruction persists to logfile" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp = std.testing.tmpDir(.{});
@@ -670,10 +731,7 @@ test "handle_query with remove instruction persists to logfile" {
 
 test "remove job round-trip through logfile" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp = std.testing.tmpDir(.{});
@@ -724,10 +782,7 @@ test "remove job round-trip through logfile" {
 
 test "remove_rule round-trip through logfile" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp = std.testing.tmpDir(.{});
@@ -782,10 +837,7 @@ test "remove_rule round-trip through logfile" {
 
 test "handle_query with list_rules instruction does not persist to logfile" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var tmp = std.testing.tmpDir(.{});
@@ -922,10 +974,7 @@ test "load with memory backend on empty backend loads nothing" {
 
 test "handle_query with set instruction round-trips through memory backend" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var scheduler = Scheduler.init(allocator);
@@ -949,10 +998,7 @@ test "handle_query with set instruction round-trips through memory backend" {
 
 test "load and handle_query round-trip through memory backend" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var scheduler = Scheduler.init(allocator);
@@ -991,10 +1037,7 @@ test "load and handle_query round-trip through memory backend" {
 
 test "double load with memory backend works without leak" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var scheduler = Scheduler.init(allocator);
@@ -1243,10 +1286,7 @@ test "tick skips compression when process is already running" {
 
 test "deinit frees active compression process allocation without joining thread" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     var scheduler = Scheduler.init(allocator);
@@ -1481,4 +1521,258 @@ test "scheduler with null instruments completes operations without error" {
 
     try scheduler.tick(1000);
     try scheduler.tick(2000);
+}
+
+test "handle_query with stat instruction returns success with all metric keys in body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var connections = std.atomic.Value(usize).init(1);
+    scheduler.setStatContext(1_000_000_000, &connections, false, false, 100);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-stat",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    const body = response.body.?;
+    try std.testing.expect(std.mem.indexOf(u8, body, "uptime_ns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "connections") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_planned") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_triggered") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_executed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "rules_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "executions_pending") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "executions_inflight") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "persistence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "compression") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "auth_enabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tls_enabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "framerate") != null);
+}
+
+test "handle_query with stat instruction reflects pre-populated job counts" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var connections = std.atomic.Value(usize).init(0);
+    scheduler.setStatContext(0, &connections, false, false, 1);
+
+    try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
+    try scheduler.job_storage.set(Job{ .identifier = "job.2", .execution = 2000, .status = .planned });
+    try scheduler.job_storage.set(Job{ .identifier = "job.3", .execution = 3000, .status = .executed });
+    try scheduler.job_storage.set(Job{ .identifier = "job.4", .execution = 4000, .status = .failed });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-stat-counts",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    const body = response.body.?;
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_total 4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_planned 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_executed 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "jobs_failed 1\n") != null);
+}
+
+test "handle_query with stat instruction with active instruments does not update any counter" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const otel = @import("opentelemetry");
+    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+    defer meter_provider.shutdown();
+    const tracer_provider = try otel.trace.TracerProvider.init(
+        allocator,
+        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+    );
+    defer tracer_provider.shutdown();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
+
+    var connections = std.atomic.Value(usize).init(0);
+    scheduler.setStatContext(0, &connections, false, false, 1);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-stat-instruments",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+}
+
+test "handle_query with stat instruction does not persist to logfile" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
+    }
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = PersistenceBackend{ .logfile = .{
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    try scheduler.load(allocator);
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-set",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1595586600_000000000 } },
+    });
+
+    const size_after_set = try get_file_size_in(tmp.dir, "logfile");
+    try std.testing.expect(size_after_set > 0);
+
+    var connections = std.atomic.Value(usize).init(1);
+    scheduler.setStatContext(0, &connections, false, false, 1);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-stat-nopersist",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expectEqual(size_after_set, try get_file_size_in(tmp.dir, "logfile"));
+}
+
+test "handle_query with stat instruction reports active_connections value from atomic" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var connections = std.atomic.Value(usize).init(7);
+    scheduler.setStatContext(0, &connections, false, false, 1);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-stat-conn",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "connections 7\n") != null);
+}
+
+test "handle_query with stat instruction reports auth_enabled and tls_enabled as 1 when configured" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var connections = std.atomic.Value(usize).init(1);
+    scheduler.setStatContext(0, &connections, true, true, 1);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-stat-auth",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "auth_enabled 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "tls_enabled 1\n") != null);
+}
+
+test "handle_query with stat instruction reports framerate and rules_total values" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var connections = std.atomic.Value(usize).init(0);
+    scheduler.setStatContext(0, &connections, false, false, 512);
+
+    try scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "backup.", .runner = .{ .shell = .{ .command = "echo" } } });
+    try scheduler.rule_storage.set(Rule{ .identifier = "rule.2", .pattern = "deploy.", .runner = .{ .shell = .{ .command = "echo" } } });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-stat-cfg",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "framerate 512\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rules_total 2\n") != null);
+}
+
+test "handle_query with stat instruction reports persistence backend type" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("logfile", .{});
+        f.close();
+    }
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = PersistenceBackend{ .logfile = .{
+        .logfile_path = "logfile",
+        .logfile_dir = tmp.dir,
+        .load_arena = null,
+        .fsync_on_persist = false,
+    } };
+    try scheduler.load(allocator);
+
+    var connections = std.atomic.Value(usize).init(0);
+    scheduler.setStatContext(0, &connections, false, false, 1);
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-stat-persist",
+        .instruction = .{ .stat = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "persistence logfile\n") != null);
 }

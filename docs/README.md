@@ -16,6 +16,7 @@ Practical how-to guides for common operations.
 - **[Writing Rules](user-guide/writing-rules.md)** — Pattern-match jobs to actions
 - **[Configuration](user-guide/configuration.md)** — Set up logging, listen addresses, persistence, and TLS encryption
 - **[Inspecting Logfiles](user-guide/inspecting-logfiles.md)** — Dump, export, and live-tail the binary persistence logfile
+- **[Monitoring Health](user-guide/monitoring-health.md)** — Check server status and inspect execution pipeline
 
 ## [Reference](reference/) — Information-Oriented
 
