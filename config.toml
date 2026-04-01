@@ -4,6 +4,10 @@ level = "info"
 [controller]
 listen = "127.0.0.1:5678"
 
+[shell]
+path = "/bin/sh"
+args = ["-c"]
+
 [database]
 fsync_on_persist = false
 framerate = 512

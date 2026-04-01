@@ -2829,3 +2829,236 @@ test "stat command over TCP reports connections reflecting active connection cou
     try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-conn connections 3\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-conn OK\n") != null);
 }
+
+// Feature: F013
+
+test "direct runner rule set via scheduler stores rule with correct runner fields" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    const args = [_][]const u8{ "-s", "http://example.com" };
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-rule-direct",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.direct",
+            .pattern = "fetch.",
+            .runner = .{ .direct = .{ .executable = "/usr/bin/curl", .args = &args } },
+        } },
+    });
+
+    const rule = scheduler.rule_storage.get("rule.direct");
+    try std.testing.expect(rule != null);
+    try std.testing.expectEqualStrings("fetch.", rule.?.pattern);
+    switch (rule.?.runner) {
+        .direct => |d| {
+            try std.testing.expectEqualStrings("/usr/bin/curl", d.executable);
+            try std.testing.expectEqual(@as(usize, 2), d.args.len);
+            try std.testing.expectEqualStrings("-s", d.args[0]);
+            try std.testing.expectEqualStrings("http://example.com", d.args[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "direct runner rule stored and retrieved via list rules query" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    const args = [_][]const u8{"hello world"};
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-rule",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.echo",
+            .pattern = "print.",
+            .runner = .{ .direct = .{ .executable = "/bin/echo", .args = &args } },
+        } },
+    });
+
+    const response = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-list",
+        .instruction = .{ .list_rules = .{} },
+    });
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.echo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "print.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "direct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "/bin/echo") != null);
+}
+
+test "direct runner rule persisted and replayed with correct fields" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = [_][]const u8{ "-s", "http://example.com" };
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = .{ .identifier = "rule.direct.replay", .pattern = "fetch.", .runner = .{ .direct = .{ .executable = "/usr/bin/curl", .args = &args } } } },
+    });
+    defer allocator.free(logfile_data);
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var decode_arena = try replay_into_scheduler(allocator, logfile_data, &scheduler);
+    defer decode_arena.deinit();
+
+    const rule = scheduler.rule_storage.get("rule.direct.replay");
+    try std.testing.expect(rule != null);
+    try std.testing.expectEqualStrings("fetch.", rule.?.pattern);
+    switch (rule.?.runner) {
+        .direct => |d| {
+            try std.testing.expectEqualStrings("/usr/bin/curl", d.executable);
+            try std.testing.expectEqual(@as(usize, 2), d.args.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "dump command prints RULE SET line for direct runner with no args" {
+    const allocator = std.testing.allocator;
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = .{ .identifier = "rule.notify", .pattern = "notify.", .runner = .{ .direct = .{ .executable = "/usr/bin/notify-send", .args = &.{} } } } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "RULE SET rule.notify notify. direct /usr/bin/notify-send\n") != null);
+}
+
+test "dump command prints RULE SET line for direct runner with args" {
+    const allocator = std.testing.allocator;
+
+    const args = [_][]const u8{ "-s", "http://example.com" };
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = .{ .identifier = "rule.curl", .pattern = "fetch.", .runner = .{ .direct = .{ .executable = "/usr/bin/curl", .args = &args } } } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "RULE SET rule.curl fetch. direct /usr/bin/curl -s http://example.com\n") != null);
+}
+
+test "dump command prints JSON for direct runner rule" {
+    const allocator = std.testing.allocator;
+
+    const args = [_][]const u8{"hello world"};
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = .{ .identifier = "rule.echo", .pattern = "print.", .runner = .{ .direct = .{ .executable = "/bin/echo", .args = &args } } } },
+    });
+    defer allocator.free(logfile_data);
+
+    var result = try run_dump_command(allocator, logfile_data, &.{ "--format", "json" });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"type\":\"rule_set\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"type\":\"direct\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"/bin/echo\"") != null);
+}
+
+test "RULE SET with direct runner over TCP stores rule and appears in LISTRULES" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19890\"\n\n[database]\npersistence = \"memory\"\n");
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19890) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    _ = stream.write("req-1 RULE SET rule.direct print. direct /bin/echo \"hello world\"\n") catch return error.SkipZigTest;
+    std.Thread.sleep(200_000_000);
+
+    _ = stream.write("req-2 LISTRULES\n") catch return error.SkipZigTest;
+    std.Thread.sleep(300_000_000);
+
+    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = stream.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const response = buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 OK\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "direct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/bin/echo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-2 OK\n") != null);
+}
+
+test "server with custom shell config starts successfully and accepts commands" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19891\"\n\n[database]\npersistence = \"memory\"\n\n[shell]\npath = \"/bin/sh\"\nargs = [\"-c\"]\n");
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19891) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    _ = stream.write("req-1 RULE SET rule.shell run. shell /bin/true\n") catch return error.SkipZigTest;
+    std.Thread.sleep(200_000_000);
+
+    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = stream.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const response = buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 OK\n") != null);
+}
+
+test "server with invalid shell path fails to start" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
+    try config_file.writeAll("[log]\nlevel = \"error\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n\n[shell]\npath = \"/nonexistent/shell\"\n");
+    config_file.close();
+
+    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    defer allocator.free(config_path);
+
+    var child = try spawn_ztick(allocator, config_path);
+    const term = try child.wait();
+
+    switch (term) {
+        .Exited => |code| try std.testing.expect(code != 0),
+        else => try std.testing.expect(false),
+    }
+}

@@ -83,11 +83,37 @@ Execute a command in a child process:
 echo 'r1 RULE SET rule.logs logs. shell "/usr/sbin/logrotate -f /etc/logrotate.conf"' | socat - TCP:localhost:5678
 ```
 
-The command is passed to `/bin/sh -c`, so shell features work. Quote commands that contain spaces:
+The command is passed to the configured shell (default: `/bin/sh -c`), so shell features work. The shell binary and arguments can be changed via the `[shell]` config section — see [Configuration Reference](../reference/configuration.md#shell). Quote commands that contain spaces:
 
 ```bash
 echo 'r1 RULE SET rule.complex complex. shell /usr/local/bin/my-script.sh' | socat - TCP:localhost:5678
 ```
+
+### Direct Runner
+
+Execute a command directly without shell interpretation. Useful for simple commands where you want to avoid shell injection vulnerabilities.
+
+```bash
+echo 'r1 RULE SET rule.fetch fetch. direct /usr/bin/curl -s http://example.com' | socat - TCP:localhost:5678
+```
+
+**Characteristics:**
+- No shell interpreter involved — execve is used directly
+- First argument is the executable path; remaining arguments are passed literally
+- Shell metacharacters (`$()`, `;`, `|`, etc.) are passed as literal strings, not interpreted
+- Eliminates shell injection risks
+
+**Example: Safe from Injection**
+
+```bash
+# Shell runner: vulnerable to injection via job ID manipulation
+echo 'r1 RULE SET rule.app1 app. shell "curl http://api/result?id=$1"' | socat - TCP:localhost:5678
+
+# Direct runner: same command, immune to injection
+echo 'r1 RULE SET rule.app2 app. direct /usr/bin/curl http://api/result?id=$1' | socat - TCP:localhost:5678
+```
+
+In the direct runner, `$1` is passed literally to curl as a query parameter value, not substituted by the shell.
 
 ### AMQP Runner (Deferred)
 

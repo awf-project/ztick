@@ -142,6 +142,7 @@ const ProcessorContext = struct {
     allocator: std.mem.Allocator,
     exec_request_ch: *Channel(execution.Request),
     exec_response_ch: *Channel(execution.Response),
+    shell_config: interfaces_config.ShellConfig,
 };
 
 fn run_controller(ctx: ControllerContext) void {
@@ -223,7 +224,7 @@ const TickContext = struct {
 
 fn run_processor(ctx: ProcessorContext) void {
     while (ctx.exec_request_ch.receive()) |req| {
-        const resp = ShellRunner.execute(ctx.allocator, req) catch execution.Response{
+        const resp = ShellRunner.execute(ctx.allocator, ctx.shell_config, req) catch execution.Response{
             .identifier = req.identifier,
             .success = false,
         };
@@ -337,6 +338,7 @@ test "processor thread routes execution request to response channel" {
         .allocator = allocator,
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
+        .shell_config = .{ .path = "/bin/sh", .args = &.{"-c"} },
     }});
 
     const resp = exec_resp_ch.receive() orelse unreachable;
@@ -376,11 +378,72 @@ test "processor thread propagates shell failure to response channel" {
         .allocator = allocator,
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
+        .shell_config = .{ .path = "/bin/sh", .args = &.{"-c"} },
     }});
 
     const resp = exec_resp_ch.receive() orelse unreachable;
     try std.testing.expectEqual(@as(u128, 0xcafe), resp.identifier);
     try std.testing.expect(!resp.success);
+
+    exec_req_ch.close();
+    thread.join();
+}
+
+test "processor thread uses configured shell path from ProcessorContext" {
+    const allocator = std.testing.allocator;
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+
+    // /bin/false as the shell means any command will exit non-zero,
+    // proving the custom path is forwarded rather than using the hardcoded default.
+    const req = execution.Request{
+        .identifier = 0xbabe,
+        .job_identifier = "test.job",
+        .runner = .{ .shell = .{ .command = "/bin/true" } },
+    };
+    try exec_req_ch.send(req);
+
+    const thread = try std.Thread.spawn(.{}, run_processor, .{ProcessorContext{
+        .allocator = allocator,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+        .shell_config = .{ .path = "/bin/false", .args = &.{"-c"} },
+    }});
+
+    const resp = exec_resp_ch.receive() orelse unreachable;
+    try std.testing.expectEqual(@as(u128, 0xbabe), resp.identifier);
+    try std.testing.expect(!resp.success);
+
+    exec_req_ch.close();
+    thread.join();
+}
+
+test "processor thread executes direct runner request via ProcessorContext" {
+    const allocator = std.testing.allocator;
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+
+    const req = execution.Request{
+        .identifier = 0xd1ec7,
+        .job_identifier = "direct.job",
+        .runner = .{ .direct = .{ .executable = "/bin/true", .args = &.{} } },
+    };
+    try exec_req_ch.send(req);
+
+    const thread = try std.Thread.spawn(.{}, run_processor, .{ProcessorContext{
+        .allocator = allocator,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+        .shell_config = .{ .path = "/bin/sh", .args = &.{"-c"} },
+    }});
+
+    const resp = exec_resp_ch.receive() orelse unreachable;
+    try std.testing.expectEqual(@as(u128, 0xd1ec7), resp.identifier);
+    try std.testing.expect(resp.success);
 
     exec_req_ch.close();
     thread.join();
@@ -945,6 +1008,7 @@ pub fn main() !void {
         .allocator = allocator,
         .exec_request_ch = &exec_request_ch,
         .exec_response_ch = &exec_response_ch,
+        .shell_config = cfg.shell,
     }});
 
     controller_thread.join();

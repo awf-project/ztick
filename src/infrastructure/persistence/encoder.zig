@@ -77,6 +77,15 @@ fn runner_encoded_size(runner: domain.runner.Runner) !usize {
             if (a.routing_key.len > std.math.maxInt(u16)) return error.Overflow;
             break :blk 1 + 2 + a.dsn.len + 2 + a.exchange.len + 2 + a.routing_key.len;
         },
+        .direct => |d| blk: {
+            if (d.executable.len > std.math.maxInt(u16)) return error.Overflow;
+            var size: usize = 1 + 2 + d.executable.len + 2;
+            for (d.args) |arg| {
+                if (arg.len > std.math.maxInt(u16)) return error.Overflow;
+                size += 2 + arg.len;
+            }
+            break :blk size;
+        },
     };
 }
 
@@ -104,6 +113,22 @@ fn encode_runner(runner: domain.runner.Runner, buf: []u8) void {
             std.mem.writeInt(u16, buf[pos..][0..2], @intCast(a.routing_key.len), .big);
             pos += 2;
             @memcpy(buf[pos..], a.routing_key);
+        },
+        .direct => |d| {
+            buf[pos] = 2;
+            pos += 1;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(d.executable.len), .big);
+            pos += 2;
+            @memcpy(buf[pos .. pos + d.executable.len], d.executable);
+            pos += d.executable.len;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(d.args.len), .big);
+            pos += 2;
+            for (d.args) |arg| {
+                std.mem.writeInt(u16, buf[pos..][0..2], @intCast(arg.len), .big);
+                pos += 2;
+                @memcpy(buf[pos .. pos + arg.len], arg);
+                pos += arg.len;
+            }
         },
     }
 }
@@ -187,6 +212,35 @@ fn decode_inner(allocator: std.mem.Allocator, data: []const u8) !Entry {
                         .runner = .{ .amqp = .{ .dsn = dsn_copy, .exchange = exch_copy, .routing_key = rk_copy } },
                     } };
                 },
+                2 => {
+                    const exe_slice = try read_sized_string(data, &pos);
+                    if (pos + 2 > data.len) return error.InvalidData;
+                    const argc = std.mem.readInt(u16, data[pos..][0..2], .big);
+                    pos += 2;
+                    const id_copy = try allocator.dupe(u8, id_slice);
+                    errdefer allocator.free(id_copy);
+                    const pat_copy = try allocator.dupe(u8, pat_slice);
+                    errdefer allocator.free(pat_copy);
+                    const exe_copy = try allocator.dupe(u8, exe_slice);
+                    errdefer allocator.free(exe_copy);
+                    const args = try allocator.alloc([]const u8, argc);
+                    var args_filled: usize = 0;
+                    errdefer {
+                        for (args[0..args_filled]) |arg| allocator.free(arg);
+                        allocator.free(args);
+                    }
+                    for (args) |*arg| {
+                        const arg_slice = try read_sized_string(data, &pos);
+                        arg.* = try allocator.dupe(u8, arg_slice);
+                        args_filled += 1;
+                    }
+                    if (pos != data.len) return error.InvalidData;
+                    return .{ .rule = .{
+                        .identifier = id_copy,
+                        .pattern = pat_copy,
+                        .runner = .{ .direct = .{ .executable = exe_copy, .args = args } },
+                    } };
+                },
                 else => return error.InvalidData,
             }
         },
@@ -232,6 +286,11 @@ pub fn free_entry_fields(entry: Entry, allocator: std.mem.Allocator) void {
                     allocator.free(a.dsn);
                     allocator.free(a.exchange);
                     allocator.free(a.routing_key);
+                },
+                .direct => |d| {
+                    allocator.free(d.executable);
+                    for (d.args) |arg| allocator.free(arg);
+                    allocator.free(d.args);
                 },
             }
         },
@@ -365,4 +424,116 @@ test "decode rule removal" {
 test "decode error on trailing bytes after job removal" {
     const data = [_]u8{ 2, 0, 3, 102, 111, 111, 255 };
     try std.testing.expectError(DecodeError.InvalidData, decode(std.testing.allocator, &data));
+}
+
+test "encode rule direct runner no args" {
+    const rule = domain.rule.Rule{
+        .identifier = "a",
+        .pattern = "b",
+        .runner = .{ .direct = .{ .executable = "/bin/true", .args = &[_][]const u8{} } },
+    };
+    const result = try encode(std.testing.allocator, .{ .rule = rule });
+    defer std.testing.allocator.free(result);
+    // type=1, id=[0,1,'a'], pat=[0,1,'b'], runner_type=2, exe=[0,9,"/bin/true"], argc=[0,0]
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 1, 97, 0, 1, 98, 2, 0, 9, 47, 98, 105, 110, 47, 116, 114, 117, 101, 0, 0 }, result);
+}
+
+test "encode rule direct runner with args" {
+    const args = [_][]const u8{"hi"};
+    const rule = domain.rule.Rule{
+        .identifier = "a",
+        .pattern = "b",
+        .runner = .{ .direct = .{ .executable = "/bin/echo", .args = &args } },
+    };
+    const result = try encode(std.testing.allocator, .{ .rule = rule });
+    defer std.testing.allocator.free(result);
+    // type=1, id=[0,1,'a'], pat=[0,1,'b'], runner_type=2, exe=[0,9,"/bin/echo"], argc=[0,1], arg=[0,2,"hi"]
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 1, 97, 0, 1, 98, 2, 0, 9, 47, 98, 105, 110, 47, 101, 99, 104, 111, 0, 1, 0, 2, 104, 105 }, result);
+}
+
+test "decode rule direct runner no args" {
+    const data = [_]u8{ 1, 0, 1, 97, 0, 1, 98, 2, 0, 9, 47, 98, 105, 110, 47, 116, 114, 117, 101, 0, 0 };
+    const result = try decode(std.testing.allocator, &data);
+    defer std.testing.allocator.free(result.rule.identifier);
+    defer std.testing.allocator.free(result.rule.pattern);
+    defer std.testing.allocator.free(result.rule.runner.direct.executable);
+    defer std.testing.allocator.free(result.rule.runner.direct.args);
+    try std.testing.expectEqualStrings("a", result.rule.identifier);
+    try std.testing.expectEqualStrings("b", result.rule.pattern);
+    try std.testing.expectEqualStrings("/bin/true", result.rule.runner.direct.executable);
+    try std.testing.expectEqual(@as(usize, 0), result.rule.runner.direct.args.len);
+}
+
+test "decode rule direct runner with args" {
+    const data = [_]u8{ 1, 0, 1, 97, 0, 1, 98, 2, 0, 9, 47, 98, 105, 110, 47, 101, 99, 104, 111, 0, 1, 0, 2, 104, 105 };
+    const result = try decode(std.testing.allocator, &data);
+    defer std.testing.allocator.free(result.rule.identifier);
+    defer std.testing.allocator.free(result.rule.pattern);
+    defer std.testing.allocator.free(result.rule.runner.direct.executable);
+    defer {
+        for (result.rule.runner.direct.args) |arg| std.testing.allocator.free(arg);
+        std.testing.allocator.free(result.rule.runner.direct.args);
+    }
+    try std.testing.expectEqualStrings("a", result.rule.identifier);
+    try std.testing.expectEqualStrings("b", result.rule.pattern);
+    try std.testing.expectEqualStrings("/bin/echo", result.rule.runner.direct.executable);
+    try std.testing.expectEqual(@as(usize, 1), result.rule.runner.direct.args.len);
+    try std.testing.expectEqualStrings("hi", result.rule.runner.direct.args[0]);
+}
+
+test "free_entry_fields frees direct runner rule fields without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "rule1");
+    const pattern = try allocator.dupe(u8, "exec.*");
+    const executable = try allocator.dupe(u8, "/bin/echo");
+    const args = try allocator.alloc([]const u8, 0);
+    const entry = Entry{ .rule = .{
+        .identifier = id,
+        .pattern = pattern,
+        .runner = .{ .direct = .{ .executable = executable, .args = args } },
+    } };
+    free_entry_fields(entry, allocator);
+    allocator.free(id);
+}
+
+test "free_entry_fields frees direct runner rule fields with args without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "rule2");
+    const pattern = try allocator.dupe(u8, "log.*");
+    const executable = try allocator.dupe(u8, "/usr/bin/cmd");
+    const args = try allocator.alloc([]const u8, 2);
+    args[0] = try allocator.dupe(u8, "--flag");
+    args[1] = try allocator.dupe(u8, "value");
+    const entry = Entry{ .rule = .{
+        .identifier = id,
+        .pattern = pattern,
+        .runner = .{ .direct = .{ .executable = executable, .args = args } },
+    } };
+    free_entry_fields(entry, allocator);
+    allocator.free(id);
+}
+
+test "encode decode direct runner round trip" {
+    const args = [_][]const u8{ "--flag", "value" };
+    const rule = domain.rule.Rule{
+        .identifier = "rule1",
+        .pattern = "*.log",
+        .runner = .{ .direct = .{ .executable = "/usr/bin/cmd", .args = &args } },
+    };
+    const encoded = try encode(std.testing.allocator, .{ .rule = rule });
+    defer std.testing.allocator.free(encoded);
+    const decoded = try decode(std.testing.allocator, encoded);
+    defer std.testing.allocator.free(decoded.rule.identifier);
+    defer std.testing.allocator.free(decoded.rule.pattern);
+    defer std.testing.allocator.free(decoded.rule.runner.direct.executable);
+    defer {
+        for (decoded.rule.runner.direct.args) |arg| std.testing.allocator.free(arg);
+        std.testing.allocator.free(decoded.rule.runner.direct.args);
+    }
+    try std.testing.expectEqualStrings("rule1", decoded.rule.identifier);
+    try std.testing.expectEqualStrings("*.log", decoded.rule.pattern);
+    try std.testing.expectEqualStrings("/usr/bin/cmd", decoded.rule.runner.direct.executable);
+    try std.testing.expectEqual(@as(usize, 2), decoded.rule.runner.direct.args.len);
+    try std.testing.expectEqualStrings("--flag", decoded.rule.runner.direct.args[0]);
+    try std.testing.expectEqualStrings("value", decoded.rule.runner.direct.args[1]);
 }

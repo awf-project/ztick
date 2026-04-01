@@ -6,7 +6,7 @@ A time-based job scheduler written in Zig with hexagonal architecture, explicit 
 
 - **Core scheduler** — Time-based job execution with TCP control protocol
 - **Protocol commands** — `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, `LISTRULES`, `RULE SET`, `STAT`
-- **Rules** — Match jobs by prefix and assign shell runners
+- **Rules** — Match jobs by prefix and assign shell or direct runners
 - **Persistence** — Append-only logfile with binary encoding and automatic background compression
 - **In-memory persistence** — Ephemeral mode for CI/testing without disk I/O
 - **Configuration** — TOML-based settings for logging, listen address, framerate, and telemetry
@@ -69,7 +69,7 @@ ztick follows **hexagonal architecture** with 4 strict layers:
 |---------|---------|
 | **Job** | Execution scheduled for a specific timestamp |
 | **Rule** | Pattern matching rule that selects jobs and specifies a runner |
-| **Runner** | Execution target (shell command) |
+| **Runner** | Execution target (shell command or direct execve) |
 | **Execution** | Result of a triggered job (success/failure with metadata) |
 
 ## CLI
@@ -103,6 +103,10 @@ level = "info"              # off, error, warn, info, debug, trace
 
 [controller]
 listen = "127.0.0.1:5678"  # TCP address for protocol server
+
+[shell]
+path = "/bin/bash"          # shell binary for shell runners (default: /bin/sh)
+args = ["-c"]               # arguments passed before the command string
 
 [database]
 persistence = "logfile"     # persistence backend: "logfile" (default) or "memory"
