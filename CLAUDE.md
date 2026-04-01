@@ -8,6 +8,8 @@
 - Logfile dump must never load entire file into memory; implement sequential frame reads to comply with NFR-001 scaling constraint
 - Use Process.execute() for all background operations; never manually construct Process structs in application layer to maintain API consistency
 
+- Send ERROR response for all protocol validation failures before disconnecting; never silently close connections on parse errors like RULE SET with missing executable
+
 ## Build System
 
 - Zig 0.15.2; minimal dependencies — zig-o11y/opentelemetry-sdk for telemetry (ADR-0004), system OpenSSL for TLS (ADR-0003), stdlib for everything else
@@ -51,7 +53,6 @@
 
 ## Common Pitfalls
 
-- Always use errdefer for cleanup on error paths; free allocations in reverse acquisition order
 - Join all spawned threads in main() and block until exit; defer deinit channels for resource cleanup
 - Pass allocator as parameter to allocation functions; never use cwd() directly in background operations
 - Use atomic rename pattern for persistence writes; verify file operations before committing state
@@ -75,6 +76,10 @@
 - Add generated compression artifacts (.compressed, .to_compress) to .gitignore; never stage test output files or temporary persistence artifacts
 
 - Always log failed background compression at ERROR level with .to_compress file path; retention of orphaned compression files is required for data recovery
+
+- Always validate shell executables with execute mode (.{ .mode = .execute }), not default read-only mode; default mode misses executable permission failures that fail at runtime
+
+- Always unescape TOML escape sequences when parsing array values; skipping escape bytes and copying raw backslashes produces literal backslashes instead of unescaped values
 
 ## Test Conventions
 

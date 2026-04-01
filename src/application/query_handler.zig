@@ -80,6 +80,11 @@ pub const QueryHandler = struct {
                     switch (rule.runner) {
                         .shell => |sh| try body_buf.writer(self.allocator).print("{s} {s} shell {s}\n", .{ rule.identifier, rule.pattern, sh.command }),
                         .amqp => |mq| try body_buf.writer(self.allocator).print("{s} {s} amqp {s} {s} {s}\n", .{ rule.identifier, rule.pattern, mq.dsn, mq.exchange, mq.routing_key }),
+                        .direct => |d| {
+                            try body_buf.writer(self.allocator).print("{s} {s} direct {s}", .{ rule.identifier, rule.pattern, d.executable });
+                            for (d.args) |arg| try body_buf.writer(self.allocator).print(" {s}", .{arg});
+                            try body_buf.writer(self.allocator).writeByte('\n');
+                        },
                     }
                 }
 
@@ -474,4 +479,75 @@ test "handle list_rules instruction returns success with amqp rule fields in bod
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "amqp://localhost") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "exchange_name") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "routing.key") != null);
+}
+
+test "handle list_rules instruction returns success with direct rule without args in body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    try rule_storage.set(.{ .identifier = "rule.exec", .pattern = "deploy.", .runner = .{ .direct = .{
+        .executable = "/usr/bin/deploy",
+        .args = &.{},
+    } } });
+
+    const request = Request{
+        .client = 15,
+        .identifier = "req-15",
+        .instruction = .{ .list_rules = .{} },
+    };
+
+    const response = try handler.handle(request);
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.exec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "deploy.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "direct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "/usr/bin/deploy") != null);
+}
+
+test "handle list_rules instruction returns success with direct rule with args in body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    const args = [_][]const u8{ "-s", "http://example.com" };
+    try rule_storage.set(.{ .identifier = "rule.curl", .pattern = "fetch.", .runner = .{ .direct = .{
+        .executable = "/usr/bin/curl",
+        .args = &args,
+    } } });
+
+    const request = Request{
+        .client = 16,
+        .identifier = "req-16",
+        .instruction = .{ .list_rules = .{} },
+    };
+
+    const response = try handler.handle(request);
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.curl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "fetch.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "direct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "/usr/bin/curl") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "-s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "http://example.com") != null);
 }

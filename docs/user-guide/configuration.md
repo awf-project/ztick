@@ -123,6 +123,82 @@ openssl s_client -connect 127.0.0.1:5679 -quiet
 - Omit both to run in plaintext mode (default)
 - When TLS is disabled, the server functions identically to earlier versions — plaintext mode is fully backward compatible
 
+### `[shell]` — Shell Execution
+
+Controls which shell binary and arguments are used to execute shell runner jobs.
+
+```toml
+[shell]
+path = "/bin/bash"
+args = ["-c"]
+```
+
+**Options:**
+
+| Option | Type | Default | Notes |
+|--------|------|---------|-------|
+| `path` | string | `"/bin/sh"` | Absolute path to the shell binary; validated at startup for existence |
+| `args` | array of strings | `["-c"]` | Arguments passed to the shell before the command string |
+
+**Validation:**
+- The shell `path` must exist on disk at startup. If missing, ztick exits with a configuration error.
+- The path is checked once at startup and not re-checked at job execution time.
+
+**Examples:**
+
+```toml
+# Default (same as omitting [shell])
+[shell]
+path = "/bin/sh"
+args = ["-c"]
+
+# Use bash (common on macOS and modern Linux)
+[shell]
+path = "/bin/bash"
+args = ["-c"]
+
+# Use dash with error handling
+[shell]
+path = "/bin/dash"
+args = ["-e", "-c"]
+
+# Use a restricted shell for security
+[shell]
+path = "/usr/bin/rbash"
+args = ["-c"]
+
+# Dry-run testing (echoes commands without executing)
+[shell]
+path = "/bin/echo"
+args = []
+```
+
+#### Direct Execution Mode
+
+In addition to configurable shell execution, ztick supports a `direct` runner type that bypasses the shell entirely. Create direct runner rules via the protocol:
+
+```
+RULE SET <id> <pattern> direct <executable> [args...]
+```
+
+**Key differences from shell runners:**
+- No shell interpreter involved — command is executed directly via execve
+- Shell metacharacters (`;`, `|`, `$()`, etc.) are passed as literal arguments, not interpreted
+- First token after `direct` is the executable; remaining tokens are arguments
+- Eliminates shell injection vulnerabilities
+
+**Example:**
+
+```
+# Shell runner — vulnerable to injection
+RULE SET r1 "backup" shell "curl http://api.example.com?id=$1"
+
+# Direct runner — safe from injection
+RULE SET r2 "backup" direct /usr/bin/curl http://api.example.com?id=$1
+```
+
+In the direct runner, the arguments `["http://api.example.com?id=$1"]` are passed literally; the `$1` is not substituted.
+
 ### `[database]` — Persistence and Timing
 
 Controls how jobs and rules are stored and when they are evaluated.

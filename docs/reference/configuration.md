@@ -49,6 +49,53 @@ TCP server configuration.
 - Requires `libssl-dev` (Debian/Ubuntu) or equivalent on the build machine
 - See [README TLS section](../../README.md#tls) for certificate generation instructions
 
+### `[shell]`
+
+Shell execution configuration. Controls which shell binary and arguments are used when executing shell runner jobs.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `path` | string | `"/bin/sh"` | Absolute path to the shell binary used for shell runner execution. Validated at startup — if the path does not exist, ztick exits with `ConfigError.InvalidValue`. |
+| `args` | array of strings | `["-c"]` | Arguments passed to the shell binary before the command string. The job command is appended as the final argument. |
+
+**Startup Validation:**
+- The shell `path` must exist on disk at startup. If it does not, ztick exits immediately with a configuration error.
+- The path is validated once at startup and not re-checked at job execution time.
+
+**Configuration Examples:**
+
+```toml
+# Default (equivalent to omitting [shell] entirely)
+[shell]
+path = "/bin/sh"
+args = ["-c"]
+
+# Use bash instead of sh
+[shell]
+path = "/bin/bash"
+args = ["-c"]
+
+# Use dash with errexit for stricter error handling
+[shell]
+path = "/bin/dash"
+args = ["-e", "-c"]
+
+# Use echo for dry-run testing (executes /bin/echo <command>)
+[shell]
+path = "/bin/echo"
+args = []
+```
+
+**Direct Execution Mode:**
+
+In addition to configurable shell execution, ztick supports a `direct` runner type that bypasses the shell entirely. Direct runner rules are created via the protocol:
+
+```
+RULE SET <id> <pattern> direct <executable> [args...]
+```
+
+The first token after `direct` is the executable path; remaining tokens are passed as literal argv elements. No shell interpretation occurs, eliminating shell injection risks. This mode uses `execve` directly — shell metacharacters like `;`, `|`, and `$()` are passed as literal strings, not interpreted.
+
 ### `[database]`
 
 Persistence and scheduling configuration.
@@ -134,6 +181,10 @@ listen = "0.0.0.0:5679"
 tls_cert = "/etc/ztick/cert.pem"
 tls_key = "/etc/ztick/key.pem"
 
+[shell]
+path = "/bin/bash"
+args = ["-c"]
+
 [database]
 persistence = "logfile"
 logfile_path = "data/ztick.log"
@@ -154,6 +205,6 @@ flush_interval_ms = 10000
 |-------|-------|
 | `InvalidLogLevel` | `level` is not one of the valid values |
 | `FramerateOutOfRange` | `framerate` is 0 or exceeds 65535 |
-| `UnknownSection` | Section name is not `log`, `controller`, `database`, or `telemetry` |
+| `UnknownSection` | Section name is not `log`, `controller`, `shell`, `database`, or `telemetry` |
 | `UnknownKey` | Key is not recognized within its section |
-| `InvalidValue` | Value cannot be parsed (e.g. non-boolean for `fsync_on_persist`), or only one of `tls_cert`/`tls_key` is set, or `persistence` is not `"logfile"` or `"memory"`, or `telemetry.enabled = true` but `endpoint` is missing/malformed, or `flush_interval_ms` is not a valid u32 |
+| `InvalidValue` | Value cannot be parsed (e.g. non-boolean for `fsync_on_persist`), or only one of `tls_cert`/`tls_key` is set, or `persistence` is not `"logfile"` or `"memory"`, or `telemetry.enabled = true` but `endpoint` is missing/malformed, or `flush_interval_ms` is not a valid u32, or `shell.path` does not exist on disk, or `shell.args` is not a valid array of quoted strings |

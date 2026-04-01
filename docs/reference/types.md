@@ -109,6 +109,10 @@ pub const Runner = union(enum) {
     shell: struct {
         command: []const u8,
     },
+    direct: struct {
+        executable: []const u8,
+        args: []const []const u8,
+    },
     amqp: struct {
         dsn: []const u8,
         exchange: []const u8,
@@ -121,7 +125,12 @@ pub const Runner = union(enum) {
 
 - **shell**: Execute a command in a POSIX shell
   - Supported
-  - Example: `SHELL /usr/bin/backup.sh`
+  - Example: `shell /usr/bin/backup.sh`
+
+- **direct**: Execute a binary directly via execve without shell interpretation
+  - Supported
+  - Fields: `executable` (path to binary), `args` (literal argv elements)
+  - Example: `direct /usr/bin/curl -s http://example.com`
 
 - **amqp**: Send a message to AMQP broker
   - Deferred (not yet implemented)
@@ -275,6 +284,13 @@ Types are persisted in binary format:
   └─ if shell:
      [2 bytes: command length]
      [N bytes: command string]
+  └─ if direct:
+     [2 bytes: executable length]
+     [N bytes: executable string]
+     [2 bytes: args count (big-endian u16)]
+     for each arg:
+       [2 bytes: arg length]
+       [N bytes: arg string]
   └─ if amqp:
      [2 bytes: dsn length]
      [N bytes: dsn string]

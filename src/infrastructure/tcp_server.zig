@@ -279,10 +279,11 @@ fn handle_connection(
                     }
                 }
             } else {
-                // Send ERROR for recognized commands missing required arguments (QUERY, REMOVE, REMOVERULE)
+                // Send ERROR for recognized commands missing required arguments
                 if (result.args.len >= 1 and (std.mem.eql(u8, result.args[0], "QUERY") or
                     std.mem.eql(u8, result.args[0], "REMOVE") or
-                    std.mem.eql(u8, result.args[0], "REMOVERULE")))
+                    std.mem.eql(u8, result.args[0], "REMOVERULE") or
+                    (std.mem.eql(u8, result.args[0], "RULE") and result.args.len >= 2 and std.mem.eql(u8, result.args[1], "SET"))))
                 {
                     const msg = std.fmt.allocPrint(allocator, "{s} ERROR\n", .{result.command}) catch {
                         result.deinit(allocator);
@@ -386,6 +387,30 @@ fn build_rule_set_instruction(allocator: std.mem.Allocator, args: [][]u8) error{
             } },
         } };
     }
+    if (runner_type.len >= 2 and std.mem.eql(u8, runner_type[0], "direct")) {
+        const id = try allocator.dupe(u8, args[2]);
+        errdefer allocator.free(id);
+        const pattern = try allocator.dupe(u8, args[3]);
+        errdefer allocator.free(pattern);
+        const executable = try allocator.dupe(u8, runner_type[1]);
+        errdefer allocator.free(executable);
+        const extra_args = runner_type[2..];
+        const duped_args = try allocator.alloc([]const u8, extra_args.len);
+        errdefer allocator.free(duped_args);
+        var i: usize = 0;
+        errdefer for (duped_args[0..i]) |a| allocator.free(a);
+        while (i < extra_args.len) : (i += 1) {
+            duped_args[i] = try allocator.dupe(u8, extra_args[i]);
+        }
+        return .{ .rule_set = .{
+            .identifier = id,
+            .pattern = pattern,
+            .runner = .{ .direct = .{
+                .executable = executable,
+                .args = duped_args,
+            } },
+        } };
+    }
     return null;
 }
 
@@ -469,6 +494,11 @@ fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Ins
                     allocator.free(a.dsn);
                     allocator.free(a.exchange);
                     allocator.free(a.routing_key);
+                },
+                .direct => |d| {
+                    allocator.free(d.executable);
+                    for (d.args) |arg| allocator.free(arg);
+                    allocator.free(d.args);
                 },
             }
         },
@@ -909,10 +939,104 @@ test "build_instruction parses RULE SET command with shell runner" {
             switch (r.runner) {
                 .shell => |sh| try std.testing.expectEqualStrings("/usr/bin/backup.sh", sh.command),
                 .amqp => return error.WrongRunnerType,
+                .direct => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
     }
+}
+
+test "build_instruction parses RULE SET command with direct runner and no args" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.exec"), @constCast("exec.*"), @constCast("direct"), @constCast("/bin/echo") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .rule_set => |r| {
+            try std.testing.expectEqualStrings("rule.exec", r.identifier);
+            try std.testing.expectEqualStrings("exec.*", r.pattern);
+            switch (r.runner) {
+                .direct => |d| {
+                    try std.testing.expectEqualStrings("/bin/echo", d.executable);
+                    try std.testing.expectEqual(@as(usize, 0), d.args.len);
+                },
+                .shell => return error.WrongRunnerType,
+                .amqp => return error.WrongRunnerType,
+            }
+        },
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction parses RULE SET command with direct runner and multiple args" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.curl"), @constCast("curl.*"), @constCast("direct"), @constCast("/usr/bin/curl"), @constCast("-s"), @constCast("http://example.com") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .rule_set => |r| {
+            switch (r.runner) {
+                .direct => |d| {
+                    try std.testing.expectEqualStrings("/usr/bin/curl", d.executable);
+                    try std.testing.expectEqual(@as(usize, 2), d.args.len);
+                    try std.testing.expectEqualStrings("-s", d.args[0]);
+                    try std.testing.expectEqualStrings("http://example.com", d.args[1]);
+                },
+                .shell => return error.WrongRunnerType,
+                .amqp => return error.WrongRunnerType,
+            }
+        },
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "free_instruction_strings frees rule_set direct runner strings without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "rule.exec");
+    const pattern = try allocator.dupe(u8, "exec.*");
+    const executable = try allocator.dupe(u8, "/bin/echo");
+    const args = try allocator.alloc([]const u8, 0);
+    const instr = instruction.Instruction{ .rule_set = .{
+        .identifier = id,
+        .pattern = pattern,
+        .runner = .{ .direct = .{ .executable = executable, .args = args } },
+    } };
+    free_instruction_strings(allocator, instr);
+}
+
+test "free_instruction_strings frees rule_set direct runner with args without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "rule.curl");
+    const pattern = try allocator.dupe(u8, "curl.*");
+    const executable = try allocator.dupe(u8, "/usr/bin/curl");
+    const args = try allocator.alloc([]const u8, 2);
+    args[0] = try allocator.dupe(u8, "-s");
+    args[1] = try allocator.dupe(u8, "http://example.com");
+    const instr = instruction.Instruction{ .rule_set = .{
+        .identifier = id,
+        .pattern = pattern,
+        .runner = .{ .direct = .{ .executable = executable, .args = args } },
+    } };
+    free_instruction_strings(allocator, instr);
+}
+
+test "build_instruction returns null for RULE SET with direct runner missing executable" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.exec"), @constCast("exec.*"), @constCast("direct") };
+    const result = parser.ParseResult{
+        .command = @constCast("req1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
 }
 
 test "build_instruction returns null for SET without timestamp" {

@@ -29,6 +29,11 @@ pub fn format_entry_text(writer: anytype, entry: Entry) !void {
             switch (rule.runner) {
                 .shell => |sh| try writer.print("RULE SET {s} {s} shell {s}\n", .{ rule.identifier, rule.pattern, sh.command }),
                 .amqp => |amqp| try writer.print("RULE SET {s} {s} amqp {s} {s} {s}\n", .{ rule.identifier, rule.pattern, amqp.dsn, amqp.exchange, amqp.routing_key }),
+                .direct => |d| {
+                    try writer.print("RULE SET {s} {s} direct {s}", .{ rule.identifier, rule.pattern, d.executable });
+                    for (d.args) |arg| try writer.print(" {s}", .{arg});
+                    try writer.writeByte('\n');
+                },
             }
         },
         .job_removal => |r| try writer.print("REMOVE {s}\n", .{r.identifier}),
@@ -81,6 +86,16 @@ pub fn format_entry_json(writer: anytype, entry: Entry) !void {
                     try writer.writeAll(",\"routing_key\":");
                     try write_json_string(writer, amqp.routing_key);
                     try writer.writeAll("}}");
+                },
+                .direct => |d| {
+                    try writer.writeAll("{\"type\":\"direct\",\"executable\":");
+                    try write_json_string(writer, d.executable);
+                    try writer.writeAll(",\"args\":[");
+                    for (d.args, 0..) |arg, i| {
+                        if (i > 0) try writer.writeByte(',');
+                        try write_json_string(writer, arg);
+                    }
+                    try writer.writeAll("]}}");
                 },
             }
         },
@@ -369,6 +384,62 @@ test "write_entry with json format writes rule entry as NDJSON line" {
     try write_entry(fbs.writer(), entry, .json);
     try std.testing.expectEqualStrings(
         "{\"type\":\"rule_set\",\"identifier\":\"r1\",\"pattern\":\"* * * * *\",\"runner\":{\"type\":\"shell\",\"command\":\"notify\"}}\n",
+        fbs.getWritten(),
+    );
+}
+
+test "format_entry_text writes RULE SET line for direct runner with no args" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const rule_entry = Entry{ .rule = .{
+        .identifier = "direct-rule",
+        .pattern = "* * * * *",
+        .runner = .{ .direct = .{ .executable = "/usr/bin/notify-send", .args = &.{} } },
+    } };
+    try format_entry_text(fbs.writer(), rule_entry);
+    try std.testing.expectEqualStrings("RULE SET direct-rule * * * * * direct /usr/bin/notify-send\n", fbs.getWritten());
+}
+
+test "format_entry_text writes RULE SET line for direct runner with args" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const args = [_][]const u8{ "-s", "http://example.com" };
+    const rule_entry = Entry{ .rule = .{
+        .identifier = "curl-rule",
+        .pattern = "0 * * * *",
+        .runner = .{ .direct = .{ .executable = "/usr/bin/curl", .args = &args } },
+    } };
+    try format_entry_text(fbs.writer(), rule_entry);
+    try std.testing.expectEqualStrings("RULE SET curl-rule 0 * * * * direct /usr/bin/curl -s http://example.com\n", fbs.getWritten());
+}
+
+test "format_entry_json writes rule_set object with direct runner and no args" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const rule_entry = Entry{ .rule = .{
+        .identifier = "direct-rule",
+        .pattern = "* * * * *",
+        .runner = .{ .direct = .{ .executable = "/usr/bin/notify-send", .args = &.{} } },
+    } };
+    try format_entry_json(fbs.writer(), rule_entry);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"rule_set\",\"identifier\":\"direct-rule\",\"pattern\":\"* * * * *\",\"runner\":{\"type\":\"direct\",\"executable\":\"/usr/bin/notify-send\",\"args\":[]}}",
+        fbs.getWritten(),
+    );
+}
+
+test "format_entry_json writes rule_set object with direct runner and args" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const args = [_][]const u8{ "-s", "http://example.com" };
+    const rule_entry = Entry{ .rule = .{
+        .identifier = "curl-rule",
+        .pattern = "0 * * * *",
+        .runner = .{ .direct = .{ .executable = "/usr/bin/curl", .args = &args } },
+    } };
+    try format_entry_json(fbs.writer(), rule_entry);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"rule_set\",\"identifier\":\"curl-rule\",\"pattern\":\"0 * * * *\",\"runner\":{\"type\":\"direct\",\"executable\":\"/usr/bin/curl\",\"args\":[\"-s\",\"http://example.com\"]}}",
         fbs.getWritten(),
     );
 }
