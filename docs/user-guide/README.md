@@ -16,11 +16,18 @@ Task-oriented how-to guides for common ztick operations.
   - Rule management and removal with `REMOVERULE`
   - Best practices
 
+- **[Configuring Authentication](authentication.md)** — Token-based client authentication
+  - Auth file setup with secrets and namespaces
+  - Namespace enforcement and filtering
+  - Multi-tenant isolation
+  - Client examples and troubleshooting
+
 - **[Configuration](configuration.md)** — Customize behavior
   - Logging levels
   - TCP server settings
   - TLS encryption setup
   - Persistence and evaluation frequency
+  - Authentication setup
 
 - **[Inspecting Logfiles](inspecting-logfiles.md)** — Dump and analyze the binary logfile
   - Human-readable text output

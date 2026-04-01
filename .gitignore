@@ -22,6 +22,7 @@ ztick.log
 *.bak
 *.db
 test_debug_log.db
+test_timing
 
 npm-cache/
 

@@ -55,6 +55,7 @@ listen = "127.0.0.1:5678"
 | Option | Type | Default | Notes |
 |--------|------|---------|-------|
 | `listen` | string | `127.0.0.1:5678` | TCP address and port to listen on |
+| `auth_file` | string (path) | (optional) | Path to TOML auth token file (authentication disabled if unset) |
 | `tls_cert` | string (path) | (optional) | Path to PEM-encoded TLS certificate |
 | `tls_key` | string (path) | (optional) | Path to PEM-encoded TLS private key |
 
@@ -73,12 +74,48 @@ listen = "[::1]:5678"
 [controller]
 listen = "127.0.0.1:9999"
 
+# Enable authentication
+[controller]
+listen = "127.0.0.1:5678"
+auth_file = "auth.toml"
+
 # Enable TLS encryption (use port 5679 by convention)
 [controller]
 listen = "127.0.0.1:5679"
 tls_cert = "/etc/ztick/cert.pem"
 tls_key = "/etc/ztick/key.pem"
+
+# Enable both authentication and TLS (recommended for production)
+[controller]
+listen = "127.0.0.1:5679"
+auth_file = "auth.toml"
+tls_cert = "/etc/ztick/cert.pem"
+tls_key = "/etc/ztick/key.pem"
 ```
+
+### Setting Up Client Authentication
+
+ztick supports optional token-based client authentication. When `auth_file` is configured, all TCP connections must authenticate with the `AUTH` command before issuing other commands.
+
+For detailed setup instructions and examples, see [Configuring Authentication](authentication.md).
+
+**Quick setup:**
+
+1. Create an auth file with tokens and secrets:
+   ```toml
+   # auth.toml
+   [token.deploy]
+   secret = "sk_deploy_a1b2c3d4e5f6"
+   namespace = "deploy."
+   ```
+
+2. Reference it in your ztick config:
+   ```toml
+   [controller]
+   auth_file = "auth.toml"
+   ```
+
+3. Restart the server — all connections now require `AUTH <secret>` as the first command
 
 ### Setting Up TLS
 
@@ -359,6 +396,32 @@ service_name = "ztick"
 flush_interval_ms = 5000
 ```
 
+**Persistent deployment with authentication and TLS:**
+
+```toml
+[log]
+level = "info"
+
+[controller]
+listen = "127.0.0.1:5679"
+auth_file = "auth.toml"
+tls_cert = "/etc/ztick/cert.pem"
+tls_key = "/etc/ztick/key.pem"
+
+[database]
+persistence = "logfile"
+fsync_on_persist = true
+framerate = 512
+logfile_path = "logfile"
+compression_interval = 3600
+
+[telemetry]
+enabled = true
+endpoint = "http://localhost:4318"
+service_name = "ztick"
+flush_interval_ms = 5000
+```
+
 **Ephemeral deployment (CI/testing):**
 
 ```toml
@@ -444,6 +507,7 @@ level = "warn"
 
 [controller]
 listen = "0.0.0.0:5679"
+auth_file = "/etc/ztick/auth.toml"
 tls_cert = "/etc/ztick/cert.pem"
 tls_key = "/etc/ztick/key.pem"
 
@@ -462,6 +526,7 @@ flush_interval_ms = 10000
 
 - Minimal logging (errors and warnings only)
 - Listen on all interfaces with TLS encryption (port 5679)
+- Client authentication enabled with token file
 - Durable logfile persistence
 - Telemetry enabled for observability and alerting
 

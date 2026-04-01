@@ -80,7 +80,7 @@ pub const ShellRunner = struct {
 
 fn execute_http(allocator: std.mem.Allocator, method_str: []const u8, url: []const u8, req: execution.Request) execution.Response {
     return execute_http_inner(allocator, method_str, url, req) catch {
-        std.log.warn("http runner: {s} {s} connection failed", .{ method_str, url });
+        std.log.debug("http runner: {s} {s} connection failed", .{ method_str, url });
         return .{ .identifier = req.identifier, .success = false };
     };
 }
@@ -151,7 +151,7 @@ fn execute_http_inner(allocator: std.mem.Allocator, method_str: []const u8, url:
 
     const status = response.head.status;
     if (status.class() != .success) {
-        std.log.warn("http runner: {s} {s} returned {d}", .{ method_str, url, @intFromEnum(status) });
+        std.log.debug("http runner: {s} {s} returned {d}", .{ method_str, url, @intFromEnum(status) });
     }
 
     return .{ .identifier = req.identifier, .success = status.class() == .success };

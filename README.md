@@ -13,9 +13,10 @@ This is an **explicit push model** — the application drives, ztick executes. T
 ## Features
 
 - **Core scheduler** — Time-based job execution with TCP control protocol
-- **Protocol commands** — `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, `LISTRULES`, `RULE SET`, `STAT`
+- **Protocol commands** — `AUTH`, `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, `LISTRULES`, `RULE SET`, `STAT`
 - **Rules** — Match jobs by prefix and assign shell, direct, HTTP webhook, or AWF workflow runners
 - **HTTP webhooks** — Trigger external services via GET/POST/PUT/DELETE requests with JSON payloads
+- **Client authentication** — Token-based AUTH handshake with namespace-scoped authorization
 - **Persistence** — Append-only logfile with binary encoding and automatic background compression
 - **In-memory persistence** — Ephemeral mode for CI/testing without disk I/O
 - **Configuration** — TOML-based settings for logging, listen address, framerate, and telemetry
@@ -115,6 +116,7 @@ level = "info"              # off, error, warn, info, debug, trace
 
 [controller]
 listen = "127.0.0.1:5678"  # TCP address for protocol server
+auth_file = "auth.toml"     # optional: path to auth token file (disabled if unset)
 
 [shell]
 path = "/bin/bash"          # shell binary for shell runners (default: /bin/sh)
@@ -127,6 +129,35 @@ fsync_on_persist = true     # fsync after each persist write (logfile mode only)
 framerate = 512             # scheduler tick rate (1-65535)
 compression_interval = 3600 # seconds between logfile compression (0 to disable, logfile mode only)
 ```
+
+### Authentication
+
+ztick supports optional token-based client authentication. When `auth_file` is configured in the `[controller]` section, all TCP connections must authenticate with the `AUTH` command before issuing other commands.
+
+**Auth File Format (TOML):**
+
+```toml
+[token.deploy]
+secret = "sk_deploy_a1b2c3d4e5f6"
+namespace = "deploy."
+
+[token.backup]
+secret = "sk_backup_x9y8z7w6v5u4"
+namespace = "*"
+```
+
+- Each `[token.<name>]` section defines a token with a `secret` and `namespace`
+- `secret` — Any string value (treated as plaintext)
+- `namespace` — Prefix that restricts which jobs/rules the token can access, or `"*"` for unrestricted access
+
+When authentication is disabled (no `auth_file` configured), all connections are accepted without the AUTH step — this is the default and maintains backward compatibility.
+
+**Token Namespaces:**
+- A token with namespace `deploy.` can only access jobs/rules matching the prefix (e.g., `deploy.daily`, `deploy.release.1`)
+- A token with namespace `*` can access all jobs/rules
+- Commands targeting identifiers outside the token's namespace are rejected with `ERROR`
+
+See [Configuring Authentication](docs/user-guide/authentication.md) for setup and examples.
 
 ### Telemetry
 

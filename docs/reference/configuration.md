@@ -33,6 +33,7 @@ TCP server configuration.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `listen` | string | `"127.0.0.1:5678"` | TCP address and port for the protocol server |
+| `auth_file` | string (path) | `null` | Path to TOML auth token file. When set, all connections require AUTH command before accepting other commands. When unset (default), authentication is disabled and connections are accepted immediately. |
 | `tls_cert` | string (path) | `null` | Path to PEM-encoded TLS certificate file (requires `tls_key` to be set) |
 | `tls_key` | string (path) | `null` | Path to PEM-encoded TLS private key file (requires `tls_cert` to be set) |
 
@@ -41,11 +42,20 @@ TCP server configuration.
 - `0.0.0.0:5678` — All interfaces (IPv4)
 - `[::1]:5678` — Localhost only (IPv6)
 
+**Authentication Configuration Notes:**
+- When `auth_file` is set, the server requires all clients to authenticate before issuing commands
+- The auth file uses TOML format with `[token.<name>]` sections containing `secret` and `namespace` keys
+- Secrets are matched using constant-time comparison to prevent timing attacks
+- Tokens are loaded once at startup; changes require a server restart
+- Omit `auth_file` to disable authentication (default for backward compatibility)
+- See [Configuring Authentication](../user-guide/authentication.md) for setup instructions and examples
+
 **TLS Configuration Notes:**
 - Both `tls_cert` and `tls_key` must be set together to enable TLS
 - If only one is set, ztick exits with `ConfigError.InvalidValue` at startup
 - Omit both to run in plaintext mode (default)
 - By convention, use port `5678` for plaintext and port `5679` for TLS to avoid confusion between encrypted and unencrypted endpoints
+- **Important**: When using authentication, TLS is **strongly recommended** to prevent tokens from being transmitted in plaintext
 - Requires `libssl-dev` (Debian/Ubuntu) or equivalent on the build machine
 - See [README TLS section](../../README.md#tls) for certificate generation instructions
 
@@ -208,3 +218,6 @@ flush_interval_ms = 10000
 | `UnknownSection` | Section name is not `log`, `controller`, `shell`, `database`, or `telemetry` |
 | `UnknownKey` | Key is not recognized within its section |
 | `InvalidValue` | Value cannot be parsed (e.g. non-boolean for `fsync_on_persist`), or only one of `tls_cert`/`tls_key` is set, or `persistence` is not `"logfile"` or `"memory"`, or `telemetry.enabled = true` but `endpoint` is missing/malformed, or `flush_interval_ms` is not a valid u32, or `shell.path` does not exist on disk, or `shell.args` is not a valid array of quoted strings |
+| `MissingSecret` | Auth file: a `[token.*]` section is missing the `secret` key |
+| `EmptyNamespace` | Auth file: a `[token.*]` section has an empty `namespace` or is missing it |
+| `DuplicateSecret` | Auth file: two or more tokens share the same `secret` value |

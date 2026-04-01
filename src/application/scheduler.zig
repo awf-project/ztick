@@ -275,7 +275,7 @@ pub const Scheduler = struct {
                     self.active_process = null;
                 },
                 .failure => {
-                    std.log.warn("compression: background compression failed, retaining .to_compress for next cycle", .{});
+                    std.log.debug("compression: background compression failed, retaining .to_compress for next cycle", .{});
                     proc.deinit();
                     self.active_process = null;
                 },

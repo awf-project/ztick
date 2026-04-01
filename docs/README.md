@@ -14,7 +14,8 @@ Practical how-to guides for common operations.
 
 - **[Creating Jobs](user-guide/creating-jobs.md)** — Define jobs with execution times and query by prefix
 - **[Writing Rules](user-guide/writing-rules.md)** — Pattern-match jobs to actions
-- **[Configuration](user-guide/configuration.md)** — Set up logging, listen addresses, persistence, and TLS encryption
+- **[Configuring Authentication](user-guide/authentication.md)** — Set up token-based client authentication with namespace isolation
+- **[Configuration](user-guide/configuration.md)** — Set up logging, listen addresses, persistence, TLS encryption, and authentication
 - **[Inspecting Logfiles](user-guide/inspecting-logfiles.md)** — Dump, export, and live-tail the binary persistence logfile
 - **[Monitoring Health](user-guide/monitoring-health.md)** — Check server status and inspect execution pipeline
 
