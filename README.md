@@ -2,6 +2,14 @@
 
 A time-based job scheduler written in Zig with hexagonal architecture, explicit memory management, and minimal dependencies.
 
+## Why ztick?
+
+Periodic schedulers (cron, systemd timers) trigger work at fixed intervals regardless of the target system's state. When load is already high, they make it worse.
+
+ztick inverts this logic: the application decides when to schedule a job based on its own state. It sends a `SET` command over TCP at the moment it sees fit, and ztick faithfully executes it at the requested time.
+
+This is an **explicit push model** — the application drives, ztick executes. There is intentionally no built-in periodic trigger mechanism.
+
 ## Features
 
 - **Core scheduler** — Time-based job execution with TCP control protocol
