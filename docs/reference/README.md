@@ -8,6 +8,7 @@ Technical specification and API documentation for ztick.
 - **[Protocol](protocol.md)** — Client communication format and commands
 - **[Data Types](types.md)** — Core domain structures
 - **[Persistence Format](persistence.md)** — Binary logfile encoding
+- **[HTTP API (OpenAPI)](../../openapi.yaml)** — OpenAPI v3.1.1 specification for the REST API
 
 ## Quick Links
 
@@ -55,7 +56,7 @@ ztick dump <logfile>                    # Inspect binary logfile
 |------|---------|---------|
 | **Job** | Scheduled action with timestamp | `app.backup.daily` at `1711612800` |
 | **Rule** | Pattern match + runner mapping | `backup.*` → `SHELL /bin/backup.sh` |
-| **Runner** | Execution target | `SHELL`, `HTTP`, `AMQP` |
+| **Runner** | Execution target | `SHELL`, `DIRECT` |
 | **Execution** | Job result (success/failure) | Tracking and logging |
 
 ### Persistence

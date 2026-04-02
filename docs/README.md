@@ -23,7 +23,8 @@ Practical how-to guides for common operations.
 Complete technical specification and API documentation.
 
 - **[Configuration Schema](reference/configuration.md)** — All TOML options and defaults
-- **[Protocol](reference/protocol.md)** — Client communication protocol
+- **[HTTP API](reference/http-api.md)** — RESTful API endpoints, authentication, and examples
+- **[Protocol](reference/protocol.md)** — Native TCP protocol reference
 - **[Data Types](reference/types.md)** — Job, Rule, Runner, Execution structures
 - **[Persistence Format](reference/persistence.md)** — Binary logfile encoding
 

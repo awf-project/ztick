@@ -2,6 +2,8 @@
 
 Complete specification of all core ztick data types.
 
+> **HTTP API Users**: These Zig types correspond directly to the HTTP API schemas defined in [openapi.yaml](../../openapi.yaml) and documented in the [HTTP API Reference](http-api.md). The HTTP API uses the field names shown in the "HTTP Schema" sections below.
+
 ## Core Types
 
 ### Job
@@ -21,13 +23,16 @@ pub const Job = struct {
 - **identifier** (string): Unique identifier for this job
   - Alphanumeric, dots allowed
   - Example: `app.job.123`, `backup.daily`, `report.monthly`
+  - HTTP API field name: `id`
 
 - **execution** (i64): Unix timestamp in nanoseconds
   - `1711612800000000000` = 2024-03-28 12:00:00 UTC
   - Used for precise timing (nanosecond resolution)
   - Persisted as big-endian i64 in logfiles
+  - HTTP API field name: `execution` (response as nanoseconds, request as ISO 8601 string)
 
 - **status** (JobStatus): Current state (see below)
+  - HTTP API field name: `status`
 
 **Lifecycle**:
 
@@ -86,12 +91,15 @@ pub const Rule = struct {
 **Fields**:
 
 - **identifier**: Unique rule name (typically the pattern)
+  - HTTP API field name: `id`
 - **pattern**: Prefix pattern matching job identifiers
   - `supports()` returns the pattern length (as weight) if the job identifier starts with the pattern, `null` otherwise
   - Longer patterns take priority (more specific match wins)
   - Example: `SETRULE backup. SHELL /bin/backup.sh` matches `backup.daily`, `backup.weekly`, etc.
+  - HTTP API field name: `pattern`
 
 - **runner**: Execution target (see Runner below)
+  - HTTP API field name: `runner` (as discriminated union)
 
 **Pattern Matching Examples**:
 
@@ -124,17 +132,20 @@ pub const Runner = union(enum) {
 **Types**:
 
 - **shell**: Execute a command in a POSIX shell
-  - Supported
+  - Supported via TCP protocol and HTTP API
+  - HTTP schema: `{"type": "shell", "command": "..."}`
   - Example: `shell /usr/bin/backup.sh`
 
 - **direct**: Execute a binary directly via execve without shell interpretation
-  - Supported
+  - Supported via TCP protocol and HTTP API
   - Fields: `executable` (path to binary), `args` (literal argv elements)
+  - HTTP schema: `{"type": "direct", "executable": "...", "args": [...]}`
   - Example: `direct /usr/bin/curl -s http://example.com`
 
 - **amqp**: Send a message to AMQP broker
-  - Deferred (not yet implemented)
+  - Supported via TCP protocol only (not exposed in HTTP API)
   - Fields: `dsn` (connection string), `exchange`, `routing_key`
+  - Deferred: Consider for future HTTP API expansion
 
 ### Instruction
 
