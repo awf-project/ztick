@@ -10,6 +10,10 @@
 
 - Send ERROR response for all protocol validation failures before disconnecting; never silently close connections on parse errors like RULE SET with missing executable
 
+- Authenticated HTTP endpoints must explicitly include 401 Unauthorized response schemas in OpenAPI specs; inherited security definitions don't auto-document client error handling paths
+
+- Maintain CRUD endpoint parity in OpenAPI specs; if GET /jobs/{id} exists, corresponding GET /rules/{id} must exist or be explicitly documented as omitted in spec comments
+
 ## Build System
 
 - Zig 0.15.2; minimal dependencies — zig-o11y/opentelemetry-sdk for telemetry (ADR-0004), system OpenSSL for TLS (ADR-0003), stdlib for everything else
@@ -53,7 +57,6 @@
 
 ## Common Pitfalls
 
-- Join all spawned threads in main() and block until exit; defer deinit channels for resource cleanup
 - Pass allocator as parameter to allocation functions; never use cwd() directly in background operations
 - Use atomic rename pattern for persistence writes; verify file operations before committing state
 - Use per-connection response channels; never share a response channel across concurrent connections
@@ -81,6 +84,8 @@
 
 - Always unescape TOML escape sequences when parsing array values; skipping escape bytes and copying raw backslashes produces literal backslashes instead of unescaped values
 
+- Never duplicate specification details across files (openapi.yaml, http-api.md, types.md); maintain single source of truth per spec element (schema descriptions, format rules, field definitions)
+
 ## Test Conventions
 
 - Co-locate unit tests in test blocks within source files; use functional_tests.zig for integration tests
@@ -93,3 +98,4 @@
 - Normalize all function names to snake_case, including private functions; remove dead code completely
 - Verify implementation matches the original specification (e.g., protocol format, timestamp parsing, command definitions)
 - Never name tests after implementation internals (e.g., 'has no payload'); name them after observable behavior from the caller's perspective (e.g., 'returns formatted rules')
+- HTTP DELETE operations must return 204 No Content for successful deletions; return 200 only when response body is present (violates client expectations)

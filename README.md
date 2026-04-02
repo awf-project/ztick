@@ -22,6 +22,7 @@ This is an **explicit push model** — the application drives, ztick executes. T
 - **TLS support** — Optional TLS 1.3 encryption via system OpenSSL
 - **Logfile dump** — Offline inspection with text/JSON output, compact mode, and live tail
 - **OpenTelemetry** — Traces and metrics exported via OTLP/HTTP to observability collectors
+- **OpenAPI contract** — Machine-readable API specification (`openapi.yaml`) for the HTTP controller
 
 ## Quick Start
 
@@ -46,7 +47,9 @@ zig build run -- -c /path/to/config  # run with config file
 ## Documentation
 
 - **[User Guide](docs/user-guide/)** — How-to guides for common tasks
-- **[Reference](docs/reference/)** — Full configuration and protocol reference
+- **[Reference](docs/reference/)** — Configuration, HTTP API, protocol, and data types
+  - **[HTTP API](docs/reference/http-api.md)** — REST endpoints and authentication
+  - **[OpenAPI Specification](openapi.yaml)** — Machine-readable v3.1.1 contract
 - **[ADRs](docs/ADR/)** — Architecture Decision Records
 
 ## Architecture

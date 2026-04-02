@@ -21,5 +21,7 @@ ztick.log
 *.db
 test_debug_log.db
 
+npm-cache/
+
 .grepai/
 .specify/
