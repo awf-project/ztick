@@ -122,6 +122,7 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = true,
         });
         san_module.addImport("opentelemetry", otel_module);
+        san_module.addEmbedPath(b.path("."));
         const san_test = b.addTest(.{ .root_module = san_module });
         if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(san_test);
         const run_san_test = b.addRunArtifact(san_test);

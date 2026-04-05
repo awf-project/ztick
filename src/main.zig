@@ -18,6 +18,7 @@ const infrastructure_channel = @import("infrastructure/channel.zig");
 const infrastructure_clock = @import("infrastructure/clock.zig");
 const infrastructure_shell_runner = @import("infrastructure/shell_runner.zig");
 const infrastructure_tcp_server = @import("infrastructure/tcp_server.zig");
+const infrastructure_http = @import("infrastructure/http.zig");
 const infrastructure_tls_context = @import("infrastructure/tls_context.zig");
 const infrastructure_telemetry = @import("infrastructure/telemetry.zig");
 const infrastructure_persistence_background = @import("infrastructure/persistence/background.zig");
@@ -89,6 +90,7 @@ test {
     _ = infrastructure_clock;
     _ = infrastructure_shell_runner;
     _ = infrastructure_tcp_server;
+    _ = infrastructure_http;
     _ = infrastructure_tls_context;
     _ = infrastructure_telemetry;
     _ = infrastructure_persistence_background;
@@ -144,6 +146,29 @@ const ProcessorContext = struct {
     exec_response_ch: *Channel(execution.Response),
     shell_config: interfaces_config.ShellConfig,
 };
+
+const HttpControllerContext = struct {
+    allocator: std.mem.Allocator,
+    address: []const u8,
+    request_ch: *Channel(query.Request),
+    response_router: *ResponseRouter,
+    running: *std.atomic.Value(bool),
+    bearer_token: ?[]const u8,
+};
+
+fn run_http_controller(ctx: HttpControllerContext) void {
+    var server = infrastructure_http.HttpServer.init(
+        ctx.allocator,
+        ctx.address,
+        ctx.running,
+        ctx.request_ch,
+        ctx.response_router,
+        ctx.bearer_token,
+    );
+    server.start() catch |err| {
+        std.log.err("http controller: start failed: {}", .{err});
+    };
+}
 
 fn run_controller(ctx: ControllerContext) void {
     var server = TcpServer.init(ctx.allocator, ctx.address, ctx.running, ctx.tls_context, ctx.active_connections);
@@ -974,6 +999,18 @@ pub fn main() !void {
         .active_connections = &active_connections,
     }});
 
+    const http_thread: ?std.Thread = if (cfg.http_listen) |http_addr| blk: {
+        std.log.info("HTTP listening on {s}", .{http_addr});
+        break :blk try std.Thread.spawn(.{}, run_http_controller, .{HttpControllerContext{
+            .allocator = allocator,
+            .address = http_addr,
+            .request_ch = &query_request_ch,
+            .response_router = &response_router,
+            .running = &running,
+            .bearer_token = null,
+        }});
+    } else null;
+
     const backend: persistence_backend.PersistenceBackend = switch (cfg.database_persistence) {
         .logfile => .{ .logfile = .{
             .logfile_path = cfg.database_logfile_path,
@@ -1012,6 +1049,8 @@ pub fn main() !void {
     }});
 
     controller_thread.join();
+
+    if (http_thread) |ht| ht.join();
 
     running.store(false, .release);
     query_request_ch.close();

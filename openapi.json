@@ -1,0 +1,528 @@
+{
+  "openapi": "3.1.1",
+  "info": {
+    "title": "ztick HTTP API",
+    "description": "RESTful API for managing scheduled jobs and rules in ztick.",
+    "version": "0.1.0",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:5680",
+      "description": "Default local instance"
+    }
+  ],
+  "security": [
+    {
+      "BearerAuth": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "operationId": "getHealth",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Server is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "OpenAPI specification",
+        "operationId": "getOpenApiSpec",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "OpenAPI v3 specification",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs/{id}": {
+      "put": {
+        "summary": "Create or update a job",
+        "operationId": "putJob",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ResourceId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Job created or updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "get": {
+        "summary": "Get a job by ID",
+        "operationId": "getJob",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ResourceId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Job not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a job",
+        "operationId": "deleteJob",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ResourceId"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Job deleted"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Job not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/jobs": {
+      "get": {
+        "summary": "List jobs by prefix",
+        "operationId": "listJobs",
+        "parameters": [
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter jobs whose ID starts with this prefix. When omitted, returns all jobs."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of matching jobs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Job"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/rules/{id}": {
+      "put": {
+        "summary": "Create or update a rule",
+        "operationId": "putRule",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ResourceId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RuleInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Rule created or updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Rule"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a rule",
+        "operationId": "deleteRule",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ResourceId"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Rule deleted"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Rule not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rules": {
+      "get": {
+        "summary": "List rules by prefix",
+        "operationId": "listRules",
+        "parameters": [
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter rules whose ID starts with this prefix. When omitted, returns all rules."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of matching rules",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Rule"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing or invalid authentication token",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Token-based authentication. Required when `auth_file` is configured. The token value must match a secret defined in the auth file."
+      }
+    },
+    "parameters": {
+      "ResourceId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        },
+        "description": "Resource identifier (e.g. \"deploy.v1\", \"notify-slack\")"
+      }
+    },
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ]
+          }
+        }
+      },
+      "Job": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "execution"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Job identifier",
+            "example": "deploy.v1"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "triggered",
+              "executed",
+              "failed"
+            ],
+            "description": "Current job status"
+          },
+          "execution": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Execution timestamp in nanoseconds since Unix epoch",
+            "example": 1744286400000000000
+          }
+        }
+      },
+      "JobInput": {
+        "type": "object",
+        "required": [
+          "execution"
+        ],
+        "properties": {
+          "execution": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Execution timestamp as ISO 8601 string (must include timezone designator)",
+            "example": "2026-04-10T12:00:00Z"
+          }
+        }
+      },
+      "Rule": {
+        "type": "object",
+        "required": [
+          "id",
+          "pattern",
+          "runner"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Rule identifier",
+            "example": "notify-slack"
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Job ID prefix pattern to match",
+            "example": "deploy."
+          },
+          "runner": {
+            "$ref": "#/components/schemas/Runner"
+          }
+        }
+      },
+      "RuleInput": {
+        "type": "object",
+        "required": [
+          "pattern",
+          "runner"
+        ],
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Job ID prefix pattern to match",
+            "example": "deploy."
+          },
+          "runner": {
+            "$ref": "#/components/schemas/Runner"
+          }
+        }
+      },
+      "Runner": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ShellRunner"
+          },
+          {
+            "$ref": "#/components/schemas/DirectRunner"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "shell": "#/components/schemas/ShellRunner",
+            "direct": "#/components/schemas/DirectRunner"
+          }
+        }
+      },
+      "ShellRunner": {
+        "type": "object",
+        "required": [
+          "type",
+          "command"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "shell"
+            ]
+          },
+          "command": {
+            "type": "string",
+            "description": "Shell command to execute",
+            "example": "/usr/bin/notify --channel ops"
+          }
+        }
+      },
+      "DirectRunner": {
+        "type": "object",
+        "required": [
+          "type",
+          "executable",
+          "args"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "direct"
+            ]
+          },
+          "executable": {
+            "type": "string",
+            "description": "Path to executable",
+            "example": "/usr/bin/curl"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Command-line arguments",
+            "example": [
+              "-s",
+              "http://example.com/webhook"
+            ]
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Human-readable error message",
+            "example": "job not found"
+          }
+        }
+      }
+    }
+  }
+}
