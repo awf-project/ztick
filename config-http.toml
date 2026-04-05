@@ -1,0 +1,11 @@
+[log]
+level = "debug"
+
+[controller]
+listen = "127.0.0.1:5678"
+
+[http]
+listen = "127.0.0.1:5680"
+
+[database]
+persistence = "memory"

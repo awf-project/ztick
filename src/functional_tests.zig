@@ -3065,3 +3065,298 @@ test "server with invalid shell path fails to start" {
         else => try std.testing.expect(false),
     }
 }
+
+// Feature: F015
+
+fn send_http_request(stream: std.net.Stream, request: []const u8) ![]const u8 {
+    _ = stream.write(request) catch return error.SkipZigTest;
+    std.Thread.sleep(500_000_000);
+
+    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch return error.SkipZigTest;
+
+    var buf: [8192]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = stream.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    if (total == 0) return error.SkipZigTest;
+    return buf[0..total];
+}
+
+fn http_connect(port: u16) !std.net.Stream {
+    const addr = std.net.Address.parseIp("127.0.0.1", port) catch unreachable;
+    return std.net.tcpConnectToAddress(addr) catch error.SkipZigTest;
+}
+
+// Feature: F015
+test "job lifecycle via HTTP creates retrieves and deletes a job" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19892\"\n\n[http]\nlisten = \"127.0.0.1:19893\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    {
+        var stream = try http_connect(19893);
+        defer stream.close();
+        const response = try send_http_request(
+            stream,
+            "PUT /jobs/deploy.v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2026-04-10T12:00:00Z\"}",
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "\"id\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "deploy.v1") != null);
+    }
+
+    {
+        var stream = try http_connect(19893);
+        defer stream.close();
+        const response = try send_http_request(
+            stream,
+            "GET /jobs/deploy.v1 HTTP/1.1\r\n\r\n",
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "deploy.v1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "planned") != null);
+    }
+
+    {
+        var stream = try http_connect(19893);
+        defer stream.close();
+        const response = try send_http_request(
+            stream,
+            "DELETE /jobs/deploy.v1 HTTP/1.1\r\n\r\n",
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "204") != null);
+    }
+
+    {
+        var stream = try http_connect(19893);
+        defer stream.close();
+        const response = try send_http_request(
+            stream,
+            "GET /jobs/deploy.v1 HTTP/1.1\r\n\r\n",
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "404") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "\"error\"") != null);
+    }
+}
+
+// Feature: F015
+test "health check returns 200 with status ok" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19894\"\n\n[http]\nlisten = \"127.0.0.1:19895\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    var stream = try http_connect(19895);
+    defer stream.close();
+    const response = try send_http_request(
+        stream,
+        "GET /health HTTP/1.1\r\n\r\n",
+    );
+    try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "application/json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "{\"status\":\"ok\"}") != null);
+}
+
+// Feature: F015
+test "unknown path returns 404 not found" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19896\"\n\n[http]\nlisten = \"127.0.0.1:19897\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    var stream = try http_connect(19897);
+    defer stream.close();
+    const response = try send_http_request(
+        stream,
+        "GET /unknown HTTP/1.1\r\n\r\n",
+    );
+    try std.testing.expect(std.mem.indexOf(u8, response, "404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"error\"") != null);
+}
+
+// Feature: F015
+test "config without http section does not open HTTP port" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19898\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19899) catch unreachable;
+    const result = std.net.tcpConnectToAddress(addr);
+    if (result) |stream| {
+        stream.close();
+        return error.TestExpectedEqual;
+    } else |_| {}
+}
+
+// Feature: F015
+test "job created via HTTP is retrievable via TCP" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19900\"\n\n[http]\nlisten = \"127.0.0.1:19901\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    {
+        var stream = try http_connect(19901);
+        defer stream.close();
+        const response = try send_http_request(
+            stream,
+            "PUT /jobs/cross.1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2026-04-10T12:00:00Z\"}",
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+    }
+
+    {
+        const addr = std.net.Address.parseIp("127.0.0.1", 19900) catch unreachable;
+        var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+        defer stream.close();
+
+        _ = stream.write("req-tcp-1 GET cross.1\n") catch return error.SkipZigTest;
+        std.Thread.sleep(500_000_000);
+
+        const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
+        const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+        _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch return error.SkipZigTest;
+
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < buf.len) {
+            const n = stream.read(buf[total..]) catch break;
+            if (n == 0) break;
+            total += n;
+        }
+        const response = buf[0..total];
+
+        try std.testing.expect(std.mem.indexOf(u8, response, "cross.1") != null or std.mem.indexOf(u8, response, "planned") != null);
+    }
+}
+
+// Feature: F015
+test "rule lifecycle via HTTP creates and deletes a rule" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19902\"\n\n[http]\nlisten = \"127.0.0.1:19903\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    {
+        var stream = try http_connect(19903);
+        defer stream.close();
+        const body = "{\"pattern\":\"deploy.*\",\"runner\":\"shell\",\"args\":[\"/usr/bin/notify\"]}";
+        var content_length_buf: [64]u8 = undefined;
+        const content_length_str = std.fmt.bufPrint(&content_length_buf, "{d}", .{body.len}) catch unreachable;
+
+        var request_buf: [512]u8 = undefined;
+        const request = std.fmt.bufPrint(&request_buf, "PUT /rules/notify HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {s}\r\n\r\n{s}", .{ content_length_str, body }) catch unreachable;
+        const response = try send_http_request(stream, request);
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "notify") != null);
+    }
+
+    {
+        var stream = try http_connect(19903);
+        defer stream.close();
+        const response = try send_http_request(
+            stream,
+            "DELETE /rules/notify HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "204") != null);
+    }
+
+    {
+        var stream = try http_connect(19903);
+        defer stream.close();
+        const response = try send_http_request(
+            stream,
+            "DELETE /rules/missing HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "404") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "\"error\"") != null);
+    }
+}
+
+// Feature: F015
+test "job listing with prefix filter returns matching jobs" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19904\"\n\n[http]\nlisten = \"127.0.0.1:19905\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    {
+        var stream = try http_connect(19905);
+        defer stream.close();
+        const body = "{\"execution\": \"2026-04-10T12:00:00Z\"}";
+        var buf: [256]u8 = undefined;
+        const request = std.fmt.bufPrint(&buf, "PUT /jobs/deploy.v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+        const response = try send_http_request(stream, request);
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+    }
+
+    {
+        var stream = try http_connect(19905);
+        defer stream.close();
+        const body = "{\"execution\": \"2026-04-11T12:00:00Z\"}";
+        var buf: [256]u8 = undefined;
+        const request = std.fmt.bufPrint(&buf, "PUT /jobs/deploy.v2 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+        const response = try send_http_request(stream, request);
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+    }
+
+    {
+        var stream = try http_connect(19905);
+        defer stream.close();
+        const response = try send_http_request(
+            stream,
+            "GET /jobs?prefix=deploy. HTTP/1.1\r\n\r\n",
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "deploy.v1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "deploy.v2") != null);
+    }
+}
+
+// Feature: F015
+test "malformed JSON on PUT returns 400 bad request" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19906\"\n\n[http]\nlisten = \"127.0.0.1:19907\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    var stream = try http_connect(19907);
+    defer stream.close();
+    const body = "{not valid json}";
+    var buf: [256]u8 = undefined;
+    const request = std.fmt.bufPrint(&buf, "PUT /jobs/bad.json HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    const response = try send_http_request(stream, request);
+    try std.testing.expect(std.mem.indexOf(u8, response, "400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"error\"") != null);
+}

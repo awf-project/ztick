@@ -14,6 +14,8 @@
 
 - Maintain CRUD endpoint parity in OpenAPI specs; if GET /jobs/{id} exists, corresponding GET /rules/{id} must exist or be explicitly documented as omitted in spec comments
 
+- Implement configuration parsing for new subsystems before wiring them as application threads; verify [http], [controller], [database] sections exist in config.zig before feature completion
+
 ## Build System
 
 - Zig 0.15.2; minimal dependencies — zig-o11y/opentelemetry-sdk for telemetry (ADR-0004), system OpenSSL for TLS (ADR-0003), stdlib for everything else
@@ -28,11 +30,11 @@
 
 ## Concurrency
 
-- Three-thread architecture: controller (TCP server), database (scheduler tick loop), processor (job executor)
+- Four-thread architecture: controller (TCP server), database (scheduler tick loop), processor (job executor), http (REST API — optional, enabled via [http] config section)
 - Bounded FIFO channels (Channel(T)) with mutex + condition variables for inter-thread communication; capacity 64
 - Atomic flag (std.atomic.Value(bool)) for cross-thread shutdown coordination
 - Per-connection ResponseRouter with mutex-guarded AutoHashMap; each TCP connection registers its own response channel
-- Shutdown order: join controller → store false to running → close request channel → join database → close exec channel → join processor
+- Shutdown order: join controller → join http (if enabled) → store false to running → close request channel → join database → close exec channel → join processor
 
 ## Protocol (TCP)
 
@@ -41,6 +43,15 @@
 - Responses: `<request_id> OK\n` or `<request_id> ERROR\n`
 - Quoted strings supported: `"value with spaces"`, escapes `\"` and `\\`
 - Timestamps: nanoseconds since Unix epoch (i64); datetime parsing supports years 1970+
+
+## Protocol (HTTP)
+
+- RESTful JSON API over HTTP/1.1; disabled by default, enabled via `[http] listen` in config
+- Uses std.http.Server for parsing/responses; OpenAPI 3.1.1 spec embedded via @embedFile (symlink from src/infrastructure/ to root openapi.json)
+- Endpoints: GET/PUT/DELETE /jobs/{id}, GET /jobs?prefix=, GET/PUT/DELETE /rules/{id}, GET /rules?prefix=, GET /health, GET /openapi.json
+- DELETE returns 204 No Content; PUT/GET return 200 with JSON body; errors return 400/401/404/405/413 with `{"error":"message"}`
+- Optional Bearer token authentication; /health and /openapi.json are public (no auth required)
+- HTTP thread shares Channel(query.Request) and ResponseRouter with TCP controller and database threads
 
 ## Persistence
 
@@ -51,13 +62,13 @@
 
 ## Configuration
 
-- Custom TOML parser; sections: [log] (level), [controller] (listen), [database] (fsync_on_persist, framerate, logfile_path)
+- Custom TOML parser; sections: [log] (level), [controller] (listen), [database] (fsync_on_persist, framerate, logfile_path), [http] (listen), [telemetry], [shell]
 - CLI flag: `-c`/`--config` for config path; defaults applied when file missing; max file size 1MB
 - Framerate range: 1-65535 (u16); log levels: off, error, warn, info, debug, trace
+- HTTP server disabled by default; enabled only when [http] section with listen key is present
 
 ## Common Pitfalls
 
-- Pass allocator as parameter to allocation functions; never use cwd() directly in background operations
 - Use atomic rename pattern for persistence writes; verify file operations before committing state
 - Use per-connection response channels; never share a response channel across concurrent connections
 - Propagate allocation errors immediately; never catch OOM and convert to false success
@@ -66,7 +77,7 @@
 - Try openFile(.write_only) first, fall back to createFile for new logfiles; handles both append and initialization
 - Pre-allocate capacity in thread tracking list before spawning; ensure append cannot fail due to OOM and orphan spawned threads
 - Remove thread handles from tracking list after joining; never accumulate handles indefinitely as this causes O(n) memory growth
-- Always escape control characters (0x00-0x1F excluding tab/CR/LF) in JSON output per RFC 8259; missing escapes produce invalid JSON that tools like jq reject
+- Use std.json.Stringify for all JSON serialization; never build JSON strings manually. Use std.json.parseFromSlice for deserialization into typed structs
 - For follow mode initial offset: subtract remaining partial-frame bytes from file length, not file length itself; starting at file end skips incomplete frames
 - Never silently ignore persistence decode errors; emit warnings to stderr with byte offset for each failure to aid debugging
 
@@ -86,6 +97,8 @@
 
 - Never duplicate specification details across files (openapi.yaml, http-api.md, types.md); maintain single source of truth per spec element (schema descriptions, format rules, field definitions)
 
+- Never commit stub barrel files without implementation; add `@compileError` to unimplemented public functions to prevent partial feature merges
+
 ## Test Conventions
 
 - Co-locate unit tests in test blocks within source files; use functional_tests.zig for integration tests
@@ -93,9 +106,14 @@
 
 - Always use std.testing.tmpDir for test files; never hardcode /tmp paths which create race conditions across parallel test execution
 
+- Always verify unit tests execute through `zig build test-<layer>` targets, not just direct `zig test`; barrel export chains may prevent test discovery by the build system
+
 ## Review Standards
 
 - Normalize all function names to snake_case, including private functions; remove dead code completely
 - Verify implementation matches the original specification (e.g., protocol format, timestamp parsing, command definitions)
 - Never name tests after implementation internals (e.g., 'has no payload'); name them after observable behavior from the caller's perspective (e.g., 'returns formatted rules')
 - HTTP DELETE operations must return 204 No Content for successful deletions; return 200 only when response body is present (violates client expectations)
+- Verify all planned components are implemented before merge; HTTP controller requires std.http.Server routing, json codec (std.json), [http] config section, and threading — all must compile and pass tests
+- Use std.http.Server for HTTP request/response handling; never parse HTTP manually. Use request.respond() for responses, iterateHeaders() for custom headers
+- Dupe all instruction string identifiers before sending to scheduler via Channel; scheduler stores pointers without copying (same ownership pattern as TCP server's build_instruction)

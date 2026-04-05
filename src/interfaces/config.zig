@@ -58,6 +58,7 @@ pub const Config = struct {
     database_compression_interval: u32,
     telemetry: TelemetryConfig,
     shell: ShellConfig,
+    http_listen: ?[]const u8,
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.controller_listen);
@@ -67,6 +68,7 @@ pub const Config = struct {
         if (self.telemetry.endpoint) |ep| allocator.free(ep);
         allocator.free(self.telemetry.service_name);
         self.shell.deinit(allocator);
+        if (self.http_listen) |hl| allocator.free(hl);
     }
 };
 
@@ -97,6 +99,8 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
         for (args) |arg| allocator.free(arg);
         allocator.free(args);
     };
+    var http_listen: ?[]u8 = null;
+    errdefer if (http_listen) |hl| allocator.free(hl);
 
     var current_section: []const u8 = "";
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -112,7 +116,8 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
                 !std.mem.eql(u8, current_section, "controller") and
                 !std.mem.eql(u8, current_section, "database") and
                 !std.mem.eql(u8, current_section, "telemetry") and
-                !std.mem.eql(u8, current_section, "shell"))
+                !std.mem.eql(u8, current_section, "shell") and
+                !std.mem.eql(u8, current_section, "http"))
             {
                 return ConfigError.UnknownSection;
             }
@@ -175,6 +180,13 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
             } else {
                 return ConfigError.UnknownKey;
             }
+        } else if (std.mem.eql(u8, current_section, "http")) {
+            if (std.mem.eql(u8, key, "listen")) {
+                if (http_listen) |prev| allocator.free(prev);
+                http_listen = try allocator.dupe(u8, unquote(raw_val));
+            } else {
+                return ConfigError.UnknownKey;
+            }
         } else if (std.mem.eql(u8, current_section, "database")) {
             if (std.mem.eql(u8, key, "fsync_on_persist")) {
                 if (std.mem.eql(u8, raw_val, "true")) {
@@ -225,6 +237,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
             .path = shell_path orelse try allocator.dupe(u8, "/bin/sh"),
             .args = shell_args orelse try make_default_shell_args(allocator),
         },
+        .http_listen = http_listen,
     };
 }
 
@@ -668,4 +681,31 @@ test "shell validate succeeds for existing executable path" {
 test "shell validate returns error for nonexistent path" {
     const cfg = ShellConfig{ .path = "/nonexistent/shell/binary", .args = &.{} };
     try std.testing.expectError(ConfigError.InvalidShellPath, cfg.validate());
+}
+
+test "http listen defaults to null when section absent" {
+    const cfg = try parse(std.testing.allocator, "");
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.http_listen);
+}
+
+test "parse http listen from section" {
+    const cfg = try parse(std.testing.allocator,
+        \\[http]
+        \\listen = "127.0.0.1:5680"
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("127.0.0.1:5680", cfg.http_listen.?);
+}
+
+test "parse rejects unknown key in http section" {
+    const result = parse(std.testing.allocator,
+        \\[http]
+        \\port = 5680
+        \\
+    );
+    try std.testing.expectError(ConfigError.UnknownKey, result);
 }
