@@ -86,6 +86,15 @@ fn runner_encoded_size(runner: domain.runner.Runner) !usize {
             }
             break :blk size;
         },
+        .awf => |awf| blk: {
+            if (awf.workflow.len > std.math.maxInt(u16)) return error.Overflow;
+            var size: usize = 1 + 2 + awf.workflow.len + 2;
+            for (awf.inputs) |input| {
+                if (input.len > std.math.maxInt(u16)) return error.Overflow;
+                size += 2 + input.len;
+            }
+            break :blk size;
+        },
     };
 }
 
@@ -128,6 +137,22 @@ fn encode_runner(runner: domain.runner.Runner, buf: []u8) void {
                 pos += 2;
                 @memcpy(buf[pos .. pos + arg.len], arg);
                 pos += arg.len;
+            }
+        },
+        .awf => |awf| {
+            buf[pos] = 3;
+            pos += 1;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(awf.workflow.len), .big);
+            pos += 2;
+            @memcpy(buf[pos .. pos + awf.workflow.len], awf.workflow);
+            pos += awf.workflow.len;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(awf.inputs.len), .big);
+            pos += 2;
+            for (awf.inputs) |input| {
+                std.mem.writeInt(u16, buf[pos..][0..2], @intCast(input.len), .big);
+                pos += 2;
+                @memcpy(buf[pos .. pos + input.len], input);
+                pos += input.len;
             }
         },
     }
@@ -241,6 +266,35 @@ fn decode_inner(allocator: std.mem.Allocator, data: []const u8) !Entry {
                         .runner = .{ .direct = .{ .executable = exe_copy, .args = args } },
                     } };
                 },
+                3 => {
+                    const wf_slice = try read_sized_string(data, &pos);
+                    if (pos + 2 > data.len) return error.InvalidData;
+                    const input_count = std.mem.readInt(u16, data[pos..][0..2], .big);
+                    pos += 2;
+                    const id_copy = try allocator.dupe(u8, id_slice);
+                    errdefer allocator.free(id_copy);
+                    const pat_copy = try allocator.dupe(u8, pat_slice);
+                    errdefer allocator.free(pat_copy);
+                    const wf_copy = try allocator.dupe(u8, wf_slice);
+                    errdefer allocator.free(wf_copy);
+                    const inputs = try allocator.alloc([]const u8, input_count);
+                    var inputs_filled: usize = 0;
+                    errdefer {
+                        for (inputs[0..inputs_filled]) |input| allocator.free(input);
+                        allocator.free(inputs);
+                    }
+                    for (inputs) |*input| {
+                        const input_slice = try read_sized_string(data, &pos);
+                        input.* = try allocator.dupe(u8, input_slice);
+                        inputs_filled += 1;
+                    }
+                    if (pos != data.len) return error.InvalidData;
+                    return .{ .rule = .{
+                        .identifier = id_copy,
+                        .pattern = pat_copy,
+                        .runner = .{ .awf = .{ .workflow = wf_copy, .inputs = inputs } },
+                    } };
+                },
                 else => return error.InvalidData,
             }
         },
@@ -291,6 +345,11 @@ pub fn free_entry_fields(entry: Entry, allocator: std.mem.Allocator) void {
                     allocator.free(d.executable);
                     for (d.args) |arg| allocator.free(arg);
                     allocator.free(d.args);
+                },
+                .awf => |awf| {
+                    allocator.free(awf.workflow);
+                    for (awf.inputs) |input| allocator.free(input);
+                    allocator.free(awf.inputs);
                 },
             }
         },
@@ -511,6 +570,146 @@ test "free_entry_fields frees direct runner rule fields with args without leak" 
     } };
     free_entry_fields(entry, allocator);
     allocator.free(id);
+}
+
+test "encode rule awf runner without inputs" {
+    const rule = domain.rule.Rule{
+        .identifier = "a",
+        .pattern = "b",
+        .runner = .{ .awf = .{ .workflow = "hello", .inputs = &.{} } },
+    };
+    const result = try encode(std.testing.allocator, .{ .rule = rule });
+    defer std.testing.allocator.free(result);
+    // type=1, id=[0,1,'a'], pat=[0,1,'b'], runner_type=3, wf=[0,5,"hello"], input_count=[0,0]
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 1, 97, 0, 1, 98, 3, 0, 5, 104, 101, 108, 108, 111, 0, 0 }, result);
+}
+
+test "encode rule awf runner with inputs" {
+    const inputs = [_][]const u8{ "format=pdf", "target=main" };
+    const rule = domain.rule.Rule{
+        .identifier = "a",
+        .pattern = "b",
+        .runner = .{ .awf = .{ .workflow = "hello", .inputs = &inputs } },
+    };
+    const result = try encode(std.testing.allocator, .{ .rule = rule });
+    defer std.testing.allocator.free(result);
+    // type=1, id=[0,1,'a'], pat=[0,1,'b'], runner_type=3, wf=[0,5,"hello"], count=[0,2], [0,10,"format=pdf"], [0,11,"target=main"]
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 1, 97, 0, 1, 98, 3, 0, 5, 104, 101, 108, 108, 111, 0, 2, 0, 10, 102, 111, 114, 109, 97, 116, 61, 112, 100, 102, 0, 11, 116, 97, 114, 103, 101, 116, 61, 109, 97, 105, 110 }, result);
+}
+
+test "decode rule awf runner without inputs" {
+    const data = [_]u8{ 1, 0, 1, 97, 0, 1, 98, 3, 0, 5, 104, 101, 108, 108, 111, 0, 0 };
+    const result = try decode(std.testing.allocator, &data);
+    defer std.testing.allocator.free(result.rule.identifier);
+    defer std.testing.allocator.free(result.rule.pattern);
+    defer std.testing.allocator.free(result.rule.runner.awf.workflow);
+    defer std.testing.allocator.free(result.rule.runner.awf.inputs);
+    try std.testing.expectEqualStrings("a", result.rule.identifier);
+    try std.testing.expectEqualStrings("b", result.rule.pattern);
+    try std.testing.expectEqualStrings("hello", result.rule.runner.awf.workflow);
+    try std.testing.expectEqual(@as(usize, 0), result.rule.runner.awf.inputs.len);
+}
+
+test "decode rule awf runner with inputs" {
+    const data = [_]u8{ 1, 0, 1, 97, 0, 1, 98, 3, 0, 5, 104, 101, 108, 108, 111, 0, 2, 0, 10, 102, 111, 114, 109, 97, 116, 61, 112, 100, 102, 0, 11, 116, 97, 114, 103, 101, 116, 61, 109, 97, 105, 110 };
+    const result = try decode(std.testing.allocator, &data);
+    defer std.testing.allocator.free(result.rule.identifier);
+    defer std.testing.allocator.free(result.rule.pattern);
+    defer std.testing.allocator.free(result.rule.runner.awf.workflow);
+    defer {
+        for (result.rule.runner.awf.inputs) |input| std.testing.allocator.free(input);
+        std.testing.allocator.free(result.rule.runner.awf.inputs);
+    }
+    try std.testing.expectEqualStrings("a", result.rule.identifier);
+    try std.testing.expectEqualStrings("b", result.rule.pattern);
+    try std.testing.expectEqualStrings("hello", result.rule.runner.awf.workflow);
+    try std.testing.expectEqual(@as(usize, 2), result.rule.runner.awf.inputs.len);
+    try std.testing.expectEqualStrings("format=pdf", result.rule.runner.awf.inputs[0]);
+    try std.testing.expectEqualStrings("target=main", result.rule.runner.awf.inputs[1]);
+}
+
+test "encode decode awf runner round trip without inputs" {
+    const rule = domain.rule.Rule{
+        .identifier = "rule.review",
+        .pattern = "app.*",
+        .runner = .{ .awf = .{ .workflow = "code-review", .inputs = &.{} } },
+    };
+    const encoded = try encode(std.testing.allocator, .{ .rule = rule });
+    defer std.testing.allocator.free(encoded);
+    const decoded = try decode(std.testing.allocator, encoded);
+    defer std.testing.allocator.free(decoded.rule.identifier);
+    defer std.testing.allocator.free(decoded.rule.pattern);
+    defer std.testing.allocator.free(decoded.rule.runner.awf.workflow);
+    defer std.testing.allocator.free(decoded.rule.runner.awf.inputs);
+    try std.testing.expectEqualStrings("rule.review", decoded.rule.identifier);
+    try std.testing.expectEqualStrings("app.*", decoded.rule.pattern);
+    try std.testing.expectEqualStrings("code-review", decoded.rule.runner.awf.workflow);
+    try std.testing.expectEqual(@as(usize, 0), decoded.rule.runner.awf.inputs.len);
+}
+
+test "encode decode awf runner round trip with inputs" {
+    const inputs = [_][]const u8{ "format=pdf", "target=main" };
+    const rule = domain.rule.Rule{
+        .identifier = "rule.report",
+        .pattern = "report.*",
+        .runner = .{ .awf = .{ .workflow = "generate-report", .inputs = &inputs } },
+    };
+    const encoded = try encode(std.testing.allocator, .{ .rule = rule });
+    defer std.testing.allocator.free(encoded);
+    const decoded = try decode(std.testing.allocator, encoded);
+    defer std.testing.allocator.free(decoded.rule.identifier);
+    defer std.testing.allocator.free(decoded.rule.pattern);
+    defer std.testing.allocator.free(decoded.rule.runner.awf.workflow);
+    defer {
+        for (decoded.rule.runner.awf.inputs) |input| std.testing.allocator.free(input);
+        std.testing.allocator.free(decoded.rule.runner.awf.inputs);
+    }
+    try std.testing.expectEqualStrings("rule.report", decoded.rule.identifier);
+    try std.testing.expectEqualStrings("report.*", decoded.rule.pattern);
+    try std.testing.expectEqualStrings("generate-report", decoded.rule.runner.awf.workflow);
+    try std.testing.expectEqual(@as(usize, 2), decoded.rule.runner.awf.inputs.len);
+    try std.testing.expectEqualStrings("format=pdf", decoded.rule.runner.awf.inputs[0]);
+    try std.testing.expectEqualStrings("target=main", decoded.rule.runner.awf.inputs[1]);
+}
+
+test "free_entry_fields frees awf runner rule fields without inputs without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "rule.review");
+    const pattern = try allocator.dupe(u8, "app.*");
+    const workflow = try allocator.dupe(u8, "code-review");
+    const inputs = try allocator.alloc([]const u8, 0);
+    const entry = Entry{ .rule = .{
+        .identifier = id,
+        .pattern = pattern,
+        .runner = .{ .awf = .{ .workflow = workflow, .inputs = inputs } },
+    } };
+    free_entry_fields(entry, allocator);
+    allocator.free(id);
+}
+
+test "free_entry_fields frees awf runner rule fields with inputs without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "rule.report");
+    const pattern = try allocator.dupe(u8, "report.*");
+    const workflow = try allocator.dupe(u8, "generate-report");
+    const input0 = try allocator.dupe(u8, "format=pdf");
+    const input1 = try allocator.dupe(u8, "target=main");
+    const inputs = try allocator.alloc([]const u8, 2);
+    inputs[0] = input0;
+    inputs[1] = input1;
+    const entry = Entry{ .rule = .{
+        .identifier = id,
+        .pattern = pattern,
+        .runner = .{ .awf = .{ .workflow = workflow, .inputs = inputs } },
+    } };
+    free_entry_fields(entry, allocator);
+    allocator.free(id);
+}
+
+test "decode error on truncated awf runner" {
+    // Truncated mid-workflow field
+    const data = [_]u8{ 1, 0, 1, 97, 0, 1, 98, 3, 0, 5, 104 };
+    try std.testing.expectError(DecodeError.InvalidData, decode(std.testing.allocator, &data));
 }
 
 test "encode decode direct runner round trip" {

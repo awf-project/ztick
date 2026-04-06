@@ -296,8 +296,9 @@ pub const HttpServer = struct {
 
         const is_shell = std.mem.eql(u8, input.runner, "shell");
         const is_direct = std.mem.eql(u8, input.runner, "direct");
+        const is_awf = std.mem.eql(u8, input.runner, "awf");
 
-        if (!is_shell and !is_direct) {
+        if (!is_shell and !is_direct and !is_awf) {
             self.allocator.free(input.pattern);
             self.allocator.free(input.runner);
             for (input.args) |arg| self.allocator.free(arg);
@@ -316,8 +317,18 @@ pub const HttpServer = struct {
 
         const runner_type: runner_mod.Runner = if (is_shell)
             .{ .shell = .{ .command = if (input.args.len > 0) input.args[0] else "" } }
+        else if (is_direct)
+            .{ .direct = .{ .executable = if (input.args.len > 0) input.args[0] else "", .args = if (input.args.len > 1) input.args[1..] else &.{} } }
         else
-            .{ .direct = .{ .executable = if (input.args.len > 0) input.args[0] else "", .args = if (input.args.len > 1) input.args[1..] else &.{} } };
+            build_awf_runner(self.allocator, input.args) orelse {
+                self.allocator.free(owned_id);
+                self.allocator.free(input.pattern);
+                self.allocator.free(input.runner);
+                for (input.args) |arg| self.allocator.free(arg);
+                self.allocator.free(input.args);
+                self.respond_json(request, .bad_request, "missing workflow argument");
+                return;
+            };
 
         const resp_body = json.serialize_rule(self.allocator, id, input.pattern, input.runner) catch {
             self.allocator.free(owned_id);
@@ -343,6 +354,21 @@ pub const HttpServer = struct {
         };
         _ = response;
 
+        if (is_awf) {
+            const awf = runner_type.awf;
+            for (input.args) |arg| {
+                var consumed = arg.ptr == awf.workflow.ptr;
+                if (!consumed) {
+                    for (awf.inputs) |inp| {
+                        if (arg.ptr == inp.ptr) {
+                            consumed = true;
+                            break;
+                        }
+                    }
+                }
+                if (!consumed) self.allocator.free(arg);
+            }
+        }
         self.allocator.free(input.runner);
         self.allocator.free(input.args);
 
@@ -456,6 +482,25 @@ fn parseAddress(address: []const u8) ?std.net.Address {
     return std.net.Address.parseIp(host, port) catch return null;
 }
 
+fn build_awf_runner(allocator: std.mem.Allocator, args: []const []const u8) ?runner_mod.Runner {
+    if (args.len == 0) return null;
+    const workflow = args[0];
+    const remaining = args[1..];
+    // Remaining args must be pairs of "--input" + value
+    if (remaining.len % 2 != 0) return null;
+    var k: usize = 0;
+    while (k < remaining.len) : (k += 2) {
+        if (!std.mem.eql(u8, remaining[k], "--input")) return null;
+    }
+    const input_count = remaining.len / 2;
+    const inputs = allocator.alloc([]const u8, input_count) catch return null;
+    var j: usize = 0;
+    while (j < input_count) : (j += 1) {
+        inputs[j] = remaining[j * 2 + 1];
+    }
+    return .{ .awf = .{ .workflow = workflow, .inputs = inputs } };
+}
+
 // Tests
 
 test "json namespace exposes serialize_health returning correct response" {
@@ -512,4 +557,30 @@ test "parseAddress parses ip and port" {
 
 test "parseAddress returns null for invalid input" {
     try std.testing.expect(parseAddress("invalid") == null);
+}
+
+test "build_awf_runner returns runner with workflow and no inputs from single arg" {
+    const args = [_][]const u8{"code-review"};
+    const runner = build_awf_runner(std.testing.allocator, &args);
+    try std.testing.expect(runner != null);
+    defer std.testing.allocator.free(runner.?.awf.inputs);
+    try std.testing.expectEqualStrings("code-review", runner.?.awf.workflow);
+    try std.testing.expectEqual(@as(usize, 0), runner.?.awf.inputs.len);
+}
+
+test "build_awf_runner extracts input values from multiple --input flags" {
+    const args = [_][]const u8{ "generate-report", "--input", "format=pdf", "--input", "target=main" };
+    const runner = build_awf_runner(std.testing.allocator, &args);
+    try std.testing.expect(runner != null);
+    defer std.testing.allocator.free(runner.?.awf.inputs);
+    try std.testing.expectEqualStrings("generate-report", runner.?.awf.workflow);
+    try std.testing.expectEqual(@as(usize, 2), runner.?.awf.inputs.len);
+    try std.testing.expectEqualStrings("format=pdf", runner.?.awf.inputs[0]);
+    try std.testing.expectEqualStrings("target=main", runner.?.awf.inputs[1]);
+}
+
+test "build_awf_runner returns null when args is empty" {
+    const args = [_][]const u8{};
+    const runner = build_awf_runner(std.testing.allocator, &args);
+    try std.testing.expectEqual(@as(?runner_mod.Runner, null), runner);
 }

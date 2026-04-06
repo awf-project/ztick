@@ -121,6 +121,10 @@ pub const Runner = union(enum) {
         executable: []const u8,
         args: []const []const u8,
     },
+    awf: struct {
+        workflow: []const u8,
+        input: ?[]const u8,
+    },
     amqp: struct {
         dsn: []const u8,
         exchange: []const u8,
@@ -141,6 +145,12 @@ pub const Runner = union(enum) {
   - Fields: `executable` (path to binary), `args` (literal argv elements)
   - HTTP schema: `{"type": "direct", "executable": "...", "args": [...]}`
   - Example: `direct /usr/bin/curl -s http://example.com`
+
+- **awf**: Execute an AWF (AI Workflow) via the AWF CLI
+  - Supported via TCP protocol and HTTP API
+  - Fields: `workflow` (workflow name), `inputs` (array of key=value parameters)
+  - HTTP request: `{"pattern": "...", "runner": "awf", "args": ["<workflow>", "--input", "key=value", ...]}`
+  - Example: `awf code-review` or `awf generate-report --input format=pdf --input target=main`
 
 - **amqp**: Send a message to AMQP broker
   - Supported via TCP protocol only (not exposed in HTTP API)
@@ -242,6 +252,24 @@ const rule = Rule{
 };
 ```
 
+### Creating an AWF Rule
+
+```zig
+// AWF rule without inputs
+const awf_rule_simple = Rule{
+    .identifier = "rule.review",
+    .pattern = "code-review.",
+    .runner = .{ .awf = .{ .workflow = "code-review", .inputs = &.{} } },
+};
+
+// AWF rule with inputs
+const awf_rule_with_inputs = Rule{
+    .identifier = "rule.report",
+    .pattern = "report.",
+    .runner = .{ .awf = .{ .workflow = "generate-report", .inputs = &.{ "format=pdf", "target=main" } } },
+};
+```
+
 ### Creating an Instruction
 
 ```zig
@@ -302,6 +330,13 @@ Types are persisted in binary format:
      for each arg:
        [2 bytes: arg length]
        [N bytes: arg string]
+  └─ if awf:
+     [2 bytes: workflow length]
+     [N bytes: workflow string]
+     [2 bytes: inputs count (big-endian u16)]
+     for each input:
+       [2 bytes: input length]
+       [N bytes: input string (key=value)]
   └─ if amqp:
      [2 bytes: dsn length]
      [N bytes: dsn string]

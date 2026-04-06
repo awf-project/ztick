@@ -14,7 +14,7 @@ This is an **explicit push model** — the application drives, ztick executes. T
 
 - **Core scheduler** — Time-based job execution with TCP control protocol
 - **Protocol commands** — `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, `LISTRULES`, `RULE SET`, `STAT`
-- **Rules** — Match jobs by prefix and assign shell or direct runners
+- **Rules** — Match jobs by prefix and assign shell, direct, or AWF workflow runners
 - **Persistence** — Append-only logfile with binary encoding and automatic background compression
 - **In-memory persistence** — Ephemeral mode for CI/testing without disk I/O
 - **Configuration** — TOML-based settings for logging, listen address, framerate, and telemetry
@@ -80,7 +80,7 @@ ztick follows **hexagonal architecture** with 4 strict layers:
 |---------|---------|
 | **Job** | Execution scheduled for a specific timestamp |
 | **Rule** | Pattern matching rule that selects jobs and specifies a runner |
-| **Runner** | Execution target (shell command or direct execve) |
+| **Runner** | Execution target (shell command, direct execve, or AWF workflow) |
 | **Execution** | Result of a triggered job (success/failure with metadata) |
 
 ## CLI

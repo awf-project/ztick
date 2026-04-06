@@ -34,6 +34,11 @@ pub fn format_entry_text(writer: anytype, entry: Entry) !void {
                     for (d.args) |arg| try writer.print(" {s}", .{arg});
                     try writer.writeByte('\n');
                 },
+                .awf => |awf| {
+                    try writer.print("RULE SET {s} {s} awf {s}", .{ rule.identifier, rule.pattern, awf.workflow });
+                    for (awf.inputs) |input| try writer.print(" --input {s}", .{input});
+                    try writer.writeByte('\n');
+                },
             }
         },
         .job_removal => |r| try writer.print("REMOVE {s}\n", .{r.identifier}),
@@ -94,6 +99,16 @@ pub fn format_entry_json(writer: anytype, entry: Entry) !void {
                     for (d.args, 0..) |arg, i| {
                         if (i > 0) try writer.writeByte(',');
                         try write_json_string(writer, arg);
+                    }
+                    try writer.writeAll("]}}");
+                },
+                .awf => |awf| {
+                    try writer.writeAll("{\"type\":\"awf\",\"workflow\":");
+                    try write_json_string(writer, awf.workflow);
+                    try writer.writeAll(",\"inputs\":[");
+                    for (awf.inputs, 0..) |input, i| {
+                        if (i > 0) try writer.writeByte(',');
+                        try write_json_string(writer, input);
                     }
                     try writer.writeAll("]}}");
                 },
@@ -440,6 +455,62 @@ test "format_entry_json writes rule_set object with direct runner and args" {
     try format_entry_json(fbs.writer(), rule_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"rule_set\",\"identifier\":\"curl-rule\",\"pattern\":\"0 * * * *\",\"runner\":{\"type\":\"direct\",\"executable\":\"/usr/bin/curl\",\"args\":[\"-s\",\"http://example.com\"]}}",
+        fbs.getWritten(),
+    );
+}
+
+test "format_entry_text writes RULE SET line for awf runner without inputs" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const rule_entry = Entry{ .rule = .{
+        .identifier = "awf-rule",
+        .pattern = "0 9 * * 1",
+        .runner = .{ .awf = .{ .workflow = "code-review", .inputs = &.{} } },
+    } };
+    try format_entry_text(fbs.writer(), rule_entry);
+    try std.testing.expectEqualStrings("RULE SET awf-rule 0 9 * * 1 awf code-review\n", fbs.getWritten());
+}
+
+test "format_entry_text writes RULE SET line for awf runner with inputs" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const inputs = [_][]const u8{ "format=pdf", "target=main" };
+    const rule_entry = Entry{ .rule = .{
+        .identifier = "report-rule",
+        .pattern = "0 8 * * *",
+        .runner = .{ .awf = .{ .workflow = "generate-report", .inputs = &inputs } },
+    } };
+    try format_entry_text(fbs.writer(), rule_entry);
+    try std.testing.expectEqualStrings("RULE SET report-rule 0 8 * * * awf generate-report --input format=pdf --input target=main\n", fbs.getWritten());
+}
+
+test "format_entry_json writes rule_set object with awf runner without inputs" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const rule_entry = Entry{ .rule = .{
+        .identifier = "awf-rule",
+        .pattern = "0 9 * * 1",
+        .runner = .{ .awf = .{ .workflow = "code-review", .inputs = &.{} } },
+    } };
+    try format_entry_json(fbs.writer(), rule_entry);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"rule_set\",\"identifier\":\"awf-rule\",\"pattern\":\"0 9 * * 1\",\"runner\":{\"type\":\"awf\",\"workflow\":\"code-review\",\"inputs\":[]}}",
+        fbs.getWritten(),
+    );
+}
+
+test "format_entry_json writes rule_set object with awf runner with inputs" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const inputs = [_][]const u8{ "format=pdf", "target=main" };
+    const rule_entry = Entry{ .rule = .{
+        .identifier = "report-rule",
+        .pattern = "0 8 * * *",
+        .runner = .{ .awf = .{ .workflow = "generate-report", .inputs = &inputs } },
+    } };
+    try format_entry_json(fbs.writer(), rule_entry);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"rule_set\",\"identifier\":\"report-rule\",\"pattern\":\"0 8 * * *\",\"runner\":{\"type\":\"awf\",\"workflow\":\"generate-report\",\"inputs\":[\"format=pdf\",\"target=main\"]}}",
         fbs.getWritten(),
     );
 }

@@ -69,7 +69,6 @@
 
 ## Common Pitfalls
 
-- Use atomic rename pattern for persistence writes; verify file operations before committing state
 - Use per-connection response channels; never share a response channel across concurrent connections
 - Propagate allocation errors immediately; never catch OOM and convert to false success
 - Copy storage results into owned allocation before mutation; never iterate and mutate simultaneously
@@ -98,6 +97,8 @@
 - Never duplicate specification details across files (openapi.yaml, http-api.md, types.md); maintain single source of truth per spec element (schema descriptions, format rules, field definitions)
 
 - Never commit stub barrel files without implementation; add `@compileError` to unimplemented public functions to prevent partial feature merges
+
+- Add all compiled binaries and build artifacts (test_zig, *.o, *.a, *.so) to .gitignore; build outputs must never be staged or committed
 
 ## Test Conventions
 

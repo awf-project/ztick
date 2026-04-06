@@ -3341,6 +3341,42 @@ test "job listing with prefix filter returns matching jobs" {
     }
 }
 
+// Feature: F016
+test "RULE SET with AWF runner over TCP stores rule and appears in LISTRULES" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19908\"\n\n[database]\npersistence = \"memory\"\n");
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19908) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    _ = stream.write("req-1 RULE SET rule.awf app. awf code-review --input target=main\n") catch return error.SkipZigTest;
+    std.Thread.sleep(200_000_000);
+
+    _ = stream.write("req-2 LISTRULES\n") catch return error.SkipZigTest;
+    std.Thread.sleep(300_000_000);
+
+    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = stream.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const response = buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 OK\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "awf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "code-review") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-2 OK\n") != null);
+}
+
 // Feature: F015
 test "malformed JSON on PUT returns 400 bad request" {
     const allocator = std.testing.allocator;
@@ -3359,4 +3395,165 @@ test "malformed JSON on PUT returns 400 bad request" {
     const response = try send_http_request(stream, request);
     try std.testing.expect(std.mem.indexOf(u8, response, "400") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"error\"") != null);
+}
+
+// Feature: F016
+test "AWF rule with input persists and replays from logfile" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const original_rule = Rule{
+        .identifier = "rule.report",
+        .pattern = "report.",
+        .runner = .{ .awf = .{ .workflow = "generate-report", .inputs = &.{ "format=pdf", "target=main" } } },
+    };
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = original_rule },
+    });
+    defer allocator.free(logfile_data);
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var decode_arena = try replay_into_scheduler(allocator, logfile_data, &scheduler);
+    defer decode_arena.deinit();
+
+    const restored = scheduler.rule_storage.get("rule.report");
+    try std.testing.expect(restored != null);
+    try std.testing.expectEqualStrings("report.", restored.?.pattern);
+    try std.testing.expectEqualStrings("generate-report", restored.?.runner.awf.workflow);
+    try std.testing.expectEqual(@as(usize, 2), restored.?.runner.awf.inputs.len);
+    try std.testing.expectEqualStrings("format=pdf", restored.?.runner.awf.inputs[0]);
+    try std.testing.expectEqualStrings("target=main", restored.?.runner.awf.inputs[1]);
+}
+
+// Feature: F016
+test "RULE SET with AWF runner and --input over TCP stores rule with input parameter" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19910\"\n\n[database]\npersistence = \"memory\"\n");
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19910) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    _ = stream.write("req-1 RULE SET rule.report report. awf generate-report --input format=pdf --input target=main\n") catch return error.SkipZigTest;
+    std.Thread.sleep(200_000_000);
+
+    _ = stream.write("req-2 LISTRULES\n") catch return error.SkipZigTest;
+    std.Thread.sleep(300_000_000);
+
+    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = stream.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const response = buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 OK\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "generate-report") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "format=pdf") != null);
+}
+
+// Feature: F016
+test "AWF rule without input persists and replays from logfile" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const original_rule = Rule{
+        .identifier = "rule.review",
+        .pattern = "app.",
+        .runner = .{ .awf = .{ .workflow = "code-review", .inputs = &.{} } },
+    };
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = original_rule },
+    });
+    defer allocator.free(logfile_data);
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var decode_arena = try replay_into_scheduler(allocator, logfile_data, &scheduler);
+    defer decode_arena.deinit();
+
+    const restored = scheduler.rule_storage.get("rule.review");
+    try std.testing.expect(restored != null);
+    try std.testing.expectEqualStrings("app.", restored.?.pattern);
+    try std.testing.expectEqualStrings("code-review", restored.?.runner.awf.workflow);
+    try std.testing.expectEqual(@as(usize, 0), restored.?.runner.awf.inputs.len);
+}
+
+// Feature: F016
+test "HTTP PUT creates AWF rule and GET returns it in listing" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19912\"\n\n[http]\nlisten = \"127.0.0.1:19913\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    {
+        var stream = try http_connect(19913);
+        defer stream.close();
+        const body = "{\"pattern\": \"app.\", \"runner\": \"awf\", \"args\": [\"code-review\"]}";
+        var buf: [512]u8 = undefined;
+        const request = std.fmt.bufPrint(&buf, "PUT /rules/rule.awf HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+        const response = try send_http_request(stream, request);
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "rule.awf") != null);
+    }
+
+    {
+        var stream = try http_connect(19913);
+        defer stream.close();
+        const response = try send_http_request(
+            stream,
+            "GET /rules?prefix=rule. HTTP/1.1\r\n\r\n",
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "rule.awf") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "awf") != null);
+    }
+}
+
+// Feature: F016
+test "TCP RULE SET with awf runner missing workflow returns ERROR" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19914\"\n\n[database]\npersistence = \"memory\"\n");
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19914) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    _ = stream.write("req-1 RULE SET rule.bad app. awf\n") catch return error.SkipZigTest;
+    std.Thread.sleep(200_000_000);
+
+    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = stream.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const response = buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 ERROR\n") != null);
 }

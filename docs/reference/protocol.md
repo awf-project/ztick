@@ -198,16 +198,18 @@ List all configured rules.
 |-------|-------------|
 | `rule_id` | The rule's identifier |
 | `pattern` | Prefix pattern the rule matches against |
-| `runner_type` | Runner type: `shell`, `direct`, or `amqp` |
-| `runner_args` | Shell: `<command>`. Direct: `<executable> [args...]`. AMQP: `<dsn> <exchange> <routing_key>` |
+| `runner_type` | Runner type: `shell`, `direct`, `awf`, or `amqp` |
+| `runner_args` | Shell: `<command>`. Direct: `<executable> [args...]`. AWF: `<workflow> [--input key=value ...]`. AMQP: `<dsn> <exchange> <routing_key>` |
 
 **Examples**:
 ```bash
-# List all rules (with shell, direct, and amqp rules loaded)
+# List all rules (with shell, direct, awf, and amqp rules loaded)
 echo 'req-1 LISTRULES' | socat - TCP:localhost:5678
 # Response:
 # req-1 rule.backup backup. shell /usr/bin/backup.sh
 # req-1 rule.curl curl. direct /usr/bin/curl -s http://example.com
+# req-1 rule.review code-review. awf code-review
+# req-1 rule.report report. awf generate-report --input format=pdf --input target=main
 # req-1 rule.notify notify. amqp amqp://broker:5672 jobs notifications
 # req-1 OK
 
@@ -357,6 +359,11 @@ Create or update a rule that matches jobs by prefix and assigns a runner.
 <request_id> RULE SET <rule_identifier> <pattern> direct <executable> [args...]
 ```
 
+**Syntax (awf runner)**:
+```
+<request_id> RULE SET <rule_identifier> <pattern> awf <workflow> [--input <key=value> ...]
+```
+
 **Syntax (amqp runner)**:
 ```
 <request_id> RULE SET <rule_identifier> <pattern> amqp <dsn> <exchange> <routing_key>
@@ -367,6 +374,7 @@ Create or update a rule that matches jobs by prefix and assigns a runner.
 - `pattern` (string): Prefix to match job identifiers (e.g., `backup.` matches `backup.daily`)
 - `shell <command>`: Execute a shell command when the job triggers. Quote the command if it contains spaces (e.g., `shell "/bin/echo hello"`)
 - `direct <executable> [args...]`: Execute a binary directly via execve without shell interpretation. The first token after `direct` is the executable path; remaining tokens are passed as literal argv elements. Shell metacharacters are not interpreted, eliminating shell injection risks.
+- `awf <workflow> [--input <key=value> ...]`: Execute an AWF workflow. The workflow name is required. The optional `--input` flag can be repeated to pass key=value parameters to the workflow (e.g., `awf generate-report --input format=pdf --input target=main`)
 - `amqp <dsn> <exchange> <routing_key>`: Publish to an AMQP broker (deferred — not yet operational)
 
 **Examples**:
@@ -379,9 +387,17 @@ echo 'req-3 RULE SET rule.backup backup. shell /usr/bin/backup.sh' | socat - TCP
 echo 'req-4 RULE SET rule.curl curl. direct /usr/bin/curl -s http://example.com' | socat - TCP:localhost:5678
 # Response: req-4 OK
 
-# AMQP runner
-echo 'req-5 RULE SET rule.notify notify. amqp amqp://broker:5672 jobs notifications' | socat - TCP:localhost:5678
+# AWF runner without inputs
+echo 'req-5 RULE SET rule.review code-review. awf code-review' | socat - TCP:localhost:5678
 # Response: req-5 OK
+
+# AWF runner with inputs
+echo 'req-6 RULE SET rule.report report. awf generate-report --input format=pdf --input target=main' | socat - TCP:localhost:5678
+# Response: req-6 OK
+
+# AMQP runner
+echo 'req-7 RULE SET rule.notify notify. amqp amqp://broker:5672 jobs notifications' | socat - TCP:localhost:5678
+# Response: req-7 OK
 ```
 
 ## Pattern Matching

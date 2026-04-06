@@ -72,10 +72,24 @@ Stores a single rule record with its runner.
 [L bytes: identifier string (UTF-8)]
 [2 bytes: pattern length (big-endian u16)]
 [L bytes: pattern string (UTF-8)]
-[1 byte: runner type (0=shell, 1=amqp)]
+[1 byte: runner type (0=shell, 1=amqp, 2=direct, 3=awf)]
   ├─ if runner_type == 0 (shell):
   │  [2 bytes: command length (big-endian u16)]
   │  [L bytes: command string (UTF-8)]
+  ├─ if runner_type == 2 (direct):
+  │  [2 bytes: executable length (big-endian u16)]
+  │  [L bytes: executable string (UTF-8)]
+  │  [2 bytes: args count (big-endian u16)]
+  │  for each arg:
+  │    [2 bytes: arg length (big-endian u16)]
+  │    [L bytes: arg string (UTF-8)]
+  ├─ if runner_type == 3 (awf):
+  │  [2 bytes: workflow length (big-endian u16)]
+  │  [L bytes: workflow string (UTF-8)]
+  │  [2 bytes: inputs count (big-endian u16)]
+  │  for each input:
+  │    [2 bytes: input length (big-endian u16)]
+  │    [L bytes: input string (UTF-8, key=value)]
   └─ if runner_type == 1 (amqp):
      [2 bytes: dsn length (big-endian u16)]
      [L bytes: dsn string (UTF-8)]
@@ -173,6 +187,8 @@ Runner type is stored as a single byte:
 |-------|------|
 | 0 | shell |
 | 1 | amqp |
+| 2 | direct |
+| 3 | awf |
 
 ## Writing Entries
 
