@@ -115,6 +115,40 @@ echo 'r1 RULE SET rule.app2 app. direct /usr/bin/curl http://api/result?id=$1' |
 
 In the direct runner, `$1` is passed literally to curl as a query parameter value, not substituted by the shell.
 
+### AWF Runner
+
+Execute an AWF (AI Workflow) using the AWF CLI. Useful for automating AI agent pipelines (code review, report generation, data analysis) on a schedule.
+
+```bash
+echo 'r1 RULE SET rule.review code-review. awf code-review' | socat - TCP:localhost:5678
+```
+
+**Characteristics**:
+- Workflow name is passed to `awf run <workflow>`
+- Optional key=value input parameters via repeated `--input` flag
+- Exit code 0 is success; non-zero is failure
+- Requires `awf` CLI binary to be in `$PATH`
+
+**Example: Without Inputs**
+
+```bash
+echo 'r1 RULE SET rule.review code-review. awf code-review' | socat - TCP:localhost:5678
+# Response: r1 OK
+```
+
+Spawns: `awf run code-review`
+
+**Example: With Inputs**
+
+```bash
+echo 'r1 RULE SET rule.report report. awf generate-report --input format=pdf --input target=main' | socat - TCP:localhost:5678
+# Response: r1 OK
+```
+
+Spawns: `awf run generate-report --input format=pdf --input target=main`
+
+Each `--input` flag passes one key=value pair. Repeat the flag for multiple parameters.
+
 ### AMQP Runner (Deferred)
 
 Publish a message to an AMQP broker. The AMQP runner is defined in the protocol but not yet operational.

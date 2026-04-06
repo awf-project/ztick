@@ -108,7 +108,7 @@ curl http://127.0.0.1:5680/health
 
 ## Runner Types
 
-The API supports two runner types for rule execution:
+The API supports three runner types for rule execution:
 
 ### Shell Runner
 
@@ -132,6 +132,30 @@ Execute a binary directly without shell invocation (safer, more predictable):
   "args": ["-s", "http://example.com/webhook"]
 }
 ```
+
+### AWF Runner
+
+Execute an AWF (AI Workflow) via the `awf` CLI. Useful for automating AI agent pipelines on a schedule:
+
+```json
+{
+  "pattern": "code-review.",
+  "runner": "awf",
+  "args": ["code-review"]
+}
+```
+
+With optional input parameters (key=value pairs passed via `--input` flags):
+
+```json
+{
+  "pattern": "report.",
+  "runner": "awf",
+  "args": ["generate-report", "--input", "format=pdf", "--input", "target=main"]
+}
+```
+
+Spawns `awf run <workflow>` (or `awf run <workflow> --input key1=value1 --input key2=value2` when inputs are provided). Requires the `awf` CLI binary in `$PATH`.
 
 ## Error Responses
 

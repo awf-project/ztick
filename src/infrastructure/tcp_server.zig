@@ -411,6 +411,39 @@ fn build_rule_set_instruction(allocator: std.mem.Allocator, args: [][]u8) error{
             } },
         } };
     }
+    if (runner_type.len >= 1 and std.mem.eql(u8, runner_type[0], "awf")) {
+        if (runner_type.len < 2) return null;
+        const remaining = runner_type[2..];
+        // Validate: remaining args must be pairs of "--input" + value
+        if (remaining.len % 2 != 0) return null;
+        var k: usize = 0;
+        while (k < remaining.len) : (k += 2) {
+            if (!std.mem.eql(u8, remaining[k], "--input")) return null;
+        }
+        const id = try allocator.dupe(u8, args[2]);
+        errdefer allocator.free(id);
+        const pattern = try allocator.dupe(u8, args[3]);
+        errdefer allocator.free(pattern);
+        const workflow = try allocator.dupe(u8, runner_type[1]);
+        errdefer allocator.free(workflow);
+        const input_count = remaining.len / 2;
+        const inputs = try allocator.alloc([]const u8, input_count);
+        var filled: usize = 0;
+        errdefer {
+            for (inputs[0..filled]) |input| allocator.free(input);
+            allocator.free(inputs);
+        }
+        var j: usize = 0;
+        while (j < input_count) : (j += 1) {
+            inputs[j] = try allocator.dupe(u8, remaining[j * 2 + 1]);
+            filled += 1;
+        }
+        return .{ .rule_set = .{
+            .identifier = id,
+            .pattern = pattern,
+            .runner = .{ .awf = .{ .workflow = workflow, .inputs = inputs } },
+        } };
+    }
     return null;
 }
 
@@ -499,6 +532,11 @@ fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Ins
                     allocator.free(d.executable);
                     for (d.args) |arg| allocator.free(arg);
                     allocator.free(d.args);
+                },
+                .awf => |awf| {
+                    allocator.free(awf.workflow);
+                    for (awf.inputs) |input| allocator.free(input);
+                    allocator.free(awf.inputs);
                 },
             }
         },
@@ -940,6 +978,7 @@ test "build_instruction parses RULE SET command with shell runner" {
                 .shell => |sh| try std.testing.expectEqualStrings("/usr/bin/backup.sh", sh.command),
                 .amqp => return error.WrongRunnerType,
                 .direct => return error.WrongRunnerType,
+                .awf => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -966,6 +1005,7 @@ test "build_instruction parses RULE SET command with direct runner and no args" 
                 },
                 .shell => return error.WrongRunnerType,
                 .amqp => return error.WrongRunnerType,
+                .awf => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -992,6 +1032,7 @@ test "build_instruction parses RULE SET command with direct runner and multiple 
                 },
                 .shell => return error.WrongRunnerType,
                 .amqp => return error.WrongRunnerType,
+                .awf => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -1549,6 +1590,109 @@ test "handle_connection forwards stat bypassing namespace authorization without 
     t.join();
 
     try std.testing.expect(ctx.forwarded);
+}
+
+test "build_instruction parses RULE SET command with awf runner and no inputs" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.review"), @constCast("app."), @constCast("awf"), @constCast("code-review") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .rule_set => |r| {
+            try std.testing.expectEqualStrings("rule.review", r.identifier);
+            try std.testing.expectEqualStrings("app.", r.pattern);
+            switch (r.runner) {
+                .awf => |awf| {
+                    try std.testing.expectEqualStrings("code-review", awf.workflow);
+                    try std.testing.expectEqual(@as(usize, 0), awf.inputs.len);
+                },
+                .shell => return error.WrongRunnerType,
+                .amqp => return error.WrongRunnerType,
+                .direct => return error.WrongRunnerType,
+            }
+        },
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction parses RULE SET command with awf runner and --input flags" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.report"), @constCast("report."), @constCast("awf"), @constCast("generate-report"), @constCast("--input"), @constCast("format=pdf"), @constCast("--input"), @constCast("target=main") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .rule_set => |r| {
+            switch (r.runner) {
+                .awf => |awf| {
+                    try std.testing.expectEqualStrings("generate-report", awf.workflow);
+                    try std.testing.expectEqual(@as(usize, 2), awf.inputs.len);
+                    try std.testing.expectEqualStrings("format=pdf", awf.inputs[0]);
+                    try std.testing.expectEqualStrings("target=main", awf.inputs[1]);
+                },
+                .shell => return error.WrongRunnerType,
+                .amqp => return error.WrongRunnerType,
+                .direct => return error.WrongRunnerType,
+            }
+        },
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction returns null for RULE SET with awf runner missing workflow" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.review"), @constCast("app."), @constCast("awf") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "build_instruction returns null for RULE SET with awf --input flag missing value" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.report"), @constCast("report."), @constCast("awf"), @constCast("generate-report"), @constCast("--input") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "build_instruction returns null for RULE SET with awf runner and non-input flag" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.report"), @constCast("report."), @constCast("awf"), @constCast("generate-report"), @constCast("--output"), @constCast("file.txt") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "free_instruction_strings frees rule_set awf runner strings without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "rule.review");
+    const pattern = try allocator.dupe(u8, "app.");
+    const workflow = try allocator.dupe(u8, "code-review");
+    const input0 = try allocator.dupe(u8, "format=pdf");
+    const inputs = try allocator.alloc([]const u8, 1);
+    inputs[0] = input0;
+    const instr = instruction.Instruction{ .rule_set = .{
+        .identifier = id,
+        .pattern = pattern,
+        .runner = .{ .awf = .{ .workflow = workflow, .inputs = inputs } },
+    } };
+    free_instruction_strings(allocator, instr);
 }
 
 test "handle_connection forwards non-stat instruction through namespace authorization check" {

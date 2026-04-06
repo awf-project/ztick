@@ -85,6 +85,11 @@ pub const QueryHandler = struct {
                             for (d.args) |arg| try body_buf.writer(self.allocator).print(" {s}", .{arg});
                             try body_buf.writer(self.allocator).writeByte('\n');
                         },
+                        .awf => |awf| {
+                            try body_buf.writer(self.allocator).print("{s} {s} awf {s}", .{ rule.identifier, rule.pattern, awf.workflow });
+                            for (awf.inputs) |input| try body_buf.writer(self.allocator).print(" --input {s}", .{input});
+                            try body_buf.writer(self.allocator).writeByte('\n');
+                        },
                     }
                 }
 
@@ -550,4 +555,75 @@ test "handle list_rules instruction returns success with direct rule with args i
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "/usr/bin/curl") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "-s") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "http://example.com") != null);
+}
+
+test "handle list_rules instruction returns success with awf rule without input in body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    try rule_storage.set(.{ .identifier = "rule.review", .pattern = "app.", .runner = .{ .awf = .{
+        .workflow = "code-review",
+        .inputs = &.{},
+    } } });
+
+    const request = Request{
+        .client = 17,
+        .identifier = "req-17",
+        .instruction = .{ .list_rules = .{} },
+    };
+
+    const response = try handler.handle(request);
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.review") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "app.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "awf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "code-review") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "--input") == null);
+}
+
+test "handle list_rules instruction returns success with awf rule with input in body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    try rule_storage.set(.{ .identifier = "rule.report", .pattern = "report.", .runner = .{ .awf = .{
+        .workflow = "generate-report",
+        .inputs = &.{"format=pdf"},
+    } } });
+
+    const request = Request{
+        .client = 18,
+        .identifier = "req-18",
+        .instruction = .{ .list_rules = .{} },
+    };
+
+    const response = try handler.handle(request);
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.report") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "report.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "awf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "generate-report") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "--input") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "format=pdf") != null);
 }
