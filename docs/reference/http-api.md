@@ -108,7 +108,7 @@ curl http://127.0.0.1:5680/health
 
 ## Runner Types
 
-The API supports three runner types for rule execution:
+The API supports four runner types for rule execution:
 
 ### Shell Runner
 
@@ -130,6 +130,53 @@ Execute a binary directly without shell invocation (safer, more predictable):
   "type": "direct",
   "executable": "/usr/bin/curl",
   "args": ["-s", "http://example.com/webhook"]
+}
+```
+
+### HTTP Runner
+
+Trigger an external webhook via HTTP/HTTPS request:
+
+```json
+{
+  "type": "http",
+  "method": "POST",
+  "url": "https://hooks.example.com/webhook"
+}
+```
+
+**Methods**: GET, POST, PUT, DELETE
+
+**Behavior**:
+- POST and PUT requests include a JSON body: `{"job_id":"<identifier>","execution":<timestamp_ns>}`
+- GET and DELETE requests send no body
+- HTTP 2xx status codes indicate success; all others indicate failure
+- TLS is automatically used for `https://` URLs
+- Connection and read timeouts are 30 seconds
+
+**Example: POST with webhook**
+
+```bash
+curl -X PUT http://127.0.0.1:5680/rules/notify-deploy \
+  -H "Authorization: Bearer token123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "pattern": "deploy.",
+    "runner": {
+      "type": "http",
+      "method": "POST",
+      "url": "https://hooks.example.com/webhook"
+    }
+  }'
+```
+
+**Example: GET request**
+
+```json
+{
+  "type": "http",
+  "method": "GET",
+  "url": "https://api.internal/trigger"
 }
 ```
 

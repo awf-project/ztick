@@ -255,7 +255,7 @@ pub const Scheduler = struct {
                 var triggered = job;
                 triggered.status = .triggered;
                 try self.job_storage.set(triggered);
-                try self.execution_client.trigger(job.identifier, rule.runner);
+                try self.execution_client.trigger(job.identifier, rule.runner, job.execution);
             } else {
                 var failed = job;
                 failed.status = .failed;

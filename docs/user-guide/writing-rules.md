@@ -115,6 +115,54 @@ echo 'r1 RULE SET rule.app2 app. direct /usr/bin/curl http://api/result?id=$1' |
 
 In the direct runner, `$1` is passed literally to curl as a query parameter value, not substituted by the shell.
 
+### HTTP Runner
+
+Trigger an external webhook via HTTP/HTTPS request. Useful for integrating ztick with third-party services like Slack, cloud functions, or custom webhooks.
+
+```bash
+echo 'r1 RULE SET rule.webhook deploy. http POST https://hooks.example.com/webhook' | socat - TCP:localhost:5678
+```
+
+**Characteristics**:
+- Methods: `GET`, `POST`, `PUT`, `DELETE`
+- POST and PUT requests include a JSON body: `{"job_id":"<identifier>","execution":<timestamp_ns>}`
+- GET and DELETE requests send no body
+- HTTP 2xx status codes are treated as success; all others as failure
+- TLS is automatically used for `https://` URLs
+- Connection and read timeouts: 30 seconds
+
+**Example: Slack Webhook (POST)**
+
+```bash
+echo 'r1 RULE SET rule.slack-notify deploy. http POST https://hooks.slack.com/services/YOUR/WEBHOOK/URL' | socat - TCP:localhost:5678
+```
+
+When a job matching `deploy.*` triggers, ztick sends:
+```
+POST https://hooks.slack.com/services/YOUR/WEBHOOK/URL HTTP/1.1
+Host: hooks.slack.com
+Content-Type: application/json
+Content-Length: 42
+
+{"job_id":"deploy.v1.2.3","execution":1711612800000000000}
+```
+
+**Example: Health Check (GET)**
+
+```bash
+echo 'r1 RULE SET rule.health health. http GET https://api.internal/health' | socat - TCP:localhost:5678
+```
+
+GET requests send no body, useful for pinging endpoints.
+
+**Example: PUT Request**
+
+```bash
+echo 'r1 RULE SET rule.update config. http PUT https://config.internal/update' | socat - TCP:localhost:5678
+```
+
+PUT requests also include the JSON body like POST.
+
 ### AWF Runner
 
 Execute an AWF (AI Workflow) using the AWF CLI. Useful for automating AI agent pipelines (code review, report generation, data analysis) on a schedule.

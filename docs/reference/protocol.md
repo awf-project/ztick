@@ -198,16 +198,18 @@ List all configured rules.
 |-------|-------------|
 | `rule_id` | The rule's identifier |
 | `pattern` | Prefix pattern the rule matches against |
-| `runner_type` | Runner type: `shell`, `direct`, `awf`, or `amqp` |
-| `runner_args` | Shell: `<command>`. Direct: `<executable> [args...]`. AWF: `<workflow> [--input key=value ...]`. AMQP: `<dsn> <exchange> <routing_key>` |
+| `runner_type` | Runner type: `shell`, `direct`, `http`, `awf`, or `amqp` |
+| `runner_args` | Shell: `<command>`. Direct: `<executable> [args...]`. HTTP: `<method> <url>`. AWF: `<workflow> [--input key=value ...]`. AMQP: `<dsn> <exchange> <routing_key>` |
 
 **Examples**:
 ```bash
-# List all rules (with shell, direct, awf, and amqp rules loaded)
+# List all rules (with shell, direct, http, awf, and amqp rules loaded)
 echo 'req-1 LISTRULES' | socat - TCP:localhost:5678
 # Response:
 # req-1 rule.backup backup. shell /usr/bin/backup.sh
 # req-1 rule.curl curl. direct /usr/bin/curl -s http://example.com
+# req-1 rule.webhook deploy. http POST https://hooks.example.com/webhook
+# req-1 rule.health health. http GET https://api.internal/trigger
 # req-1 rule.review code-review. awf code-review
 # req-1 rule.report report. awf generate-report --input format=pdf --input target=main
 # req-1 rule.notify notify. amqp amqp://broker:5672 jobs notifications
@@ -364,6 +366,11 @@ Create or update a rule that matches jobs by prefix and assigns a runner.
 <request_id> RULE SET <rule_identifier> <pattern> awf <workflow> [--input <key=value> ...]
 ```
 
+**Syntax (http runner)**:
+```
+<request_id> RULE SET <rule_identifier> <pattern> http <method> <url>
+```
+
 **Syntax (amqp runner)**:
 ```
 <request_id> RULE SET <rule_identifier> <pattern> amqp <dsn> <exchange> <routing_key>
@@ -374,6 +381,7 @@ Create or update a rule that matches jobs by prefix and assigns a runner.
 - `pattern` (string): Prefix to match job identifiers (e.g., `backup.` matches `backup.daily`)
 - `shell <command>`: Execute a shell command when the job triggers. Quote the command if it contains spaces (e.g., `shell "/bin/echo hello"`)
 - `direct <executable> [args...]`: Execute a binary directly via execve without shell interpretation. The first token after `direct` is the executable path; remaining tokens are passed as literal argv elements. Shell metacharacters are not interpreted, eliminating shell injection risks.
+- `http <method> <url>`: Trigger an external webhook via HTTP/HTTPS request. Methods: `GET`, `POST`, `PUT`, `DELETE`. The URL must include a scheme (`http://` or `https://`). POST and PUT requests include a JSON body `{"job_id":"<identifier>","execution":<timestamp_ns>}`; GET and DELETE send no body. HTTP 2xx status codes indicate success; all others indicate failure. Connection and read timeouts are 30 seconds.
 - `awf <workflow> [--input <key=value> ...]`: Execute an AWF workflow. The workflow name is required. The optional `--input` flag can be repeated to pass key=value parameters to the workflow (e.g., `awf generate-report --input format=pdf --input target=main`)
 - `amqp <dsn> <exchange> <routing_key>`: Publish to an AMQP broker (deferred — not yet operational)
 
@@ -395,8 +403,16 @@ echo 'req-5 RULE SET rule.review code-review. awf code-review' | socat - TCP:loc
 echo 'req-6 RULE SET rule.report report. awf generate-report --input format=pdf --input target=main' | socat - TCP:localhost:5678
 # Response: req-6 OK
 
+# HTTP runner (POST)
+echo 'req-7 RULE SET rule.webhook deploy. http POST https://hooks.example.com/webhook' | socat - TCP:localhost:5678
+# Response: req-7 OK
+
+# HTTP runner (GET)
+echo 'req-8 RULE SET rule.health health. http GET https://api.internal/trigger' | socat - TCP:localhost:5678
+# Response: req-8 OK
+
 # AMQP runner
-echo 'req-7 RULE SET rule.notify notify. amqp amqp://broker:5672 jobs notifications' | socat - TCP:localhost:5678
+echo 'req-9 RULE SET rule.notify notify. amqp amqp://broker:5672 jobs notifications' | socat - TCP:localhost:5678
 # Response: req-7 OK
 ```
 

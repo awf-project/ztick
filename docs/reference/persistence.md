@@ -72,10 +72,17 @@ Stores a single rule record with its runner.
 [L bytes: identifier string (UTF-8)]
 [2 bytes: pattern length (big-endian u16)]
 [L bytes: pattern string (UTF-8)]
-[1 byte: runner type (0=shell, 1=amqp, 2=direct, 3=awf)]
+[1 byte: runner type (0=shell, 1=amqp, 2=direct, 3=awf, 4=http)]
   ├─ if runner_type == 0 (shell):
   │  [2 bytes: command length (big-endian u16)]
   │  [L bytes: command string (UTF-8)]
+  ├─ if runner_type == 1 (amqp):
+  │  [2 bytes: dsn length (big-endian u16)]
+  │  [L bytes: dsn string (UTF-8)]
+  │  [2 bytes: exchange length (big-endian u16)]
+  │  [L bytes: exchange string (UTF-8)]
+  │  [2 bytes: routing_key length (big-endian u16)]
+  │  [L bytes: routing_key string (UTF-8)]
   ├─ if runner_type == 2 (direct):
   │  [2 bytes: executable length (big-endian u16)]
   │  [L bytes: executable string (UTF-8)]
@@ -90,13 +97,11 @@ Stores a single rule record with its runner.
   │  for each input:
   │    [2 bytes: input length (big-endian u16)]
   │    [L bytes: input string (UTF-8, key=value)]
-  └─ if runner_type == 1 (amqp):
-     [2 bytes: dsn length (big-endian u16)]
-     [L bytes: dsn string (UTF-8)]
-     [2 bytes: exchange length (big-endian u16)]
-     [L bytes: exchange string (UTF-8)]
-     [2 bytes: routing_key length (big-endian u16)]
-     [L bytes: routing_key string (UTF-8)]
+  └─ if runner_type == 4 (http):
+     [2 bytes: method length (big-endian u16)]
+     [L bytes: method string (UTF-8, GET|POST|PUT|DELETE)]
+     [2 bytes: url length (big-endian u16)]
+     [L bytes: url string (UTF-8)]
 ```
 
 **Example** (shell runner for rule "t" matching pattern "toto" with command "titi"):
@@ -189,6 +194,7 @@ Runner type is stored as a single byte:
 | 1 | amqp |
 | 2 | direct |
 | 3 | awf |
+| 4 | http |
 
 ## Writing Entries
 

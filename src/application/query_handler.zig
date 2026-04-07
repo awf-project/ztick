@@ -90,6 +90,7 @@ pub const QueryHandler = struct {
                             for (awf.inputs) |input| try body_buf.writer(self.allocator).print(" --input {s}", .{input});
                             try body_buf.writer(self.allocator).writeByte('\n');
                         },
+                        .http => |h| try body_buf.writer(self.allocator).print("{s} {s} http {s} {s}\n", .{ rule.identifier, rule.pattern, h.method, h.url }),
                     }
                 }
 
@@ -626,4 +627,74 @@ test "handle list_rules instruction returns success with awf rule with input in 
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "generate-report") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "--input") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "format=pdf") != null);
+}
+
+test "handle list_rules instruction returns success with http GET rule in body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    try rule_storage.set(.{ .identifier = "rule.ping", .pattern = "health.", .runner = .{ .http = .{
+        .method = "GET",
+        .url = "https://api.internal/trigger",
+    } } });
+
+    const request = Request{
+        .client = 19,
+        .identifier = "req-19",
+        .instruction = .{ .list_rules = .{} },
+    };
+
+    const response = try handler.handle(request);
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.ping") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "health.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "http") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "GET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "https://api.internal/trigger") != null);
+}
+
+test "handle list_rules instruction returns success with http POST rule in body" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var job_storage = JobStorage.init(allocator);
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(allocator);
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    try rule_storage.set(.{ .identifier = "rule.notify", .pattern = "deploy.", .runner = .{ .http = .{
+        .method = "POST",
+        .url = "https://hooks.example.com/webhook",
+    } } });
+
+    const request = Request{
+        .client = 20,
+        .identifier = "req-20",
+        .instruction = .{ .list_rules = .{} },
+    };
+
+    const response = try handler.handle(request);
+    defer if (response.body) |b| allocator.free(b);
+
+    try std.testing.expect(response.success);
+    try std.testing.expect(response.body != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "rule.notify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "deploy.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "http") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "POST") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "https://hooks.example.com/webhook") != null);
 }

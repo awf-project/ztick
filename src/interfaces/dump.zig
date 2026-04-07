@@ -39,6 +39,7 @@ pub fn format_entry_text(writer: anytype, entry: Entry) !void {
                     for (awf.inputs) |input| try writer.print(" --input {s}", .{input});
                     try writer.writeByte('\n');
                 },
+                .http => |h| try writer.print("RULE SET {s} {s} http {s} {s}\n", .{ rule.identifier, rule.pattern, h.method, h.url }),
             }
         },
         .job_removal => |r| try writer.print("REMOVE {s}\n", .{r.identifier}),
@@ -111,6 +112,13 @@ pub fn format_entry_json(writer: anytype, entry: Entry) !void {
                         try write_json_string(writer, input);
                     }
                     try writer.writeAll("]}}");
+                },
+                .http => |h| {
+                    try writer.writeAll("{\"type\":\"http\",\"method\":");
+                    try write_json_string(writer, h.method);
+                    try writer.writeAll(",\"url\":");
+                    try write_json_string(writer, h.url);
+                    try writer.writeAll("}}");
                 },
             }
         },
@@ -511,6 +519,33 @@ test "format_entry_json writes rule_set object with awf runner with inputs" {
     try format_entry_json(fbs.writer(), rule_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"rule_set\",\"identifier\":\"report-rule\",\"pattern\":\"0 8 * * *\",\"runner\":{\"type\":\"awf\",\"workflow\":\"generate-report\",\"inputs\":[\"format=pdf\",\"target=main\"]}}",
+        fbs.getWritten(),
+    );
+}
+
+test "format_entry_text writes RULE SET line for http runner" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const rule_entry = Entry{ .rule = .{
+        .identifier = "webhook-rule",
+        .pattern = "deploy.",
+        .runner = .{ .http = .{ .method = "POST", .url = "https://hooks.example.com/webhook" } },
+    } };
+    try format_entry_text(fbs.writer(), rule_entry);
+    try std.testing.expectEqualStrings("RULE SET webhook-rule deploy. http POST https://hooks.example.com/webhook\n", fbs.getWritten());
+}
+
+test "format_entry_json writes rule_set object with http runner" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const rule_entry = Entry{ .rule = .{
+        .identifier = "webhook-rule",
+        .pattern = "deploy.",
+        .runner = .{ .http = .{ .method = "POST", .url = "https://hooks.example.com/webhook" } },
+    } };
+    try format_entry_json(fbs.writer(), rule_entry);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"rule_set\",\"identifier\":\"webhook-rule\",\"pattern\":\"deploy.\",\"runner\":{\"type\":\"http\",\"method\":\"POST\",\"url\":\"https://hooks.example.com/webhook\"}}",
         fbs.getWritten(),
     );
 }

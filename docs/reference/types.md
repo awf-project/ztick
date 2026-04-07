@@ -121,6 +121,10 @@ pub const Runner = union(enum) {
         executable: []const u8,
         args: []const []const u8,
     },
+    http: struct {
+        method: []const u8,
+        url: []const u8,
+    },
     awf: struct {
         workflow: []const u8,
         input: ?[]const u8,
@@ -145,6 +149,17 @@ pub const Runner = union(enum) {
   - Fields: `executable` (path to binary), `args` (literal argv elements)
   - HTTP schema: `{"type": "direct", "executable": "...", "args": [...]}`
   - Example: `direct /usr/bin/curl -s http://example.com`
+
+- **http**: Trigger an external webhook via HTTP/HTTPS request
+  - Supported via TCP protocol and HTTP API
+  - Fields: `method` (HTTP verb: GET, POST, PUT, DELETE), `url` (target URL)
+  - TCP syntax: `http <METHOD> <URL>` (e.g., `http POST https://hooks.example.com/webhook`)
+  - HTTP request: `{"pattern": "...", "runner": "http", "args": ["POST", "https://hooks.example.com/webhook"]}`
+  - POST and PUT requests include JSON body: `{"job_id":"<identifier>","execution":<timestamp_ns>}`
+  - GET and DELETE requests send no body
+  - TLS support: `https://` URLs establish encrypted connections
+  - Timeout: 30-second connection and read timeout to prevent blocking
+  - Success: HTTP 2xx status codes; all others are treated as failure
 
 - **awf**: Execute an AWF (AI Workflow) via the AWF CLI
   - Supported via TCP protocol and HTTP API
@@ -252,6 +267,22 @@ const rule = Rule{
 };
 ```
 
+### Creating an HTTP Rule
+
+```zig
+const http_rule = Rule{
+    .identifier = "rule.notify",
+    .pattern = "deploy.",
+    .runner = .{ .http = .{ .method = "POST", .url = "https://hooks.example.com/webhook" } },
+};
+
+const http_get_rule = Rule{
+    .identifier = "rule.ping",
+    .pattern = "health.",
+    .runner = .{ .http = .{ .method = "GET", .url = "https://api.internal/trigger" } },
+};
+```
+
 ### Creating an AWF Rule
 
 ```zig
@@ -320,30 +351,35 @@ Types are persisted in binary format:
 [2 bytes: pattern length (big-endian u16)]
 [N bytes: pattern string]
 [1 byte: runner type discriminant]
-  └─ if shell:
+  └─ if shell (0):
      [2 bytes: command length]
      [N bytes: command string]
-  └─ if direct:
-     [2 bytes: executable length]
-     [N bytes: executable string]
-     [2 bytes: args count (big-endian u16)]
-     for each arg:
-       [2 bytes: arg length]
-       [N bytes: arg string]
-  └─ if awf:
-     [2 bytes: workflow length]
-     [N bytes: workflow string]
-     [2 bytes: inputs count (big-endian u16)]
-     for each input:
-       [2 bytes: input length]
-       [N bytes: input string (key=value)]
-  └─ if amqp:
+  └─ if amqp (1):
      [2 bytes: dsn length]
      [N bytes: dsn string]
      [2 bytes: exchange length]
      [N bytes: exchange string]
      [2 bytes: routing_key length]
      [N bytes: routing_key string]
+  └─ if direct (2):
+     [2 bytes: executable length]
+     [N bytes: executable string]
+     [2 bytes: args count (big-endian u16)]
+     for each arg:
+       [2 bytes: arg length]
+       [N bytes: arg string]
+  └─ if awf (3):
+     [2 bytes: workflow length]
+     [N bytes: workflow string]
+     [2 bytes: inputs count (big-endian u16)]
+     for each input:
+       [2 bytes: input length]
+       [N bytes: input string (key=value)]
+  └─ if http (4):
+     [2 bytes: method length]
+     [N bytes: method string (GET|POST|PUT|DELETE)]
+     [2 bytes: url length]
+     [N bytes: url string]
 ```
 
 See [Persistence Format](persistence.md) for complete details.

@@ -3,6 +3,8 @@ zig-out/
 zig-cache/
 .zig-cache/
 test_zig
+test_infra_manual
+*.a
 logfile
 logfile.compressed
 ztick.log

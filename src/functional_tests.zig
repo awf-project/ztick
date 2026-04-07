@@ -3557,3 +3557,155 @@ test "TCP RULE SET with awf runner missing workflow returns ERROR" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "req-1 ERROR\n") != null);
 }
+
+test "RULE SET with HTTP runner over TCP stores rule and appears in LISTRULES" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19915\"\n\n[database]\npersistence = \"memory\"\n");
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19915) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    _ = stream.write("req-1 RULE SET rule.http webhook. http POST https://hooks.example.com/notify\n") catch return error.SkipZigTest;
+    std.Thread.sleep(200_000_000);
+
+    _ = stream.write("req-2 LISTRULES\n") catch return error.SkipZigTest;
+    std.Thread.sleep(300_000_000);
+
+    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
+    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
+    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = stream.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    const response = buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-1 OK\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "http") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "POST") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "https://hooks.example.com/notify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-2 OK\n") != null);
+}
+
+test "HTTP PUT creates HTTP rule and GET returns it in listing" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19916\"\n\n[http]\nlisten = \"127.0.0.1:19917\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    {
+        var stream = try http_connect(19917);
+        defer stream.close();
+        const body = "{\"pattern\": \"deploy.\", \"runner\": \"http\", \"args\": [\"POST\", \"https://hooks.example.com/webhook\"]}";
+        var buf: [512]u8 = undefined;
+        const request = std.fmt.bufPrint(&buf, "PUT /rules/rule.http HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+        const response = try send_http_request(stream, request);
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "rule.http") != null);
+    }
+
+    {
+        var stream = try http_connect(19917);
+        defer stream.close();
+        const response = try send_http_request(
+            stream,
+            "GET /rules?prefix=rule. HTTP/1.1\r\n\r\n",
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "rule.http") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "http") != null);
+    }
+}
+
+test "HTTP PUT with HTTP runner missing url returns 400 bad request" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19918\"\n\n[http]\nlisten = \"127.0.0.1:19919\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    var stream = try http_connect(19919);
+    defer stream.close();
+    const body = "{\"pattern\": \"x\", \"runner\": \"http\", \"args\": [\"GET\"]}";
+    var buf: [512]u8 = undefined;
+    const request = std.fmt.bufPrint(&buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    const response = try send_http_request(stream, request);
+    try std.testing.expect(std.mem.indexOf(u8, response, "400") != null);
+}
+
+test "HTTP PUT with HTTP runner unsupported method returns 400 bad request" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19920\"\n\n[http]\nlisten = \"127.0.0.1:19921\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    var stream = try http_connect(19921);
+    defer stream.close();
+    const body = "{\"pattern\": \"x\", \"runner\": \"http\", \"args\": [\"PATCH\", \"https://hooks.example.com/webhook\"]}";
+    var buf: [512]u8 = undefined;
+    const request = std.fmt.bufPrint(&buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    const response = try send_http_request(stream, request);
+    try std.testing.expect(std.mem.indexOf(u8, response, "400") != null);
+}
+
+test "HTTP PUT with HTTP runner invalid url scheme returns 400 bad request" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19922\"\n\n[http]\nlisten = \"127.0.0.1:19923\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    var stream = try http_connect(19923);
+    defer stream.close();
+    const body = "{\"pattern\": \"x\", \"runner\": \"http\", \"args\": [\"POST\", \"ftp://hooks.example.com/webhook\"]}";
+    var buf: [512]u8 = undefined;
+    const request = std.fmt.bufPrint(&buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    const response = try send_http_request(stream, request);
+    try std.testing.expect(std.mem.indexOf(u8, response, "400") != null);
+}
+
+test "HTTP rule persists and replays from logfile with correct method and url" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const original_rule = Rule{
+        .identifier = "rule.webhook",
+        .pattern = "deploy.",
+        .runner = .{ .http = .{ .method = "POST", .url = "https://hooks.example.com/webhook" } },
+    };
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = original_rule },
+    });
+    defer allocator.free(logfile_data);
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var decode_arena = try replay_into_scheduler(allocator, logfile_data, &scheduler);
+    defer decode_arena.deinit();
+
+    const restored = scheduler.rule_storage.get("rule.webhook");
+    try std.testing.expect(restored != null);
+    try std.testing.expectEqualStrings("deploy.", restored.?.pattern);
+    try std.testing.expectEqualStrings("POST", restored.?.runner.http.method);
+    try std.testing.expectEqualStrings("https://hooks.example.com/webhook", restored.?.runner.http.url);
+}

@@ -444,6 +444,31 @@ fn build_rule_set_instruction(allocator: std.mem.Allocator, args: [][]u8) error{
             .runner = .{ .awf = .{ .workflow = workflow, .inputs = inputs } },
         } };
     }
+    if (runner_type.len >= 1 and std.mem.eql(u8, runner_type[0], "http")) {
+        if (runner_type.len < 3) return null;
+        const method = runner_type[1];
+        const url = runner_type[2];
+        const valid_method = std.mem.eql(u8, method, "GET") or
+            std.mem.eql(u8, method, "POST") or
+            std.mem.eql(u8, method, "PUT") or
+            std.mem.eql(u8, method, "DELETE");
+        if (!valid_method) return null;
+        const valid_scheme = std.mem.startsWith(u8, url, "http://") or
+            std.mem.startsWith(u8, url, "https://");
+        if (!valid_scheme) return null;
+        const id = try allocator.dupe(u8, args[2]);
+        errdefer allocator.free(id);
+        const pattern = try allocator.dupe(u8, args[3]);
+        errdefer allocator.free(pattern);
+        const duped_method = try allocator.dupe(u8, method);
+        errdefer allocator.free(duped_method);
+        const duped_url = try allocator.dupe(u8, url);
+        return .{ .rule_set = .{
+            .identifier = id,
+            .pattern = pattern,
+            .runner = .{ .http = .{ .method = duped_method, .url = duped_url } },
+        } };
+    }
     return null;
 }
 
@@ -537,6 +562,10 @@ fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Ins
                     allocator.free(awf.workflow);
                     for (awf.inputs) |input| allocator.free(input);
                     allocator.free(awf.inputs);
+                },
+                .http => |h| {
+                    allocator.free(h.method);
+                    allocator.free(h.url);
                 },
             }
         },
@@ -979,6 +1008,7 @@ test "build_instruction parses RULE SET command with shell runner" {
                 .amqp => return error.WrongRunnerType,
                 .direct => return error.WrongRunnerType,
                 .awf => return error.WrongRunnerType,
+                .http => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -1006,6 +1036,7 @@ test "build_instruction parses RULE SET command with direct runner and no args" 
                 .shell => return error.WrongRunnerType,
                 .amqp => return error.WrongRunnerType,
                 .awf => return error.WrongRunnerType,
+                .http => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -1033,6 +1064,7 @@ test "build_instruction parses RULE SET command with direct runner and multiple 
                 .shell => return error.WrongRunnerType,
                 .amqp => return error.WrongRunnerType,
                 .awf => return error.WrongRunnerType,
+                .http => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -1613,6 +1645,7 @@ test "build_instruction parses RULE SET command with awf runner and no inputs" {
                 .shell => return error.WrongRunnerType,
                 .amqp => return error.WrongRunnerType,
                 .direct => return error.WrongRunnerType,
+                .http => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -1640,6 +1673,7 @@ test "build_instruction parses RULE SET command with awf runner and --input flag
                 .shell => return error.WrongRunnerType,
                 .amqp => return error.WrongRunnerType,
                 .direct => return error.WrongRunnerType,
+                .http => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -1691,6 +1725,104 @@ test "free_instruction_strings frees rule_set awf runner strings without leak" {
         .identifier = id,
         .pattern = pattern,
         .runner = .{ .awf = .{ .workflow = workflow, .inputs = inputs } },
+    } };
+    free_instruction_strings(allocator, instr);
+}
+
+test "build_instruction parses RULE SET command with http runner GET method" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.ping"), @constCast("health."), @constCast("http"), @constCast("GET"), @constCast("https://api.internal/trigger") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .rule_set => |r| {
+            try std.testing.expectEqualStrings("rule.ping", r.identifier);
+            try std.testing.expectEqualStrings("health.", r.pattern);
+            switch (r.runner) {
+                .http => |h| {
+                    try std.testing.expectEqualStrings("GET", h.method);
+                    try std.testing.expectEqualStrings("https://api.internal/trigger", h.url);
+                },
+                .shell => return error.WrongRunnerType,
+                .amqp => return error.WrongRunnerType,
+                .direct => return error.WrongRunnerType,
+                .awf => return error.WrongRunnerType,
+            }
+        },
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction parses RULE SET command with http runner POST method" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.notify"), @constCast("deploy."), @constCast("http"), @constCast("POST"), @constCast("https://hooks.example.com/webhook") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .rule_set => |r| {
+            switch (r.runner) {
+                .http => |h| {
+                    try std.testing.expectEqualStrings("POST", h.method);
+                    try std.testing.expectEqualStrings("https://hooks.example.com/webhook", h.url);
+                },
+                else => return error.WrongRunnerType,
+            }
+        },
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction returns null for RULE SET with http runner missing url" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.ping"), @constCast("health."), @constCast("http"), @constCast("GET") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "build_instruction returns null for RULE SET with http runner unsupported method" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.ping"), @constCast("health."), @constCast("http"), @constCast("PATCH"), @constCast("https://api.internal/trigger") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "build_instruction returns null for RULE SET with http runner invalid url scheme" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.ping"), @constCast("health."), @constCast("http"), @constCast("GET"), @constCast("ftp://api.internal/trigger") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "free_instruction_strings frees rule_set http runner strings without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "rule.notify");
+    const pattern = try allocator.dupe(u8, "deploy.");
+    const method = try allocator.dupe(u8, "POST");
+    const url = try allocator.dupe(u8, "https://hooks.example.com/webhook");
+    const instr = instruction.Instruction{ .rule_set = .{
+        .identifier = id,
+        .pattern = pattern,
+        .runner = .{ .http = .{ .method = method, .url = url } },
     } };
     free_instruction_strings(allocator, instr);
 }
