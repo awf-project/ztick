@@ -302,7 +302,7 @@ fn handle_connection(
                         .get => |g| TokenStore.is_authorized(id, g.identifier),
                         .remove => |r| TokenStore.is_authorized(id, r.identifier),
                         .remove_rule => |r| TokenStore.is_authorized(id, r.identifier),
-                        .rule_set => |r| TokenStore.is_authorized(id, r.identifier) and TokenStore.is_authorized(id, r.pattern),
+                        .rule_set => |r| TokenStore.is_authorized(id, r.identifier),
                         .query, .list_rules, .stat => true,
                     };
                     if (!allowed) {
@@ -318,11 +318,11 @@ fn handle_connection(
                     }
                 }
 
-                const requires_ns_auth = switch (instr) {
+                const requires_namespace_scope = switch (instr) {
                     .stat => false,
                     else => true,
                 };
-                if (requires_ns_auth and !is_namespace_authorized(client_id, instr)) {
+                if (requires_namespace_scope and !is_namespace_authorized(client_id, instr)) {
                     const msg = std.fmt.allocPrint(allocator, "{s} ERROR\n", .{result.command}) catch {
                         allocator.free(result.command);
                         free_instruction_strings(allocator, instr);
@@ -2302,7 +2302,7 @@ test "handle_connection QUERY results filtered to client namespace after AUTH" {
     try std.testing.expect(std.mem.indexOf(u8, output, "backup.daily") == null);
 }
 
-test "handle_connection RULE SET with pattern outside namespace responds ERROR after AUTH" {
+test "handle_connection RULE SET with identifier in namespace succeeds regardless of pattern namespace" {
     const tokens = [_]domain.auth.Token{
         .{ .name = "deploy", .secret = "sk_deploy_rule", .namespace = "deploy." },
     };
@@ -2346,5 +2346,5 @@ test "handle_connection RULE SET with pattern outside namespace responds ERROR a
     var buf2: [64]u8 = undefined;
     const n_cmd = try poll_for_response(pair.write_stream.handle, &buf2, 500);
     try std.testing.expect(n_cmd > 0);
-    try std.testing.expectEqualStrings("r4 ERROR\n", buf2[0..n_cmd]);
+    try std.testing.expectEqualStrings("r4 OK\n", buf2[0..n_cmd]);
 }
