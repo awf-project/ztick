@@ -5,6 +5,7 @@ pub const Request = struct {
     identifier: u128,
     job_identifier: []const u8,
     runner: runner.Runner,
+    execution: i64 = 0,
 };
 
 pub const Response = struct {

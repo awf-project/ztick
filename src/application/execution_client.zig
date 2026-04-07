@@ -30,7 +30,7 @@ pub const ExecutionClient = struct {
         self.resolved.deinit(self.allocator);
     }
 
-    pub fn trigger(self: *ExecutionClient, job_identifier: []const u8, runner: Runner) !void {
+    pub fn trigger(self: *ExecutionClient, job_identifier: []const u8, runner: Runner, job_execution: i64) !void {
         var bytes: [16]u8 = undefined;
         std.crypto.random.bytes(&bytes);
         const identifier = std.mem.readInt(u128, &bytes, .big);
@@ -39,6 +39,7 @@ pub const ExecutionClient = struct {
             .identifier = identifier,
             .job_identifier = job_identifier,
             .runner = runner,
+            .execution = job_execution,
         };
         try self.triggered.put(self.allocator, identifier, request);
         try self.pending.append(self.allocator, request);
@@ -91,7 +92,7 @@ test "trigger stores request in tracking map" {
     var client = ExecutionClient.init(allocator);
     defer client.deinit();
 
-    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } });
+    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } }, 0);
 
     try std.testing.expectEqual(@as(u32, 1), client.triggered.count());
 }
@@ -104,8 +105,8 @@ test "trigger generates unique identifiers for each invocation" {
     var client = ExecutionClient.init(allocator);
     defer client.deinit();
 
-    try client.trigger("job.1", .{ .shell = .{ .command = "echo a" } });
-    try client.trigger("job.2", .{ .shell = .{ .command = "echo b" } });
+    try client.trigger("job.1", .{ .shell = .{ .command = "echo a" } }, 0);
+    try client.trigger("job.2", .{ .shell = .{ .command = "echo b" } }, 0);
 
     try std.testing.expectEqual(@as(u32, 2), client.triggered.count());
 }
@@ -118,7 +119,7 @@ test "pull_results returns execution results for triggered jobs" {
     var client = ExecutionClient.init(allocator);
     defer client.deinit();
 
-    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } });
+    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } }, 0);
 
     const identifier = client.pending.items[0].identifier;
     client.resolve(.{ .identifier = identifier, .success = true });
@@ -138,8 +139,8 @@ test "pull_results drains tracked executions" {
     var client = ExecutionClient.init(allocator);
     defer client.deinit();
 
-    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } });
-    try client.trigger("job.2", .{ .shell = .{ .command = "echo world" } });
+    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } }, 0);
+    try client.trigger("job.2", .{ .shell = .{ .command = "echo world" } }, 0);
 
     for (client.pending.items) |req| {
         client.resolve(.{ .identifier = req.identifier, .success = true });
@@ -162,7 +163,7 @@ test "resolve does not propagate allocation error to caller" {
     var client = ExecutionClient.init(allocator);
     defer client.deinit();
 
-    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } });
+    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } }, 0);
     const identifier = client.pending.items[0].identifier;
 
     client.resolve(.{ .identifier = identifier, .success = true });
@@ -180,7 +181,7 @@ test "resolve silently discards result on allocation failure" {
     var client = ExecutionClient.init(failing.allocator());
     defer client.deinit();
 
-    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } });
+    try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } }, 0);
     const identifier = client.pending.items[0].identifier;
 
     // resolve must not panic — silent catch handles OOM
@@ -197,9 +198,9 @@ test "drain_pending clears only sent prefix on channel closed" {
     var client = ExecutionClient.init(allocator);
     defer client.deinit();
 
-    try client.trigger("job.1", .{ .shell = .{ .command = "echo a" } });
-    try client.trigger("job.2", .{ .shell = .{ .command = "echo b" } });
-    try client.trigger("job.3", .{ .shell = .{ .command = "echo c" } });
+    try client.trigger("job.1", .{ .shell = .{ .command = "echo a" } }, 0);
+    try client.trigger("job.2", .{ .shell = .{ .command = "echo b" } }, 0);
+    try client.trigger("job.3", .{ .shell = .{ .command = "echo c" } }, 0);
 
     // Mock sender that fails after accepting 2 items.
     const FailAfter2 = struct {

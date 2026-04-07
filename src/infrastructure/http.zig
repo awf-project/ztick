@@ -297,21 +297,16 @@ pub const HttpServer = struct {
         const is_shell = std.mem.eql(u8, input.runner, "shell");
         const is_direct = std.mem.eql(u8, input.runner, "direct");
         const is_awf = std.mem.eql(u8, input.runner, "awf");
+        const is_http = std.mem.eql(u8, input.runner, "http");
 
-        if (!is_shell and !is_direct and !is_awf) {
-            self.allocator.free(input.pattern);
-            self.allocator.free(input.runner);
-            for (input.args) |arg| self.allocator.free(arg);
-            self.allocator.free(input.args);
+        if (!is_shell and !is_direct and !is_awf and !is_http) {
+            free_rule_input(self.allocator, input);
             self.respond_json(request, .bad_request, "unsupported runner type");
             return;
         }
 
         const owned_id = self.allocator.dupe(u8, id) catch {
-            self.allocator.free(input.pattern);
-            self.allocator.free(input.runner);
-            for (input.args) |arg| self.allocator.free(arg);
-            self.allocator.free(input.args);
+            free_rule_input(self.allocator, input);
             return;
         };
 
@@ -319,23 +314,24 @@ pub const HttpServer = struct {
             .{ .shell = .{ .command = if (input.args.len > 0) input.args[0] else "" } }
         else if (is_direct)
             .{ .direct = .{ .executable = if (input.args.len > 0) input.args[0] else "", .args = if (input.args.len > 1) input.args[1..] else &.{} } }
-        else
+        else if (is_awf)
             build_awf_runner(self.allocator, input.args) orelse {
                 self.allocator.free(owned_id);
-                self.allocator.free(input.pattern);
-                self.allocator.free(input.runner);
-                for (input.args) |arg| self.allocator.free(arg);
-                self.allocator.free(input.args);
+                free_rule_input(self.allocator, input);
                 self.respond_json(request, .bad_request, "missing workflow argument");
+                return;
+            }
+        else
+            build_http_runner(input.args) orelse {
+                self.allocator.free(owned_id);
+                free_rule_input(self.allocator, input);
+                self.respond_json(request, .bad_request, "invalid http runner arguments");
                 return;
             };
 
         const resp_body = json.serialize_rule(self.allocator, id, input.pattern, input.runner) catch {
             self.allocator.free(owned_id);
-            self.allocator.free(input.pattern);
-            self.allocator.free(input.runner);
-            for (input.args) |arg| self.allocator.free(arg);
-            self.allocator.free(input.args);
+            free_rule_input(self.allocator, input);
             return;
         };
         defer self.allocator.free(resp_body);
@@ -346,14 +342,12 @@ pub const HttpServer = struct {
             .runner = runner_type,
         } }) orelse {
             self.allocator.free(owned_id);
-            self.allocator.free(input.pattern);
-            self.allocator.free(input.runner);
-            for (input.args) |arg| self.allocator.free(arg);
-            self.allocator.free(input.args);
+            free_rule_input(self.allocator, input);
             return;
         };
         _ = response;
 
+        // Free args not consumed by the runner (method/url for http, workflow/inputs for awf)
         if (is_awf) {
             const awf = runner_type.awf;
             for (input.args) |arg| {
@@ -367,6 +361,11 @@ pub const HttpServer = struct {
                     }
                 }
                 if (!consumed) self.allocator.free(arg);
+            }
+        } else if (is_http) {
+            // args[0] = method (consumed), args[1] = url (consumed), rest freed
+            for (input.args, 0..) |arg, i| {
+                if (i >= 2) self.allocator.free(arg);
             }
         }
         self.allocator.free(input.runner);
@@ -501,6 +500,28 @@ fn build_awf_runner(allocator: std.mem.Allocator, args: []const []const u8) ?run
     return .{ .awf = .{ .workflow = workflow, .inputs = inputs } };
 }
 
+fn free_rule_input(allocator: std.mem.Allocator, input: json.RuleInput) void {
+    allocator.free(input.pattern);
+    allocator.free(input.runner);
+    for (input.args) |arg| allocator.free(arg);
+    allocator.free(input.args);
+}
+
+fn build_http_runner(args: []const []const u8) ?runner_mod.Runner {
+    if (args.len < 2) return null;
+    const method = args[0];
+    const url = args[1];
+    const valid_method = std.mem.eql(u8, method, "GET") or
+        std.mem.eql(u8, method, "POST") or
+        std.mem.eql(u8, method, "PUT") or
+        std.mem.eql(u8, method, "DELETE");
+    if (!valid_method) return null;
+    const valid_scheme = std.mem.startsWith(u8, url, "http://") or
+        std.mem.startsWith(u8, url, "https://");
+    if (!valid_scheme) return null;
+    return .{ .http = .{ .method = method, .url = url } };
+}
+
 // Tests
 
 test "json namespace exposes serialize_health returning correct response" {
@@ -582,5 +603,39 @@ test "build_awf_runner extracts input values from multiple --input flags" {
 test "build_awf_runner returns null when args is empty" {
     const args = [_][]const u8{};
     const runner = build_awf_runner(std.testing.allocator, &args);
+    try std.testing.expectEqual(@as(?runner_mod.Runner, null), runner);
+}
+
+test "build_http_runner returns runner with method and url for POST https" {
+    const args = [_][]const u8{ "POST", "https://hooks.example.com/webhook" };
+    const runner = build_http_runner(&args);
+    try std.testing.expect(runner != null);
+    try std.testing.expectEqualStrings("POST", runner.?.http.method);
+    try std.testing.expectEqualStrings("https://hooks.example.com/webhook", runner.?.http.url);
+}
+
+test "build_http_runner returns runner with method and url for GET http" {
+    const args = [_][]const u8{ "GET", "http://api.internal/trigger" };
+    const runner = build_http_runner(&args);
+    try std.testing.expect(runner != null);
+    try std.testing.expectEqualStrings("GET", runner.?.http.method);
+    try std.testing.expectEqualStrings("http://api.internal/trigger", runner.?.http.url);
+}
+
+test "build_http_runner returns null when url is missing" {
+    const args = [_][]const u8{"POST"};
+    const runner = build_http_runner(&args);
+    try std.testing.expectEqual(@as(?runner_mod.Runner, null), runner);
+}
+
+test "build_http_runner returns null for unsupported method" {
+    const args = [_][]const u8{ "PATCH", "https://hooks.example.com/webhook" };
+    const runner = build_http_runner(&args);
+    try std.testing.expectEqual(@as(?runner_mod.Runner, null), runner);
+}
+
+test "build_http_runner returns null for invalid url scheme" {
+    const args = [_][]const u8{ "POST", "ftp://hooks.example.com/webhook" };
+    const runner = build_http_runner(&args);
     try std.testing.expectEqual(@as(?runner_mod.Runner, null), runner);
 }

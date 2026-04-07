@@ -15,6 +15,10 @@ pub const Runner = union(enum) {
         workflow: []const u8,
         inputs: []const []const u8,
     },
+    http: struct {
+        method: []const u8,
+        url: []const u8,
+    },
 };
 
 const std = @import("std");
@@ -57,6 +61,31 @@ test "direct runner is matched by exhaustive switch" {
         .amqp => "amqp",
         .direct => "direct",
         .awf => "awf",
+        .http => "http",
     };
     try std.testing.expectEqualStrings("direct", tag);
+}
+
+test "http runner stores method and url" {
+    const runner = Runner{ .http = .{ .method = "POST", .url = "https://hooks.example.com/webhook" } };
+    try std.testing.expectEqualStrings("POST", runner.http.method);
+    try std.testing.expectEqualStrings("https://hooks.example.com/webhook", runner.http.url);
+}
+
+test "http runner stores GET method with http url" {
+    const runner = Runner{ .http = .{ .method = "GET", .url = "http://api.internal/trigger" } };
+    try std.testing.expectEqualStrings("GET", runner.http.method);
+    try std.testing.expectEqualStrings("http://api.internal/trigger", runner.http.url);
+}
+
+test "http runner is matched by exhaustive switch" {
+    const runner = Runner{ .http = .{ .method = "DELETE", .url = "https://api.example.com/resource/1" } };
+    const tag: []const u8 = switch (runner) {
+        .shell => "shell",
+        .amqp => "amqp",
+        .direct => "direct",
+        .awf => "awf",
+        .http => "http",
+    };
+    try std.testing.expectEqualStrings("http", tag);
 }

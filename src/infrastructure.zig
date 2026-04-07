@@ -7,3 +7,8 @@ pub const protocol = @import("infrastructure/protocol.zig");
 pub const tls_context = @import("infrastructure/tls_context.zig");
 pub const telemetry = @import("infrastructure/telemetry.zig");
 pub const http = @import("infrastructure/http.zig");
+
+const std = @import("std");
+test {
+    std.testing.refAllDecls(@This());
+}

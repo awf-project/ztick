@@ -95,6 +95,11 @@ fn runner_encoded_size(runner: domain.runner.Runner) !usize {
             }
             break :blk size;
         },
+        .http => |h| blk: {
+            if (h.method.len > std.math.maxInt(u16)) return error.Overflow;
+            if (h.url.len > std.math.maxInt(u16)) return error.Overflow;
+            break :blk 1 + 2 + h.method.len + 2 + h.url.len;
+        },
     };
 }
 
@@ -154,6 +159,17 @@ fn encode_runner(runner: domain.runner.Runner, buf: []u8) void {
                 @memcpy(buf[pos .. pos + input.len], input);
                 pos += input.len;
             }
+        },
+        .http => |h| {
+            buf[pos] = 4;
+            pos += 1;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(h.method.len), .big);
+            pos += 2;
+            @memcpy(buf[pos .. pos + h.method.len], h.method);
+            pos += h.method.len;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(h.url.len), .big);
+            pos += 2;
+            @memcpy(buf[pos..], h.url);
         },
     }
 }
@@ -295,6 +311,23 @@ fn decode_inner(allocator: std.mem.Allocator, data: []const u8) !Entry {
                         .runner = .{ .awf = .{ .workflow = wf_copy, .inputs = inputs } },
                     } };
                 },
+                4 => {
+                    const method_slice = try read_sized_string(data, &pos);
+                    const url_slice = try read_sized_string(data, &pos);
+                    if (pos != data.len) return error.InvalidData;
+                    const id_copy = try allocator.dupe(u8, id_slice);
+                    errdefer allocator.free(id_copy);
+                    const pat_copy = try allocator.dupe(u8, pat_slice);
+                    errdefer allocator.free(pat_copy);
+                    const method_copy = try allocator.dupe(u8, method_slice);
+                    errdefer allocator.free(method_copy);
+                    const url_copy = try allocator.dupe(u8, url_slice);
+                    return .{ .rule = .{
+                        .identifier = id_copy,
+                        .pattern = pat_copy,
+                        .runner = .{ .http = .{ .method = method_copy, .url = url_copy } },
+                    } };
+                },
                 else => return error.InvalidData,
             }
         },
@@ -350,6 +383,10 @@ pub fn free_entry_fields(entry: Entry, allocator: std.mem.Allocator) void {
                     allocator.free(awf.workflow);
                     for (awf.inputs) |input| allocator.free(input);
                     allocator.free(awf.inputs);
+                },
+                .http => |h| {
+                    allocator.free(h.method);
+                    allocator.free(h.url);
                 },
             }
         },
@@ -670,6 +707,65 @@ test "encode decode awf runner round trip with inputs" {
     try std.testing.expectEqual(@as(usize, 2), decoded.rule.runner.awf.inputs.len);
     try std.testing.expectEqualStrings("format=pdf", decoded.rule.runner.awf.inputs[0]);
     try std.testing.expectEqualStrings("target=main", decoded.rule.runner.awf.inputs[1]);
+}
+
+test "encode rule http runner" {
+    const rule = domain.rule.Rule{
+        .identifier = "a",
+        .pattern = "b",
+        .runner = .{ .http = .{ .method = "GET", .url = "http://x" } },
+    };
+    const result = try encode(std.testing.allocator, .{ .rule = rule });
+    defer std.testing.allocator.free(result);
+    // type=1, id=[0,1,'a'], pat=[0,1,'b'], runner_type=4, method=[0,3,"GET"], url=[0,8,"http://x"]
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 1, 97, 0, 1, 98, 4, 0, 3, 71, 69, 84, 0, 8, 104, 116, 116, 112, 58, 47, 47, 120 }, result);
+}
+
+test "decode rule http runner" {
+    const data = [_]u8{ 1, 0, 1, 97, 0, 1, 98, 4, 0, 3, 71, 69, 84, 0, 8, 104, 116, 116, 112, 58, 47, 47, 120 };
+    const result = try decode(std.testing.allocator, &data);
+    defer std.testing.allocator.free(result.rule.identifier);
+    defer std.testing.allocator.free(result.rule.pattern);
+    defer std.testing.allocator.free(result.rule.runner.http.method);
+    defer std.testing.allocator.free(result.rule.runner.http.url);
+    try std.testing.expectEqualStrings("a", result.rule.identifier);
+    try std.testing.expectEqualStrings("b", result.rule.pattern);
+    try std.testing.expectEqualStrings("GET", result.rule.runner.http.method);
+    try std.testing.expectEqualStrings("http://x", result.rule.runner.http.url);
+}
+
+test "encode decode http runner round trip" {
+    const rule = domain.rule.Rule{
+        .identifier = "rule.notify",
+        .pattern = "deploy.*",
+        .runner = .{ .http = .{ .method = "POST", .url = "https://hooks.example.com/webhook" } },
+    };
+    const encoded = try encode(std.testing.allocator, .{ .rule = rule });
+    defer std.testing.allocator.free(encoded);
+    const decoded = try decode(std.testing.allocator, encoded);
+    defer std.testing.allocator.free(decoded.rule.identifier);
+    defer std.testing.allocator.free(decoded.rule.pattern);
+    defer std.testing.allocator.free(decoded.rule.runner.http.method);
+    defer std.testing.allocator.free(decoded.rule.runner.http.url);
+    try std.testing.expectEqualStrings("rule.notify", decoded.rule.identifier);
+    try std.testing.expectEqualStrings("deploy.*", decoded.rule.pattern);
+    try std.testing.expectEqualStrings("POST", decoded.rule.runner.http.method);
+    try std.testing.expectEqualStrings("https://hooks.example.com/webhook", decoded.rule.runner.http.url);
+}
+
+test "free_entry_fields frees http runner rule fields without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "rule.notify");
+    const pattern = try allocator.dupe(u8, "deploy.*");
+    const method = try allocator.dupe(u8, "POST");
+    const url = try allocator.dupe(u8, "https://hooks.example.com/webhook");
+    const entry = Entry{ .rule = .{
+        .identifier = id,
+        .pattern = pattern,
+        .runner = .{ .http = .{ .method = method, .url = url } },
+    } };
+    free_entry_fields(entry, allocator);
+    allocator.free(id);
 }
 
 test "free_entry_fields frees awf runner rule fields without inputs without leak" {
