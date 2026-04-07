@@ -29,13 +29,17 @@ All documentation examples use `socat` as the default tool.
 ```
 1. Connect to the TCP server (default: 127.0.0.1:5678)
 2. If TLS is configured, complete the TLS handshake
-3. Send commands as lines (terminated with \n)
-4. Receive responses (also newline-terminated)
-5. Connection stays open for multiple commands
-6. Close when done
+3. If authentication is enabled, send AUTH command (see AUTH below)
+4. Send commands as lines (terminated with \n)
+5. Receive responses (also newline-terminated)
+6. Connection stays open for multiple commands
+7. Close when done
 ```
 
 When TLS is enabled, plaintext clients that connect will have their connection closed after a failed handshake. The server remains available to new connections.
+
+**Authentication and Namespace Enforcement:**
+When `auth_file` is configured, every new connection must authenticate with the `AUTH` command before any other commands are accepted. After successful authentication, all subsequent commands are subject to **namespace restrictions** — commands targeting job or rule identifiers outside the authenticated token's namespace are rejected with `ERROR`. This applies to `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, and `RULE SET` commands.
 
 ## Command Format
 
@@ -46,7 +50,7 @@ Every command follows this structure:
 ```
 
 - `request_id` — A client-chosen identifier echoed back in the response (e.g., `req-1`, `cmd-42`)
-- `instruction` — The operation to perform (`SET`, `GET`, `QUERY`, `LISTRULES`, `STAT`, `REMOVE`, `REMOVERULE`, or `RULE SET`)
+- `instruction` — The operation to perform (`AUTH`, `SET`, `GET`, `QUERY`, `LISTRULES`, `STAT`, `REMOVE`, `REMOVERULE`, or `RULE SET`)
 - `args` — Instruction-specific arguments
 
 ## Response Format
@@ -73,10 +77,52 @@ Write commands (`SET`, `RULE SET`) and delete commands (`REMOVE`, `REMOVERULE`) 
 | Incomplete line (no newline yet) | Server waits for more data |
 | Unrecognized command | Silently ignored, no response sent (see below) |
 | Out of memory | Connection closed |
+| AUTH timeout (5s) | Connection closed when auth is enabled |
+| Non-AUTH command before authentication | `ERROR` response and connection closed |
 
-**Important**: Only `SET`, `GET`, `QUERY`, `LISTRULES`, `STAT`, `REMOVE`, `REMOVERULE`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
+**Important**: Only `AUTH`, `SET`, `GET`, `QUERY`, `LISTRULES`, `STAT`, `REMOVE`, `REMOVERULE`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
 
 ## Commands
+
+### AUTH
+
+Authenticate with a secret token (required as the first command when authentication is enabled).
+
+**Syntax**:
+```
+AUTH <secret>\n
+```
+
+**Parameters**:
+- `secret` (string): Token secret from the auth file (e.g., `sk_deploy_a1b2c3d4e5f6`)
+
+**Response**:
+- Success: `OK\n`
+- Failure: `ERROR\n` (connection is immediately closed)
+
+**Behavior**:
+- When `auth_file` is configured, AUTH **must** be the first command sent after connecting
+- Sending any other command before AUTH returns `ERROR` and closes the connection
+- Connections that do not complete AUTH within 5 seconds are automatically closed
+- After successful authentication, all subsequent commands are restricted to the token's assigned namespace
+
+**Examples**:
+```bash
+# Authenticate with a valid token
+echo 'AUTH sk_deploy_a1b2c3d4e5f6' | socat - TCP:localhost:5678
+# Response: OK
+
+# Attempt to authenticate with an invalid token
+echo 'AUTH invalid_secret' | socat - TCP:localhost:5678
+# Response: ERROR
+# Connection is closed
+```
+
+**Notes**:
+- AUTH is only required when `auth_file` is configured in the server config
+- When auth is disabled (no `auth_file`), clients can skip AUTH and issue commands directly
+- Secrets are transmitted in **cleartext** over plaintext TCP connections — TLS is **strongly recommended** in production
+- After successful AUTH, the secret is not retained in memory; only the token name and namespace are kept
 
 ### SET
 
@@ -178,6 +224,8 @@ echo 'req-3 QUERY nonexistent.' | socat - TCP:localhost:5678
 ```
 
 **Notes**: QUERY is a read-only command — it does not generate any persistence log entry. Results are returned in unspecified order (hashmap iteration order).
+
+When authentication is enabled, QUERY results are filtered to only include jobs matching the authenticated token's namespace prefix. For example, a token with namespace `deploy.` will only see jobs starting with `deploy.` even if the pattern would normally match other jobs. A token with namespace `*` sees all jobs.
 
 ### LISTRULES
 
@@ -505,6 +553,23 @@ r3 OK
 r4 OK
 ```
 
+### Authenticated Session
+
+When `auth_file` is configured, authenticate before sending commands:
+
+```bash
+# Authenticate, then create and query jobs within namespace
+{
+  echo 'AUTH sk_deploy_a1b2c3d4e5f6'
+  echo 'r1 SET deploy.release.v1 2026-04-01 12:00:00'
+  echo 'r2 QUERY deploy.'
+} | socat - TCP:localhost:5678
+# OK
+# r1 OK
+# r2 deploy.release.v1 planned 1743508800000000000
+# r2 OK
+```
+
 ### Python Client
 
 ```python
@@ -512,6 +577,10 @@ import socket
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.connect(('localhost', 5678))
+
+# Authenticate (only when auth_file is configured)
+# sock.send(b'AUTH sk_deploy_a1b2c3d4e5f6\n')
+# print(sock.recv(1024).decode())  # OK
 
 # Create a rule
 sock.send(b'r1 RULE SET rule.app app. shell "/bin/echo hello"\n')

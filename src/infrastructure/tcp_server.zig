@@ -5,6 +5,9 @@ const Channel = @import("channel.zig").Channel;
 const TlsContext = @import("tls_context.zig").TlsContext;
 const TlsStream = @import("tls_context.zig").TlsStream;
 const telemetry = @import("telemetry.zig");
+const application = @import("../application.zig");
+
+const TokenStore = application.token_store.TokenStore;
 
 const query = domain.query;
 const instruction = domain.instruction;
@@ -32,6 +35,13 @@ pub const Connection = union(enum) {
             .plain => |p| p.stream.close(),
             .tls => |t| t.stream.close(),
         }
+    }
+
+    pub fn fd(self: Connection) std.posix.socket_t {
+        return switch (self) {
+            .plain => |p| p.stream.handle,
+            .tls => |t| t.stream.fd,
+        };
     }
 };
 
@@ -84,15 +94,17 @@ pub const TcpServer = struct {
     active_connections: *std.atomic.Value(usize),
     running: *std.atomic.Value(bool),
     tls_context: ?*TlsContext,
+    token_store: ?*TokenStore,
     instruments: ?telemetry.Instruments,
 
-    pub fn init(allocator: std.mem.Allocator, address: []const u8, running: *std.atomic.Value(bool), tls_context: ?*TlsContext, active_connections: *std.atomic.Value(usize)) TcpServer {
+    pub fn init(allocator: std.mem.Allocator, address: []const u8, running: *std.atomic.Value(bool), tls_context: ?*TlsContext, active_connections: *std.atomic.Value(usize), token_store: ?*TokenStore) TcpServer {
         return .{
             .allocator = allocator,
             .address = address,
             .active_connections = active_connections,
             .running = running,
             .tls_context = tls_context,
+            .token_store = token_store,
             .instruments = null,
         };
     }
@@ -140,6 +152,7 @@ pub const TcpServer = struct {
                 request_channel,
                 response_router,
                 self.tls_context,
+                self.token_store,
             }) catch {
                 _ = self.active_connections.fetchSub(1, .release);
                 if (self.instruments) |instr| instr.connections_active.add(-1, .{}) catch {};
@@ -172,6 +185,7 @@ fn connection_worker(
     request_channel: *Channel(query.Request),
     response_router: *ResponseRouter,
     tls_context: ?*TlsContext,
+    token_store: ?*TokenStore,
 ) void {
     defer _ = active_connections.fetchSub(1, .release);
     defer if (instruments) |instr| instr.connections_active.add(-1, .{}) catch {};
@@ -182,7 +196,7 @@ fn connection_worker(
         };
         break :blk Connection{ .tls = .{ .stream = tls_stream } };
     } else Connection{ .plain = .{ .stream = stream } };
-    handle_connection(allocator, conn, address, client_id, request_channel, response_router);
+    handle_connection(allocator, conn, address, client_id, request_channel, response_router, token_store);
 }
 
 fn handle_connection(
@@ -192,6 +206,7 @@ fn handle_connection(
     client_id: u128,
     request_channel: *Channel(query.Request),
     response_router: *ResponseRouter,
+    token_store: ?*TokenStore,
 ) void {
     std.log.info("client connected: {f}", .{address});
     defer std.log.info("client disconnected: {f}", .{address});
@@ -206,7 +221,29 @@ fn handle_connection(
     var buf: [4096]u8 = undefined;
     var filled: usize = 0;
 
+    var auth_done: bool = (token_store == null);
+    var identity: ?domain.auth.ClientIdentity = null;
+
+    // FR-010: connections that don't complete AUTH within 5 seconds are closed.
+    const auth_deadline_ns: i128 = if (token_store != null)
+        std.time.nanoTimestamp() + 5_000_000_000
+    else
+        0;
+
     while (true) {
+        if (!auth_done) {
+            const now = std.time.nanoTimestamp();
+            if (now >= auth_deadline_ns) return;
+            const remaining_ms = @min(@divFloor(auth_deadline_ns - now, 1_000_000), std.math.maxInt(i32));
+            var pfd = [1]std.posix.pollfd{.{
+                .fd = conn.fd(),
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&pfd, @intCast(remaining_ms)) catch return;
+            if (ready == 0) return;
+        }
+
         const n = conn.read(buf[filled..]) catch return;
         if (n == 0) return;
 
@@ -230,6 +267,26 @@ fn handle_connection(
 
             consumed = filled - result.remaining.len;
 
+            if (!auth_done) {
+                if (!std.mem.eql(u8, result.command, "AUTH") or result.args.len < 1) {
+                    result.deinit(allocator);
+                    _ = conn.write("ERROR\n") catch {};
+                    return;
+                }
+                const secret = result.args[0];
+                if (token_store.?.authenticate(secret)) |id| {
+                    identity = id;
+                    auth_done = true;
+                    result.deinit(allocator);
+                    _ = conn.write("OK\n") catch return;
+                    continue;
+                } else {
+                    result.deinit(allocator);
+                    _ = conn.write("ERROR\n") catch {};
+                    return;
+                }
+            }
+
             if (build_instruction(allocator, result) catch {
                 result.deinit(allocator);
                 return;
@@ -238,6 +295,28 @@ fn handle_connection(
                 // Instruction owns duped strings; free all parsed args uniformly.
                 for (result.args) |arg| allocator.free(arg);
                 allocator.free(result.args);
+
+                if (identity) |id| {
+                    const allowed = switch (instr) {
+                        .set => |s| TokenStore.is_authorized(id, s.identifier),
+                        .get => |g| TokenStore.is_authorized(id, g.identifier),
+                        .remove => |r| TokenStore.is_authorized(id, r.identifier),
+                        .remove_rule => |r| TokenStore.is_authorized(id, r.identifier),
+                        .rule_set => |r| TokenStore.is_authorized(id, r.identifier) and TokenStore.is_authorized(id, r.pattern),
+                        .query, .list_rules, .stat => true,
+                    };
+                    if (!allowed) {
+                        free_instruction_strings(allocator, instr);
+                        const msg = std.fmt.allocPrint(allocator, "{s} ERROR\n", .{result.command}) catch {
+                            allocator.free(result.command);
+                            return;
+                        };
+                        defer allocator.free(msg);
+                        allocator.free(result.command);
+                        _ = conn.write(msg) catch {};
+                        continue;
+                    }
+                }
 
                 const requires_ns_auth = switch (instr) {
                     .stat => false,
@@ -268,7 +347,33 @@ fn handle_connection(
                     };
 
                     if (response_channel.receive()) |resp| {
-                        write_response(allocator, conn, resp) catch {};
+                        if (identity) |id| {
+                            if (resp.request.instruction == .query and !std.mem.eql(u8, id.namespace, "*")) {
+                                var filtered = std.ArrayListUnmanaged(u8){};
+                                defer filtered.deinit(allocator);
+                                if (resp.body) |body| {
+                                    var iter = std.mem.splitScalar(u8, body, '\n');
+                                    while (iter.next()) |line| {
+                                        if (line.len == 0) continue;
+                                        const first_space = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+                                        if (std.mem.startsWith(u8, line[0..first_space], id.namespace)) {
+                                            filtered.appendSlice(allocator, line) catch return;
+                                            filtered.append(allocator, '\n') catch return;
+                                        }
+                                    }
+                                }
+                                const filtered_resp = query.Response{
+                                    .request = resp.request,
+                                    .success = resp.success,
+                                    .body = if (filtered.items.len > 0) filtered.items else null,
+                                };
+                                write_response(allocator, conn, filtered_resp) catch {};
+                            } else {
+                                write_response(allocator, conn, resp) catch {};
+                            }
+                        } else {
+                            write_response(allocator, conn, resp) catch {};
+                        }
                         // Free only the request_id (result.command) — not stored by scheduler.
                         // Instruction strings (job id, pattern, runner args) are now owned
                         // by the scheduler's storage and must not be freed here.
@@ -678,7 +783,7 @@ test "parse_timestamp returns zero on invalid input" {
 test "tcp server init stores address" {
     var running = std.atomic.Value(bool).init(true);
     var active = std.atomic.Value(usize).init(0);
-    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active);
+    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active, null);
     defer server.deinit();
     try std.testing.expectEqualStrings("127.0.0.1:5678", server.address);
 }
@@ -942,6 +1047,7 @@ test "handle_connection exits cleanly when client disconnects immediately" {
         42,
         &req_ch,
         &router,
+        null,
     );
 }
 
@@ -964,6 +1070,7 @@ test "handle_connection deregisters client from router on disconnect" {
         77,
         &req_ch,
         &router,
+        null,
     );
 
     router.mutex.lock();
@@ -1182,6 +1289,7 @@ test "handle_connection passes peer address and exits cleanly" {
         99,
         &req_ch,
         &router,
+        null,
     );
 }
 
@@ -1246,6 +1354,7 @@ test "handle_connection forwards SET instruction to request channel" {
         42,
         &req_ch,
         &router,
+        null,
     );
 
     t.join();
@@ -1289,6 +1398,7 @@ test "handle_connection forwards LISTRULES instruction to request channel" {
         43,
         &req_ch,
         &router,
+        null,
     );
 
     t.join();
@@ -1360,13 +1470,14 @@ test "handle_connection accepts plain Connection and exits cleanly" {
         100,
         &req_ch,
         &router,
+        null,
     );
 }
 
 test "tcp server initializes with null instruments" {
     var running = std.atomic.Value(bool).init(true);
     var active = std.atomic.Value(usize).init(0);
-    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active);
+    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active, null);
     defer server.deinit();
     try std.testing.expectEqual(@as(?telemetry.Instruments, null), server.instruments);
 }
@@ -1375,7 +1486,7 @@ test "tcp server setInstruments makes instruments non-null" {
     const sdk = @import("opentelemetry");
     var running = std.atomic.Value(bool).init(true);
     var active = std.atomic.Value(usize).init(0);
-    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active);
+    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active, null);
     defer server.deinit();
 
     const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator);
@@ -1423,6 +1534,7 @@ test "connection_worker decrements active_connections on exit" {
         200,
         &req_ch,
         &router,
+        null,
         null,
     );
 
@@ -1547,6 +1659,7 @@ test "handle_connection forwards STAT instruction to request channel" {
         44,
         &req_ch,
         &router,
+        null,
     );
 
     t.join();
@@ -1576,6 +1689,7 @@ test "connection_worker with null instruments decrements active_connections on e
         201,
         &req_ch,
         &router,
+        null,
         null,
     );
 
@@ -1617,6 +1731,7 @@ test "handle_connection forwards stat bypassing namespace authorization without 
         202,
         &req_ch,
         &router,
+        null,
     );
 
     t.join();
@@ -1862,9 +1977,374 @@ test "handle_connection forwards non-stat instruction through namespace authoriz
         203,
         &req_ch,
         &router,
+        null,
     );
 
     t.join();
 
     try std.testing.expect(ctx.forwarded);
+}
+
+fn poll_for_response(fd: std.posix.socket_t, buf: []u8, timeout_ms: i32) !usize {
+    var pfd = [1]std.posix.pollfd{.{
+        .fd = fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = try std.posix.poll(&pfd, timeout_ms);
+    if (ready == 0) return 0;
+    return try std.posix.read(fd, buf);
+}
+
+const HCThread = struct {
+    conn: Connection,
+    addr: std.net.Address,
+    client_id: u128,
+    req_ch: *Channel(query.Request),
+    router: *ResponseRouter,
+    store: ?*TokenStore,
+
+    fn run(self: @This()) void {
+        handle_connection(
+            std.testing.allocator,
+            self.conn,
+            self.addr,
+            self.client_id,
+            self.req_ch,
+            self.router,
+            self.store,
+        );
+    }
+};
+
+const EchoScheduler = struct {
+    req_ch: *Channel(query.Request),
+    router: *ResponseRouter,
+
+    fn run(self: @This()) void {
+        while (self.req_ch.receive()) |req| {
+            // In production the scheduler owns instruction strings; free them here to avoid leak.
+            free_instruction_strings(std.testing.allocator, req.instruction);
+            const resp = query.Response{ .request = req, .success = true };
+            self.router.route(resp);
+        }
+    }
+};
+
+test "handle_connection AUTH with valid token responds OK" {
+    const tokens = [_]domain.auth.Token{
+        .{ .name = "deploy", .secret = "sk_deploy_abc", .namespace = "deploy." },
+    };
+    var store = TokenStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.load(&tokens);
+
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    try pair.write_stream.writeAll("AUTH sk_deploy_abc\n");
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
+        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
+        .addr = addr,
+        .client_id = 300,
+        .req_ch = &req_ch,
+        .router = &router,
+        .store = @as(?*TokenStore, &store),
+    }});
+    defer t.join();
+    defer pair.write_stream.close();
+
+    var buf: [64]u8 = undefined;
+    const n = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    try std.testing.expect(n > 0);
+    try std.testing.expectEqualStrings("OK\n", buf[0..n]);
+}
+
+test "handle_connection AUTH with invalid token responds ERROR and closes connection" {
+    var store = TokenStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    try pair.write_stream.writeAll("AUTH bad_secret_xyz\n");
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
+        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
+        .addr = addr,
+        .client_id = 301,
+        .req_ch = &req_ch,
+        .router = &router,
+        .store = @as(?*TokenStore, &store),
+    }});
+    defer t.join();
+    defer pair.write_stream.close();
+
+    var buf: [64]u8 = undefined;
+    const n = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    try std.testing.expect(n > 0);
+    try std.testing.expectEqualStrings("ERROR\n", buf[0..n]);
+}
+
+test "handle_connection non-AUTH first command responds ERROR and closes connection" {
+    const tokens = [_]domain.auth.Token{
+        .{ .name = "deploy", .secret = "sk_deploy_abc", .namespace = "deploy." },
+    };
+    var store = TokenStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.load(&tokens);
+
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const sched = EchoScheduler{ .req_ch = &req_ch, .router = &router };
+    const t_sched = try std.Thread.spawn(.{}, EchoScheduler.run, .{sched});
+    defer t_sched.join();
+    defer req_ch.close();
+
+    try pair.write_stream.writeAll("r1 SET deploy.job 12345\n");
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
+        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
+        .addr = addr,
+        .client_id = 302,
+        .req_ch = &req_ch,
+        .router = &router,
+        .store = @as(?*TokenStore, &store),
+    }});
+    defer t.join();
+    defer pair.write_stream.close();
+
+    var buf: [64]u8 = undefined;
+    const n = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    try std.testing.expect(n > 0);
+    try std.testing.expectEqualStrings("ERROR\n", buf[0..n]);
+}
+
+test "handle_connection command within namespace is accepted after AUTH" {
+    const tokens = [_]domain.auth.Token{
+        .{ .name = "deploy", .secret = "sk_deploy_ns", .namespace = "deploy." },
+    };
+    var store = TokenStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.load(&tokens);
+
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const sched = EchoScheduler{ .req_ch = &req_ch, .router = &router };
+    const t_sched = try std.Thread.spawn(.{}, EchoScheduler.run, .{sched});
+    defer t_sched.join();
+    defer req_ch.close();
+
+    try pair.write_stream.writeAll("AUTH sk_deploy_ns\n");
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
+        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
+        .addr = addr,
+        .client_id = 303,
+        .req_ch = &req_ch,
+        .router = &router,
+        .store = @as(?*TokenStore, &store),
+    }});
+    defer t.join();
+    defer pair.write_stream.close();
+
+    var buf: [128]u8 = undefined;
+    const n_auth = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    try std.testing.expect(n_auth > 0);
+    try std.testing.expectEqualStrings("OK\n", buf[0..n_auth]);
+
+    try pair.write_stream.writeAll("r1 SET deploy.release.1 12345\n");
+
+    var buf2: [64]u8 = undefined;
+    const n_cmd = try poll_for_response(pair.write_stream.handle, &buf2, 500);
+    try std.testing.expect(n_cmd > 0);
+    try std.testing.expectEqualStrings("r1 OK\n", buf2[0..n_cmd]);
+}
+
+test "handle_connection command outside namespace responds ERROR after AUTH" {
+    const tokens = [_]domain.auth.Token{
+        .{ .name = "deploy", .secret = "sk_deploy_ns2", .namespace = "deploy." },
+    };
+    var store = TokenStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.load(&tokens);
+
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const sched = EchoScheduler{ .req_ch = &req_ch, .router = &router };
+    const t_sched = try std.Thread.spawn(.{}, EchoScheduler.run, .{sched});
+    defer t_sched.join();
+    defer req_ch.close();
+
+    try pair.write_stream.writeAll("AUTH sk_deploy_ns2\n");
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
+        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
+        .addr = addr,
+        .client_id = 304,
+        .req_ch = &req_ch,
+        .router = &router,
+        .store = @as(?*TokenStore, &store),
+    }});
+    defer t.join();
+    defer pair.write_stream.close();
+
+    var buf: [64]u8 = undefined;
+    const n_auth = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    try std.testing.expect(n_auth > 0);
+    try std.testing.expectEqualStrings("OK\n", buf[0..n_auth]);
+
+    try pair.write_stream.writeAll("r2 SET backup.daily 12345\n");
+
+    var buf2: [64]u8 = undefined;
+    const n_cmd = try poll_for_response(pair.write_stream.handle, &buf2, 500);
+    try std.testing.expect(n_cmd > 0);
+    try std.testing.expectEqualStrings("r2 ERROR\n", buf2[0..n_cmd]);
+}
+
+test "handle_connection QUERY results filtered to client namespace after AUTH" {
+    const tokens = [_]domain.auth.Token{
+        .{ .name = "deploy", .secret = "sk_deploy_query", .namespace = "deploy." },
+    };
+    var store = TokenStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.load(&tokens);
+
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const QueryScheduler = struct {
+        rch: *Channel(query.Request),
+        rtr: *ResponseRouter,
+
+        fn run(self: @This()) void {
+            if (self.rch.receive()) |req| {
+                // In production the scheduler owns instruction strings; free them here to avoid leak.
+                free_instruction_strings(std.testing.allocator, req.instruction);
+                const body = std.testing.allocator.dupe(u8, "deploy.job1 planned 1595586600000000000\nbackup.daily planned 1595586700000000000\n") catch return;
+                const resp = query.Response{ .request = req, .success = true, .body = body };
+                self.rtr.route(resp);
+            }
+        }
+    };
+    const t_sched = try std.Thread.spawn(.{}, QueryScheduler.run, .{QueryScheduler{
+        .rch = &req_ch,
+        .rtr = &router,
+    }});
+    defer t_sched.join();
+    defer req_ch.close();
+
+    try pair.write_stream.writeAll("AUTH sk_deploy_query\n");
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
+        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
+        .addr = addr,
+        .client_id = 305,
+        .req_ch = &req_ch,
+        .router = &router,
+        .store = @as(?*TokenStore, &store),
+    }});
+    defer t.join();
+    defer pair.write_stream.close();
+
+    var buf: [64]u8 = undefined;
+    const n_auth = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    try std.testing.expect(n_auth > 0);
+    try std.testing.expectEqualStrings("OK\n", buf[0..n_auth]);
+
+    try pair.write_stream.writeAll("r3 QUERY *\n");
+
+    var resp_buf: [512]u8 = undefined;
+    var total: usize = 0;
+    for (0..10) |_| {
+        const n = try poll_for_response(pair.write_stream.handle, resp_buf[total..], 200);
+        if (n == 0) break;
+        total += n;
+        if (std.mem.endsWith(u8, resp_buf[0..total], "r3 OK\n")) break;
+    }
+    try std.testing.expect(total > 0);
+    const output = resp_buf[0..total];
+    try std.testing.expect(std.mem.indexOf(u8, output, "deploy.job1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "backup.daily") == null);
+}
+
+test "handle_connection RULE SET with pattern outside namespace responds ERROR after AUTH" {
+    const tokens = [_]domain.auth.Token{
+        .{ .name = "deploy", .secret = "sk_deploy_rule", .namespace = "deploy." },
+    };
+    var store = TokenStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.load(&tokens);
+
+    const pair = try make_socket_pair();
+
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    defer req_ch.deinit();
+    var router = ResponseRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const sched = EchoScheduler{ .req_ch = &req_ch, .router = &router };
+    const t_sched = try std.Thread.spawn(.{}, EchoScheduler.run, .{sched});
+    defer t_sched.join();
+    defer req_ch.close();
+
+    try pair.write_stream.writeAll("AUTH sk_deploy_rule\n");
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
+    const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
+        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
+        .addr = addr,
+        .client_id = 306,
+        .req_ch = &req_ch,
+        .router = &router,
+        .store = @as(?*TokenStore, &store),
+    }});
+    defer t.join();
+    defer pair.write_stream.close();
+
+    var buf: [64]u8 = undefined;
+    const n_auth = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    try std.testing.expect(n_auth > 0);
+    try std.testing.expectEqualStrings("OK\n", buf[0..n_auth]);
+
+    try pair.write_stream.writeAll("r4 RULE SET deploy.rule backup. shell echo ok\n");
+
+    var buf2: [64]u8 = undefined;
+    const n_cmd = try poll_for_response(pair.write_stream.handle, &buf2, 500);
+    try std.testing.expect(n_cmd > 0);
+    try std.testing.expectEqualStrings("r4 ERROR\n", buf2[0..n_cmd]);
 }

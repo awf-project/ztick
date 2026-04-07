@@ -16,6 +16,10 @@
 
 - Implement configuration parsing for new subsystems before wiring them as application threads; verify [http], [controller], [database] sections exist in config.zig before feature completion
 
+- Expose file descriptors from TLS stream wrappers via accessor methods when low-level socket operations are required
+
+- Implement connection-level authentication as TCP middleware; never add AUTH as Instruction variant to maintain connection-scoped isolation
+
 ## Build System
 
 - Zig 0.15.2; minimal dependencies — zig-o11y/opentelemetry-sdk for telemetry (ADR-0004), system OpenSSL for TLS (ADR-0003), stdlib for everything else
@@ -99,6 +103,10 @@
 - Never commit stub barrel files without implementation; add `@compileError` to unimplemented public functions to prevent partial feature merges
 
 - Add all compiled binaries and build artifacts (test_zig, *.o, *.a, *.so) to .gitignore; build outputs must never be staged or committed
+
+- Enforce 5-second auth timeout using poll-based socket reads; close connection if AUTH not received within timeout
+
+- Initialize TLS contexts identically in test and production code; apply identical guard conditions (config presence checks) to prevent environment-specific bugs
 
 ## Test Conventions
 

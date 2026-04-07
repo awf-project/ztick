@@ -5,6 +5,7 @@ const domain_runner = @import("domain/runner.zig");
 const domain_instruction = @import("domain/instruction.zig");
 const domain_query = @import("domain/query.zig");
 const domain_execution = @import("domain/execution.zig");
+const domain_auth = @import("domain/auth.zig");
 const persistence_encoder = @import("infrastructure/persistence/encoder.zig");
 const persistence_logfile = @import("infrastructure/persistence/logfile.zig");
 const persistence_backend = @import("infrastructure/persistence/backend.zig");
@@ -14,6 +15,8 @@ const application_rule_storage = @import("application/rule_storage.zig");
 const application_query_handler = @import("application/query_handler.zig");
 const application_execution_client = @import("application/execution_client.zig");
 const application_scheduler = @import("application/scheduler.zig");
+const application_token_store = @import("application/token_store.zig");
+const infrastructure_auth = @import("infrastructure/auth.zig");
 const infrastructure_channel = @import("infrastructure/channel.zig");
 const infrastructure_clock = @import("infrastructure/clock.zig");
 const infrastructure_shell_runner = @import("infrastructure/shell_runner.zig");
@@ -86,6 +89,8 @@ test {
     _ = application_query_handler;
     _ = application_execution_client;
     _ = application_scheduler;
+    _ = application_token_store;
+    _ = infrastructure_auth;
     _ = infrastructure_channel;
     _ = infrastructure_clock;
     _ = infrastructure_shell_runner;
@@ -119,6 +124,7 @@ const ControllerContext = struct {
     response_router: *ResponseRouter,
     running: *std.atomic.Value(bool),
     tls_context: ?*infrastructure_tls_context.TlsContext,
+    token_store: ?*application_token_store.TokenStore,
     instruments: ?infrastructure_telemetry.Instruments,
     active_connections: *std.atomic.Value(usize),
 };
@@ -171,7 +177,7 @@ fn run_http_controller(ctx: HttpControllerContext) void {
 }
 
 fn run_controller(ctx: ControllerContext) void {
-    var server = TcpServer.init(ctx.allocator, ctx.address, ctx.running, ctx.tls_context, ctx.active_connections);
+    var server = TcpServer.init(ctx.allocator, ctx.address, ctx.running, ctx.tls_context, ctx.active_connections, ctx.token_store);
     if (ctx.instruments) |instr| server.setInstruments(instr);
     defer server.deinit();
     server.start(ctx.request_ch, ctx.response_router) catch |err| {
@@ -490,10 +496,38 @@ test "controller context tls_context is null when no TLS cert is configured" {
         .response_router = &router,
         .running = &running,
         .tls_context = null,
+        .token_store = null,
         .instruments = null,
         .active_connections = &active,
     };
     try std.testing.expectEqual(@as(?*infrastructure_tls_context.TlsContext, null), ctx.tls_context);
+    try std.testing.expectEqual(@as(?*application_token_store.TokenStore, null), ctx.token_store);
+}
+
+test "controller context token_store is non-null when auth file is configured" {
+    const allocator = std.testing.allocator;
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    var running = std.atomic.Value(bool).init(false);
+
+    var store = application_token_store.TokenStore.init(allocator);
+    defer store.deinit();
+
+    var active = std.atomic.Value(usize).init(0);
+    const ctx = ControllerContext{
+        .allocator = allocator,
+        .address = "127.0.0.1:0",
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .running = &running,
+        .tls_context = null,
+        .token_store = &store,
+        .instruments = null,
+        .active_connections = &active,
+    };
+    try std.testing.expect(ctx.token_store != null);
 }
 
 test "controller context tls_context is non-null when cert and key are configured" {
@@ -518,6 +552,7 @@ test "controller context tls_context is non-null when cert and key are configure
         .response_router = &router,
         .running = &running,
         .tls_context = &tls_ctx,
+        .token_store = null,
         .instruments = null,
         .active_connections = &active,
     };
@@ -988,6 +1023,26 @@ pub fn main() !void {
     }
     defer if (tls_ctx) |*ctx| ctx.deinit();
 
+    var token_store: ?application_token_store.TokenStore = null;
+    var auth_tokens: ?[]domain_auth.Token = null;
+    if (cfg.controller_auth_file) |auth_file| {
+        const content = try std.fs.cwd().readFileAlloc(allocator, auth_file, 1024 * 1024);
+        defer allocator.free(content);
+        auth_tokens = try infrastructure_auth.parse(allocator, content);
+        var store = application_token_store.TokenStore.init(allocator);
+        try store.load(auth_tokens.?);
+        token_store = store;
+    }
+    defer if (auth_tokens) |tokens| {
+        for (tokens) |t| {
+            allocator.free(t.name);
+            allocator.free(t.secret);
+            allocator.free(t.namespace);
+        }
+        allocator.free(tokens);
+    };
+    defer if (token_store) |*store| store.deinit();
+
     const controller_thread = try std.Thread.spawn(.{}, run_controller, .{ControllerContext{
         .allocator = allocator,
         .address = cfg.controller_listen,
@@ -995,6 +1050,7 @@ pub fn main() !void {
         .response_router = &response_router,
         .running = &running,
         .tls_context = if (tls_ctx) |*ctx| ctx else null,
+        .token_store = if (token_store) |*store| store else null,
         .instruments = telemetry_instruments,
         .active_connections = &active_connections,
     }});

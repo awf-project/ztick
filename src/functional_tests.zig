@@ -2751,11 +2751,11 @@ test "stat command over TCP rejects unauthenticated client when auth is enabled"
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tokens_file = try tmp_dir.dir.createFile("tokens.txt", .{});
-    try tokens_file.writeAll("secret-token\n");
+    const tokens_file = try tmp_dir.dir.createFile("tokens.toml", .{});
+    try tokens_file.writeAll("[token.test]\nsecret = \"secret-token\"\nnamespace = \"*\"\n");
     tokens_file.close();
 
-    const tokens_path = try tmp_dir.dir.realpathAlloc(allocator, "tokens.txt");
+    const tokens_path = try tmp_dir.dir.realpathAlloc(allocator, "tokens.toml");
     defer allocator.free(tokens_path);
 
     const config = try std.fmt.allocPrint(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19888\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n", .{tokens_path});
@@ -2770,22 +2770,21 @@ test "stat command over TCP rejects unauthenticated client when auth is enabled"
 
     _ = stream.write("req-unauth STAT\n") catch return error.SkipZigTest;
 
-    std.Thread.sleep(300_000_000);
-
-    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+    // Use poll instead of sleep+nonblocking for sanitizer reliability
+    var pfd = [1]std.posix.pollfd{.{
+        .fd = stream.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = std.posix.poll(&pfd, 2000) catch return error.SkipZigTest;
+    if (ready == 0) return error.SkipZigTest;
 
     var buf: [4096]u8 = undefined;
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = stream.read(buf[total..]) catch break;
-        if (n == 0) break;
-        total += n;
-    }
-    const response = buf[0..total];
+    const n = stream.read(buf[0..]) catch return error.SkipZigTest;
+    const response = buf[0..n];
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "req-unauth ERROR\n") != null);
+    // Server responds ERROR without request_id for non-AUTH commands before authentication
+    try std.testing.expect(std.mem.indexOf(u8, response, "ERROR\n") != null);
 }
 
 test "stat command over TCP reports connections reflecting active connection count" {
@@ -2831,6 +2830,407 @@ test "stat command over TCP reports connections reflecting active connection cou
 
     try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-conn connections 3\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-conn OK\n") != null);
+}
+
+// Feature: F011
+
+const AuthPaths = struct {
+    cwd: []const u8,
+    valid: []const u8,
+    wildcard: []const u8,
+
+    fn resolve(allocator: std.mem.Allocator) !AuthPaths {
+        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        errdefer allocator.free(cwd);
+        const valid = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/auth/valid.toml", .{cwd});
+        errdefer allocator.free(valid);
+        const wildcard = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/auth/wildcard.toml", .{cwd});
+        return .{ .cwd = cwd, .valid = valid, .wildcard = wildcard };
+    }
+
+    fn deinit(self: AuthPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.wildcard);
+        allocator.free(self.valid);
+        allocator.free(self.cwd);
+    }
+};
+
+test "F011: valid AUTH followed by SET command succeeds" {
+    const allocator = std.testing.allocator;
+
+    const auth = try AuthPaths.resolve(allocator);
+    defer auth.deinit(allocator);
+
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19881\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_valid_set.db\"\n",
+        .{auth.valid},
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19881) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&recv_timeout),
+    ) catch {};
+
+    _ = stream.write("AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+
+    var auth_buf: [16]u8 = undefined;
+    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    const auth_response = auth_buf[0..auth_n];
+
+    try std.testing.expectEqualStrings("OK\n", auth_response);
+
+    _ = stream.write("req-auth-1 SET deploy.release.1 1595586600000000000\n") catch return error.SkipZigTest;
+
+    var set_buf: [64]u8 = undefined;
+    const set_n = stream.read(&set_buf) catch return error.SkipZigTest;
+    const set_response = set_buf[0..set_n];
+
+    try std.testing.expect(std.mem.indexOf(u8, set_response, "OK") != null);
+
+    server.tmp_dir.dir.deleteFile("test_auth_valid_set.db") catch {};
+}
+
+test "F011: invalid AUTH closes connection" {
+    const allocator = std.testing.allocator;
+
+    const auth = try AuthPaths.resolve(allocator);
+    defer auth.deinit(allocator);
+
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19882\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_invalid.db\"\n",
+        .{auth.valid},
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19882) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&recv_timeout),
+    ) catch {};
+
+    _ = stream.write("AUTH invalid_secret\n") catch return error.SkipZigTest;
+
+    var buf: [16]u8 = undefined;
+    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const response = buf[0..n];
+
+    try std.testing.expectEqualStrings("ERROR\n", response);
+
+    // Server closes the connection after rejecting invalid AUTH
+    var closed_buf: [16]u8 = undefined;
+    const closed_n = stream.read(&closed_buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), closed_n);
+
+    server.tmp_dir.dir.deleteFile("test_auth_invalid.db") catch {};
+}
+
+test "F011: namespace deny rejects SET outside namespace, allow within namespace" {
+    const allocator = std.testing.allocator;
+
+    const auth = try AuthPaths.resolve(allocator);
+    defer auth.deinit(allocator);
+
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19909\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_ns_deny.db\"\n",
+        .{auth.valid},
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19909) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&recv_timeout),
+    ) catch {};
+
+    _ = stream.write("AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+
+    var auth_buf: [16]u8 = undefined;
+    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
+
+    _ = stream.write("req-ns-deny-1 SET backup.daily 1595586600000000000\n") catch return error.SkipZigTest;
+
+    var deny_buf: [64]u8 = undefined;
+    const deny_n = stream.read(&deny_buf) catch return error.SkipZigTest;
+    try std.testing.expect(std.mem.indexOf(u8, deny_buf[0..deny_n], "ERROR") != null);
+
+    _ = stream.write("req-ns-allow-1 SET deploy.release.1 1595586600000000000\n") catch return error.SkipZigTest;
+
+    var allow_buf: [64]u8 = undefined;
+    const allow_n = stream.read(&allow_buf) catch return error.SkipZigTest;
+    try std.testing.expect(std.mem.indexOf(u8, allow_buf[0..allow_n], "OK") != null);
+
+    server.tmp_dir.dir.deleteFile("test_auth_ns_deny.db") catch {};
+}
+
+test "F011: no auth_file allows commands without AUTH" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19883\"\n\n[database]\nlogfile_path = \"test_no_auth.db\"\n",
+    );
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19883) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&recv_timeout),
+    ) catch {};
+
+    _ = stream.write("req-noauth-1 SET test.job 1595586600000000000\n") catch return error.SkipZigTest;
+
+    var buf: [64]u8 = undefined;
+    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const response = buf[0..n];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "OK") != null);
+
+    server.tmp_dir.dir.deleteFile("test_no_auth.db") catch {};
+}
+
+test "F011: wildcard namespace allows commands targeting any identifier" {
+    const allocator = std.testing.allocator;
+
+    const auth = try AuthPaths.resolve(allocator);
+    defer auth.deinit(allocator);
+
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19885\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_wildcard.db\"\n",
+        .{auth.wildcard},
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19885) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&recv_timeout),
+    ) catch {};
+
+    _ = stream.write("AUTH sk_admin_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+
+    var auth_buf: [16]u8 = undefined;
+    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
+
+    _ = stream.write("req-wc-1 SET deploy.job1 1595586600000000000\n") catch return error.SkipZigTest;
+    var buf1: [64]u8 = undefined;
+    const n1 = stream.read(&buf1) catch return error.SkipZigTest;
+    try std.testing.expect(std.mem.indexOf(u8, buf1[0..n1], "OK") != null);
+
+    _ = stream.write("req-wc-2 SET backup.job1 1595586600000000000\n") catch return error.SkipZigTest;
+    var buf2: [64]u8 = undefined;
+    const n2 = stream.read(&buf2) catch return error.SkipZigTest;
+    try std.testing.expect(std.mem.indexOf(u8, buf2[0..n2], "OK") != null);
+
+    server.tmp_dir.dir.deleteFile("test_auth_wildcard.db") catch {};
+}
+
+test "F011: QUERY filters results to client namespace" {
+    const allocator = std.testing.allocator;
+
+    const auth = try AuthPaths.resolve(allocator);
+    defer auth.deinit(allocator);
+
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19886\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_query_filter.db\"\n",
+        .{auth.valid},
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19886) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&recv_timeout),
+    ) catch {};
+
+    // Authenticate as the backup. token first to seed a backup. job via a separate connection
+    {
+        var seed_stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+        defer seed_stream.close();
+        std.posix.setsockopt(
+            seed_stream.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&recv_timeout),
+        ) catch {};
+        _ = seed_stream.write("AUTH sk_backup_d4e5f6a1b2c3\n") catch return error.SkipZigTest;
+        var sb: [16]u8 = undefined;
+        _ = seed_stream.read(&sb) catch return error.SkipZigTest;
+        _ = seed_stream.write("seed-1 SET backup.job1 1595586600000000000\n") catch return error.SkipZigTest;
+        var sb2: [64]u8 = undefined;
+        _ = seed_stream.read(&sb2) catch return error.SkipZigTest;
+    }
+
+    _ = stream.write("AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+    var auth_buf: [16]u8 = undefined;
+    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
+
+    _ = stream.write("req-set-1 SET deploy.job1 1595586600000000000\n") catch return error.SkipZigTest;
+    var set_buf: [64]u8 = undefined;
+    _ = stream.read(&set_buf) catch return error.SkipZigTest;
+
+    // Empty pattern returns all jobs from scheduler; TCP handler filters by namespace
+    _ = stream.write("req-q-1 QUERY\n") catch return error.SkipZigTest;
+
+    // Accumulate all response lines until OK terminator
+    var response_buf: [1024]u8 = undefined;
+    var total: usize = 0;
+    while (total < response_buf.len) {
+        const n = stream.read(response_buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+        if (std.mem.indexOf(u8, response_buf[0..total], "req-q-1 OK\n") != null) break;
+    }
+    const response = response_buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "deploy.job1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "backup.job1") == null);
+
+    server.tmp_dir.dir.deleteFile("test_auth_query_filter.db") catch {};
+}
+
+test "F011: RULE SET namespace enforcement rejects pattern outside namespace, allows within namespace" {
+    const allocator = std.testing.allocator;
+
+    const auth = try AuthPaths.resolve(allocator);
+    defer auth.deinit(allocator);
+
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19887\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_rule_set_ns.db\"\n",
+        .{auth.valid},
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19887) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&recv_timeout),
+    ) catch {};
+
+    _ = stream.write("AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+
+    var auth_buf: [16]u8 = undefined;
+    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
+
+    _ = stream.write("req-rs-deny-1 RULE SET x backup. shell echo\n") catch return error.SkipZigTest;
+
+    var deny_buf: [64]u8 = undefined;
+    const deny_n = stream.read(&deny_buf) catch return error.SkipZigTest;
+    try std.testing.expect(std.mem.indexOf(u8, deny_buf[0..deny_n], "ERROR") != null);
+
+    _ = stream.write("req-rs-allow-1 RULE SET deploy.r deploy. shell echo\n") catch return error.SkipZigTest;
+
+    var allow_buf: [64]u8 = undefined;
+    const allow_n = stream.read(&allow_buf) catch return error.SkipZigTest;
+    try std.testing.expect(std.mem.indexOf(u8, allow_buf[0..allow_n], "OK") != null);
+
+    server.tmp_dir.dir.deleteFile("test_auth_rule_set_ns.db") catch {};
+}
+
+test "F011: connection closed when no AUTH data received within timeout" {
+    const allocator = std.testing.allocator;
+
+    const auth = try AuthPaths.resolve(allocator);
+    defer auth.deinit(allocator);
+
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19888\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_timeout.db\"\n",
+        .{auth.valid},
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19888) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    // Connect but send no data; server must close the connection after auth timeout (FR-010: 5 seconds)
+    var pfd = [1]std.posix.pollfd{.{
+        .fd = stream.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const ready = std.posix.poll(&pfd, 6000) catch return error.SkipZigTest;
+    try std.testing.expect(ready > 0);
+    var buf: [1]u8 = undefined;
+    const n = std.posix.read(stream.handle, &buf) catch 0;
+    try std.testing.expectEqual(@as(usize, 0), n);
+
+    server.tmp_dir.dir.deleteFile("test_auth_timeout.db") catch {};
 }
 
 // Feature: F013

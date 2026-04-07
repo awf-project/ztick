@@ -1,3 +1,4 @@
+pub const auth = @import("domain/auth.zig");
 pub const job = @import("domain/job.zig");
 pub const rule = @import("domain/rule.zig");
 pub const runner = @import("domain/runner.zig");

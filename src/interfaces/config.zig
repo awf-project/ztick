@@ -50,6 +50,7 @@ pub const Config = struct {
     controller_listen: []const u8,
     controller_tls_cert: ?[]const u8,
     controller_tls_key: ?[]const u8,
+    controller_auth_file: ?[]const u8,
     database_fsync_on_persist: bool,
     database_framerate: u16,
     /// Zig extension: configurable logfile path (Rust reference used hardcoded "logfile").
@@ -64,6 +65,7 @@ pub const Config = struct {
         allocator.free(self.controller_listen);
         if (self.controller_tls_cert) |cert| allocator.free(cert);
         if (self.controller_tls_key) |key| allocator.free(key);
+        if (self.controller_auth_file) |af| allocator.free(af);
         allocator.free(self.database_logfile_path);
         if (self.telemetry.endpoint) |ep| allocator.free(ep);
         allocator.free(self.telemetry.service_name);
@@ -80,6 +82,8 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
     errdefer if (controller_tls_cert) |cert| allocator.free(cert);
     var controller_tls_key: ?[]u8 = null;
     errdefer if (controller_tls_key) |key| allocator.free(key);
+    var controller_auth_file: ?[]u8 = null;
+    errdefer if (controller_auth_file) |af| allocator.free(af);
     var database_fsync_on_persist: bool = true;
     var database_framerate: u16 = 512;
     var database_logfile_path: ?[]u8 = null;
@@ -144,6 +148,9 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
             } else if (std.mem.eql(u8, key, "tls_key")) {
                 if (controller_tls_key) |prev| allocator.free(prev);
                 controller_tls_key = try allocator.dupe(u8, unquote(raw_val));
+            } else if (std.mem.eql(u8, key, "auth_file")) {
+                if (controller_auth_file) |prev| allocator.free(prev);
+                controller_auth_file = try allocator.dupe(u8, unquote(raw_val));
             } else {
                 return ConfigError.UnknownKey;
             }
@@ -222,6 +229,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
         .controller_listen = controller_listen orelse try allocator.dupe(u8, "127.0.0.1:5678"),
         .controller_tls_cert = controller_tls_cert,
         .controller_tls_key = controller_tls_key,
+        .controller_auth_file = controller_auth_file,
         .database_fsync_on_persist = database_fsync_on_persist,
         .database_framerate = database_framerate,
         .database_logfile_path = database_logfile_path orelse try allocator.dupe(u8, "logfile"),
@@ -708,4 +716,37 @@ test "parse rejects unknown key in http section" {
         \\
     );
     try std.testing.expectError(ConfigError.UnknownKey, result);
+}
+
+test "auth_file defaults to null when not configured" {
+    const cfg = try parse(std.testing.allocator, "");
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.controller_auth_file);
+}
+
+test "parse sets auth_file path from controller section" {
+    const cfg = try parse(std.testing.allocator,
+        \\[controller]
+        \\auth_file = "/etc/ztick/auth.toml"
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("/etc/ztick/auth.toml", cfg.controller_auth_file.?);
+}
+
+test "parse sets auth_file independently of tls fields" {
+    const cfg = try parse(std.testing.allocator,
+        \\[controller]
+        \\tls_cert = "/etc/ztick/server.crt"
+        \\tls_key = "/etc/ztick/server.key"
+        \\auth_file = "/etc/ztick/auth.toml"
+        \\
+    );
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("/etc/ztick/server.crt", cfg.controller_tls_cert.?);
+    try std.testing.expectEqualStrings("/etc/ztick/server.key", cfg.controller_tls_key.?);
+    try std.testing.expectEqualStrings("/etc/ztick/auth.toml", cfg.controller_auth_file.?);
 }

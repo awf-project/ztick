@@ -1,0 +1,3 @@
+[token.admin]
+secret = "sk_admin_a1b2c3d4e5f6"
+namespace = "*"
