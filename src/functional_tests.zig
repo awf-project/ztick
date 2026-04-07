@@ -2835,23 +2835,21 @@ test "stat command over TCP reports connections reflecting active connection cou
 // Feature: F011
 
 const AuthPaths = struct {
-    cwd: []const u8,
     valid: []const u8,
     wildcard: []const u8,
 
     fn resolve(allocator: std.mem.Allocator) !AuthPaths {
         const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
-        errdefer allocator.free(cwd);
+        defer allocator.free(cwd);
         const valid = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/auth/valid.toml", .{cwd});
         errdefer allocator.free(valid);
         const wildcard = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/auth/wildcard.toml", .{cwd});
-        return .{ .cwd = cwd, .valid = valid, .wildcard = wildcard };
+        return .{ .valid = valid, .wildcard = wildcard };
     }
 
     fn deinit(self: AuthPaths, allocator: std.mem.Allocator) void {
         allocator.free(self.wildcard);
         allocator.free(self.valid);
-        allocator.free(self.cwd);
     }
 };
 
@@ -4108,4 +4106,124 @@ test "HTTP rule persists and replays from logfile with correct method and url" {
     try std.testing.expectEqualStrings("deploy.", restored.?.pattern);
     try std.testing.expectEqualStrings("POST", restored.?.runner.http.method);
     try std.testing.expectEqualStrings("https://hooks.example.com/webhook", restored.?.runner.http.url);
+}
+
+// Feature: F018
+
+test "stat command over TCP reports auth_enabled 1 when auth_file is configured" {
+    const allocator = std.testing.allocator;
+
+    const auth = try AuthPaths.resolve(allocator);
+    defer auth.deinit(allocator);
+
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19924\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
+        .{auth.wildcard},
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19924) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&recv_timeout),
+    ) catch {};
+
+    _ = stream.write("AUTH sk_admin_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+
+    var auth_buf: [16]u8 = undefined;
+    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
+
+    _ = stream.write("req-stat-f018 STAT\n") catch return error.SkipZigTest;
+
+    // Poll in a loop to accumulate multi-line STAT response for sanitizer reliability
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        var pfd = [1]std.posix.pollfd{.{
+            .fd = stream.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&pfd, 2000) catch return error.SkipZigTest;
+        if (ready == 0) break;
+        const n = stream.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+        if (std.mem.indexOf(u8, buf[0..total], "req-stat-f018 OK\n") != null) break;
+    }
+    const response = buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-f018 auth_enabled 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-f018 OK\n") != null);
+}
+
+test "stat command succeeds for namespace-scoped authenticated client" {
+    const allocator = std.testing.allocator;
+
+    const auth = try AuthPaths.resolve(allocator);
+    defer auth.deinit(allocator);
+
+    // valid.toml has deploy token scoped to "deploy." namespace
+    const config_content = try std.fmt.allocPrint(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19925\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
+        .{auth.valid},
+    );
+    defer allocator.free(config_content);
+
+    var server = try TestServer.start(allocator, config_content);
+    defer server.stop();
+
+    const addr = std.net.Address.parseIp("127.0.0.1", 19925) catch unreachable;
+    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    defer stream.close();
+
+    const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        std.mem.asBytes(&recv_timeout),
+    ) catch {};
+
+    _ = stream.write("AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+
+    var auth_buf: [16]u8 = undefined;
+    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
+
+    // STAT has no namespace prefix — must succeed despite namespace-scoped token
+    _ = stream.write("req-stat-ns STAT\n") catch return error.SkipZigTest;
+
+    // Poll in a loop to accumulate multi-line STAT response for sanitizer reliability
+    var buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        var pfd = [1]std.posix.pollfd{.{
+            .fd = stream.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&pfd, 2000) catch return error.SkipZigTest;
+        if (ready == 0) break;
+        const n = stream.read(buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+        if (std.mem.indexOf(u8, buf[0..total], "req-stat-ns OK\n") != null) break;
+    }
+    const response = buf[0..total];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-ns auth_enabled 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-ns OK\n") != null);
 }

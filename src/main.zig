@@ -1093,7 +1093,7 @@ pub fn main() !void {
         .instruments = telemetry_instruments,
         .startup_ns = startup_ns,
         .active_connections = &active_connections,
-        .auth_enabled = false,
+        .auth_enabled = cfg.controller_auth_file != null,
         .tls_enabled = cfg.controller_tls_cert != null,
     }});
 

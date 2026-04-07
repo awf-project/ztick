@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **STAT command** — Server health metrics query with 15 key-value metrics (uptime, connection count, job/rule counts, execution pipeline state, persistence backend, compression status, auth/TLS configuration)
+- **STAT command with authentication wiring (F018)** — Server health metrics query with 15 key-value metrics (uptime, connection count, job/rule counts, execution pipeline state, persistence backend, compression status, auth/TLS configuration). STAT reports `auth_enabled` based on server configuration and requires authentication when `auth_file` is configured. STAT is namespace-independent — any authenticated client can call it regardless of token scope.
 - EUPL v1.2 license file
 - `.editorconfig` for consistent code formatting
 

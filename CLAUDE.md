@@ -15,10 +15,9 @@
 - Maintain CRUD endpoint parity in OpenAPI specs; if GET /jobs/{id} exists, corresponding GET /rules/{id} must exist or be explicitly documented as omitted in spec comments
 
 - Implement configuration parsing for new subsystems before wiring them as application threads; verify [http], [controller], [database] sections exist in config.zig before feature completion
-
 - Expose file descriptors from TLS stream wrappers via accessor methods when low-level socket operations are required
-
 - Implement connection-level authentication as TCP middleware; never add AUTH as Instruction variant to maintain connection-scoped isolation
+- Maintain strict layer separation during feature merges; keep application-layer code (session management, namespace enforcement) isolated to its originating feature branch, reference-only in dependent tasks
 
 ## Build System
 
@@ -29,8 +28,7 @@
 ## Naming Conventions
 
 - Types: PascalCase (Job, ShellRunner, ParseResult). Functions: snake_case (handle_query, encode_job). Constants: snake_case (max_entry_size)
-- Error types suffixed with Error (ConfigError, SendError, ParseError, DecodeError)
-- Abbreviations: ch (channel), req/resp (request/response), instr (instruction), id (identifier), ns (nanoseconds)
+- Error types suffixed with Error (ConfigError, SendError, ParseError, DecodeError)- Abbreviations: ch (channel), req/resp (request/response), instr (instruction), id (identifier), ns (nanoseconds)
 
 ## Concurrency
 
@@ -73,7 +71,6 @@
 
 ## Common Pitfalls
 
-- Use per-connection response channels; never share a response channel across concurrent connections
 - Propagate allocation errors immediately; never catch OOM and convert to false success
 - Copy storage results into owned allocation before mutation; never iterate and mutate simultaneously
 - Close channels before joining threads to prevent deadlocks; document shutdown sequence explicitly
@@ -83,38 +80,25 @@
 - Use std.json.Stringify for all JSON serialization; never build JSON strings manually. Use std.json.parseFromSlice for deserialization into typed structs
 - For follow mode initial offset: subtract remaining partial-frame bytes from file length, not file length itself; starting at file end skips incomplete frames
 - Never silently ignore persistence decode errors; emit warnings to stderr with byte offset for each failure to aid debugging
-
 - When copying structs containing ArrayListUnmanaged or similar shared-backing types, ensure only the owning copy calls deinit; non-owning copies must be dropped without cleanup to prevent double-frees
-
 - Retain .to_compress file on failed atomic rename during compression; verify destination non-existence before overwrite to prevent silent data loss during file rotation
-
 - Use monotonic time or atomic counters for compression intervals; avoid wall-clock subtraction which wraps on NTP stepback causing infinite compression loops
-
 - Add generated compression artifacts (.compressed, .to_compress) to .gitignore; never stage test output files or temporary persistence artifacts
-
 - Always log failed background compression at ERROR level with .to_compress file path; retention of orphaned compression files is required for data recovery
-
 - Always validate shell executables with execute mode (.{ .mode = .execute }), not default read-only mode; default mode misses executable permission failures that fail at runtime
-
 - Always unescape TOML escape sequences when parsing array values; skipping escape bytes and copying raw backslashes produces literal backslashes instead of unescaped values
-
 - Never duplicate specification details across files (openapi.yaml, http-api.md, types.md); maintain single source of truth per spec element (schema descriptions, format rules, field definitions)
-
 - Never commit stub barrel files without implementation; add `@compileError` to unimplemented public functions to prevent partial feature merges
-
 - Add all compiled binaries and build artifacts (test_zig, *.o, *.a, *.so) to .gitignore; build outputs must never be staged or committed
-
 - Enforce 5-second auth timeout using poll-based socket reads; close connection if AUTH not received within timeout
-
 - Initialize TLS contexts identically in test and production code; apply identical guard conditions (config presence checks) to prevent environment-specific bugs
+- Never reimplement logic from merged features; if F011 auth was completed, F018 should only reference it via config wiring without adding session management code
 
 ## Test Conventions
 
 - Co-locate unit tests in test blocks within source files; use functional_tests.zig for integration tests
 - Verbose test names describe behavior (e.g., `test "tick processes query request and routes response"`)
-
 - Always use std.testing.tmpDir for test files; never hardcode /tmp paths which create race conditions across parallel test execution
-
 - Always verify unit tests execute through `zig build test-<layer>` targets, not just direct `zig test`; barrel export chains may prevent test discovery by the build system
 
 ## Review Standards
@@ -126,3 +110,4 @@
 - Verify all planned components are implemented before merge; HTTP controller requires std.http.Server routing, json codec (std.json), [http] config section, and threading — all must compile and pass tests
 - Use std.http.Server for HTTP request/response handling; never parse HTTP manually. Use request.respond() for responses, iterateHeaders() for custom headers
 - Dupe all instruction string identifiers before sending to scheduler via Channel; scheduler stores pointers without copying (same ownership pattern as TCP server's build_instruction)
+- Always verify scope alignment before merge; reject PRs that include logic from non-target features (e.g., F011 auth session management should not appear in F018 branch)
