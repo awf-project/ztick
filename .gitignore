@@ -2,8 +2,7 @@
 zig-out/
 zig-cache/
 .zig-cache/
-test_zig
-test_infra_manual
+test_*
 *.a
 logfile
 logfile.compressed
