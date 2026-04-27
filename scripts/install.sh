@@ -1,0 +1,115 @@
+#!/bin/sh
+# POSIX-compatible installer for ztick: detects OS/arch, downloads binary from
+# GitHub Releases, verifies SHA256 checksum, and places it in INSTALL_DIR.
+set -eu
+
+REPO="awf-project/ztick"
+INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
+
+detect_os() {
+    uname -s | tr '[:upper:]' '[:lower:]'
+}
+
+detect_arch() {
+    uname -m
+}
+
+map_platform() {
+    os=$(detect_os)
+    arch=$(detect_arch)
+    case "${os}-${arch}" in
+        darwin-arm64|darwin-x86_64) echo "ztick-darwin-universal" ;;
+        linux-x86_64)    echo "ztick-linux-x86_64" ;;
+        linux-aarch64)   echo "ztick-linux-arm64" ;;
+        *)
+            echo "unsupported platform: ${os}-${arch}" >&2
+            exit 1
+            ;;
+    esac
+}
+
+fetch_latest_release_url() {
+    platform="$1"
+    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+        | grep "browser_download_url" \
+        | grep "${platform}" \
+        | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/'
+}
+
+download_binary() {
+    url="$1"
+    dest="$2"
+    curl -fsSL -o "$dest" "$url"
+}
+
+verify_checksum() {
+    binary="$1"
+    checksums_file="$2"
+    name=$(basename "$binary")
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash_cmd="sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        hash_cmd="shasum -a 256"
+    else
+        echo "warning: sha256sum and shasum not found, skipping checksum verification" >&2
+        return
+    fi
+    # SHA256SUMS lines look like "<hash>  [path/]filename". Strip any leading
+    # directory from the recorded name and match the basename exactly, so a
+    # download named `ztick-linux-x86_64` doesn't accidentally match every line
+    # that starts with `ztick-`.
+    expected=$(awk -v n="$name" '{sub(/^.*\//, "", $2)} $2 == n {print $1; exit}' "$checksums_file")
+    actual=$($hash_cmd "$binary" | awk '{print $1}')
+    if [ "$expected" != "$actual" ]; then
+        echo "checksum mismatch for ${name}" >&2
+        exit 1
+    fi
+}
+
+install_binary() {
+    src="$1"
+    mkdir -p "$INSTALL_DIR"
+    cp "$src" "${INSTALL_DIR}/ztick"
+    chmod +x "${INSTALL_DIR}/ztick"
+}
+
+check_path() {
+    case ":${PATH}:" in
+        *":${INSTALL_DIR}:"*) ;;
+        *)
+            echo "warning: ${INSTALL_DIR} is not in your PATH" >&2
+            printf '  Add to your shell profile: export PATH="${PATH}:%s"\n' "${INSTALL_DIR}" >&2
+            ;;
+    esac
+}
+
+main() {
+    platform=$(map_platform)
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+
+    binary="${tmpdir}/${platform}"
+    checksums="${tmpdir}/SHA256SUMS"
+
+    binary_url=$(fetch_latest_release_url "$platform")
+    if [ -z "$binary_url" ]; then
+        echo "error: could not find release binary for ${platform}" >&2
+        exit 1
+    fi
+
+    checksums_url=$(fetch_latest_release_url "SHA256SUMS")
+    download_binary "$binary_url" "$binary"
+
+    if [ -n "$checksums_url" ]; then
+        download_binary "$checksums_url" "$checksums"
+        verify_checksum "$binary" "$checksums"
+    fi
+
+    install_binary "$binary"
+    check_path
+    echo "ztick installed to ${INSTALL_DIR}/ztick"
+}
+
+if [ -z "${ZTICK_INSTALL_SKIP_MAIN:-}" ]; then
+    main "$@"
+fi

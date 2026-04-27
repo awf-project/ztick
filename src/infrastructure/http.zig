@@ -5,6 +5,7 @@ const http = std.http;
 const domain = @import("../domain.zig");
 const Channel = @import("channel.zig").Channel;
 const tcp_server = @import("tcp_server.zig");
+const version_info = @import("../version.zig");
 
 const query = domain.query;
 const instruction = domain.instruction;
@@ -23,7 +24,24 @@ pub const HttpServer = struct {
     next_client_id: std.atomic.Value(u128),
     bearer_token: ?[]const u8,
 
-    const openapi_spec = @embedFile("openapi.json");
+    // Comptime substitution: replace the `__VERSION__` placeholder embedded
+    // inside `openapi.json` with the canonical version from `build.zig.zon`,
+    // so the served spec stays in sync without duplicating the version string.
+    const openapi_spec: []const u8 = blk: {
+        @setEvalBranchQuota(200_000);
+        const template = @embedFile("openapi.json");
+        const placeholder = "__VERSION__";
+        const idx = std.mem.indexOf(u8, template, placeholder) orelse
+            @compileError("openapi.json must contain a single \"__VERSION__\" placeholder");
+        const ver = version_info.version;
+        const new_len = template.len - placeholder.len + ver.len;
+        var buf: [new_len]u8 = undefined;
+        @memcpy(buf[0..idx], template[0..idx]);
+        @memcpy(buf[idx .. idx + ver.len], ver);
+        @memcpy(buf[idx + ver.len ..], template[idx + placeholder.len ..]);
+        const final = buf;
+        break :blk &final;
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,

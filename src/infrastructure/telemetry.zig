@@ -1,6 +1,7 @@
 const std = @import("std");
 const sdk = @import("opentelemetry");
 const config = @import("../interfaces/config.zig");
+const version_info = @import("../version.zig");
 
 pub const Span = sdk.api.trace.Span;
 
@@ -281,7 +282,7 @@ pub fn setup(allocator: std.mem.Allocator, cfg: config.TelemetryConfig) !?*Provi
     // Build resource attributes for service identification
     const resource_attrs = try sdk.attributes.Attributes.from(allocator, .{
         "service.name",    @as([]const u8, cfg.service_name),
-        "service.version", @as([]const u8, "0.1.0"),
+        "service.version", @as([]const u8, version_info.version),
     });
 
     const trace_otlp = try ResourceAwareOTLPExporter.init(allocator, otlp_config, resource_attrs);

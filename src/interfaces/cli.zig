@@ -1,9 +1,12 @@
 const std = @import("std");
+const cli = @import("cli");
+const version_info = @import("../version.zig");
 
 pub const CliError = error{
+    NoCommandSelected,
     UnknownFlag,
     MissingValue,
-    InvalidValue,
+    UnexpectedPositional,
 };
 
 pub const Format = enum {
@@ -23,138 +26,200 @@ pub const Command = union(enum) {
     dump: struct { options: DumpOptions },
 };
 
-pub fn parse_slice(args: []const []const u8) CliError!Command {
-    if (args.len > 0 and std.mem.eql(u8, args[0], "dump")) {
-        return parse_dump(args[1..]);
-    }
-    return parse_server(args);
+// zig-cli action handlers must be `*const fn () anyerror!void` (zero-arg).
+// We capture parsed values into module-level state, then read them from
+// `parse()` after the runner returns. State is reset on each parse() call.
+var captured: ?Command = null;
+var arg_config_path: ?[]const u8 = null;
+var arg_dump_logfile: []const u8 = "";
+var arg_dump_format: Format = .text;
+var arg_dump_compact: bool = false;
+var arg_dump_follow: bool = false;
+
+fn server_action() !void {
+    captured = Command{ .server = .{ .config_path = arg_config_path } };
 }
 
-fn parse_server(args: []const []const u8) CliError!Command {
-    var config_path: ?[]const u8 = null;
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
-            i += 1;
-            if (i >= args.len) return CliError.MissingValue;
-            config_path = args[i];
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            return CliError.UnknownFlag;
-        }
-    }
-    return Command{ .server = .{ .config_path = config_path } };
-}
-
-fn parse_dump(args: []const []const u8) CliError!Command {
-    if (args.len == 0) return CliError.MissingValue;
-
-    const logfile_path = args[0];
-    var format = Format.text;
-    var compact = false;
-    var follow = false;
-
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--format")) {
-            i += 1;
-            if (i >= args.len) return CliError.MissingValue;
-            const fmt = args[i];
-            if (std.mem.eql(u8, fmt, "text")) {
-                format = .text;
-            } else if (std.mem.eql(u8, fmt, "json")) {
-                format = .json;
-            } else {
-                return CliError.InvalidValue;
-            }
-        } else if (std.mem.eql(u8, arg, "--compact")) {
-            compact = true;
-        } else if (std.mem.eql(u8, arg, "--follow")) {
-            follow = true;
-        } else {
-            return CliError.UnknownFlag;
-        }
-    }
-
-    return Command{ .dump = .{ .options = .{
-        .logfile_path = logfile_path,
-        .format = format,
-        .compact = compact,
-        .follow = follow,
+fn dump_action() !void {
+    captured = Command{ .dump = .{ .options = .{
+        .logfile_path = arg_dump_logfile,
+        .format = arg_dump_format,
+        .compact = arg_dump_compact,
+        .follow = arg_dump_follow,
     } } };
 }
 
-pub fn parse(allocator: std.mem.Allocator) anyerror!Command {
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
-    var cmd = try parse_slice(argv[1..]);
-    switch (cmd) {
-        .server => |*s| {
-            if (s.config_path) |p| s.config_path = try allocator.dupe(u8, p);
-        },
-        .dump => |*d| {
-            d.options.logfile_path = try allocator.dupe(u8, d.options.logfile_path);
-        },
-    }
-    return cmd;
+/// Returns true when argv[1] is a known subcommand or a top-level help/version
+/// flag — i.e., when zig-cli can dispatch directly. Otherwise, the user invoked
+/// `ztick` (no args) or `ztick -c PATH`, and we transparently default to
+/// `server` mode to preserve the daemon-style UX.
+fn has_recognized_subcommand(argv: []const []const u8) bool {
+    if (argv.len < 2) return false;
+    const first = argv[1];
+    return std.mem.eql(u8, first, "server") or
+        std.mem.eql(u8, first, "dump") or
+        std.mem.eql(u8, first, "--help") or
+        std.mem.eql(u8, first, "-h") or
+        std.mem.eql(u8, first, "--version") or
+        std.mem.eql(u8, first, "-v");
 }
 
-test "parse no args returns server command" {
-    const cmd = try parse_slice(&.{});
+/// Inline parser for the implicit-server form (`ztick`, `ztick -c PATH`).
+/// Allocates `config_path` on the supplied allocator so the result outlives
+/// `argv`. The caller is responsible for freeing it (see main.zig).
+fn parse_implicit_server(allocator: std.mem.Allocator, argv: []const []const u8) !Command {
+    var config_path_ref: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
+            i += 1;
+            if (i >= argv.len) return CliError.MissingValue;
+            config_path_ref = argv[i];
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return CliError.UnknownFlag;
+        } else {
+            return CliError.UnexpectedPositional;
+        }
+    }
+    const config_dup = if (config_path_ref) |p| try allocator.dupe(u8, p) else null;
+    return Command{ .server = .{ .config_path = config_dup } };
+}
+
+pub fn parse(allocator: std.mem.Allocator) !Command {
+    const argv = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, argv);
+
+    if (!has_recognized_subcommand(argv)) {
+        return parse_implicit_server(allocator, argv);
+    }
+
+    captured = null;
+    arg_config_path = null;
+    arg_dump_logfile = "";
+    arg_dump_format = .text;
+    arg_dump_compact = false;
+    arg_dump_follow = false;
+
+    var r = try cli.AppRunner.init(allocator);
+
+    const server_options = try r.allocOptions(&.{
+        .{
+            .long_name = "config",
+            .short_alias = 'c',
+            .help = "Path to a TOML configuration file",
+            .value_ref = r.mkRef(&arg_config_path),
+            .value_name = "PATH",
+        },
+    });
+
+    const dump_positional = try r.allocPositionalArgs(&.{
+        .{
+            .name = "LOGFILE",
+            .help = "Path to the logfile to dump",
+            .value_ref = r.mkRef(&arg_dump_logfile),
+        },
+    });
+
+    const dump_options = try r.allocOptions(&.{
+        .{
+            .long_name = "format",
+            .help = "Output format: text or json",
+            .value_ref = r.mkRef(&arg_dump_format),
+            .value_name = "FORMAT",
+        },
+        .{
+            .long_name = "compact",
+            .help = "Compact JSON output (no pretty-printing)",
+            .value_ref = r.mkRef(&arg_dump_compact),
+        },
+        .{
+            .long_name = "follow",
+            .help = "Watch the logfile for new entries",
+            .value_ref = r.mkRef(&arg_dump_follow),
+        },
+    });
+
+    const subcommands = try r.allocCommands(&.{
+        .{
+            .name = "server",
+            .description = .{ .one_line = "Start the ztick scheduler (TCP + optional HTTP)" },
+            .options = server_options,
+            .target = .{ .action = .{ .exec = server_action } },
+        },
+        .{
+            .name = "dump",
+            .description = .{ .one_line = "Dump entries from a ztick logfile" },
+            .options = dump_options,
+            .target = .{ .action = .{
+                .exec = dump_action,
+                .positional_args = .{ .required = dump_positional },
+            } },
+        },
+    });
+
+    const app = cli.App{
+        .version = version_info.version,
+        .command = .{
+            .name = "ztick",
+            .description = .{
+                .one_line = "Time-based job scheduler with rule engine",
+            },
+            .target = .{ .subcommands = subcommands },
+        },
+    };
+
+    try r.run(&app);
+    return captured orelse CliError.NoCommandSelected;
+}
+
+test "implicit-server parser handles bare invocation" {
+    const allocator = std.testing.allocator;
+    const cmd = try parse_implicit_server(allocator, &.{"ztick"});
     try std.testing.expect(cmd == .server);
     try std.testing.expectEqual(@as(?[]const u8, null), cmd.server.config_path);
 }
 
-test "parse --config returns server command with config path" {
-    const cmd = try parse_slice(&.{ "--config", "/etc/ztick.toml" });
+test "implicit-server parser captures -c PATH" {
+    const allocator = std.testing.allocator;
+    const cmd = try parse_implicit_server(allocator, &.{ "ztick", "-c", "/etc/ztick.toml" });
     try std.testing.expect(cmd == .server);
     const path = cmd.server.config_path orelse return error.ConfigPathIsNull;
+    defer allocator.free(path);
     try std.testing.expectEqualStrings("/etc/ztick.toml", path);
 }
 
-test "parse -c returns server command with config path" {
-    const cmd = try parse_slice(&.{ "-c", "/etc/ztick.toml" });
+test "implicit-server parser captures --config PATH" {
+    const allocator = std.testing.allocator;
+    const cmd = try parse_implicit_server(allocator, &.{ "ztick", "--config", "/etc/ztick.toml" });
     try std.testing.expect(cmd == .server);
     const path = cmd.server.config_path orelse return error.ConfigPathIsNull;
+    defer allocator.free(path);
     try std.testing.expectEqualStrings("/etc/ztick.toml", path);
 }
 
-test "parse dump with logfile path returns dump command" {
-    const cmd = try parse_slice(&.{ "dump", "logfile.bin" });
-    try std.testing.expect(cmd == .dump);
-    try std.testing.expectEqualStrings("logfile.bin", cmd.dump.options.logfile_path);
+test "implicit-server parser rejects -c with missing value" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(CliError.MissingValue, parse_implicit_server(allocator, &.{ "ztick", "-c" }));
 }
 
-test "parse dump with --format json returns json format" {
-    const cmd = try parse_slice(&.{ "dump", "logfile.bin", "--format", "json" });
-    try std.testing.expect(cmd == .dump);
-    try std.testing.expectEqual(Format.json, cmd.dump.options.format);
+test "implicit-server parser rejects unexpected positional" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(CliError.UnexpectedPositional, parse_implicit_server(allocator, &.{ "ztick", "logfile.bin" }));
 }
 
-test "parse dump with --compact returns compact true" {
-    const cmd = try parse_slice(&.{ "dump", "logfile.bin", "--compact" });
-    try std.testing.expect(cmd == .dump);
-    try std.testing.expect(cmd.dump.options.compact);
+test "implicit-server parser rejects unknown flag" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(CliError.UnknownFlag, parse_implicit_server(allocator, &.{ "ztick", "--unknown" }));
 }
 
-test "parse dump with --follow returns follow true" {
-    const cmd = try parse_slice(&.{ "dump", "logfile.bin", "--follow" });
-    try std.testing.expect(cmd == .dump);
-    try std.testing.expect(cmd.dump.options.follow);
-}
-
-test "parse dump without logfile path returns MissingValue" {
-    const result = parse_slice(&.{"dump"});
-    try std.testing.expectError(CliError.MissingValue, result);
-}
-
-test "parse dump with unknown format returns InvalidValue" {
-    const result = parse_slice(&.{ "dump", "logfile.bin", "--format", "xml" });
-    try std.testing.expectError(CliError.InvalidValue, result);
-}
-
-test "parse unknown flag returns UnknownFlag" {
-    const result = parse_slice(&.{"--verbose"});
-    try std.testing.expectError(CliError.UnknownFlag, result);
+test "has_recognized_subcommand detects server, dump, --help, --version" {
+    try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "server" }));
+    try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "dump" }));
+    try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "--help" }));
+    try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "-h" }));
+    try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "--version" }));
+    try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "-v" }));
+    try std.testing.expect(!has_recognized_subcommand(&.{"ztick"}));
+    try std.testing.expect(!has_recognized_subcommand(&.{ "ztick", "-c", "/etc/ztick.toml" }));
 }

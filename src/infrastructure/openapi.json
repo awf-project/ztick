@@ -3,7 +3,7 @@
   "info": {
     "title": "ztick HTTP API",
     "description": "RESTful API for managing scheduled jobs and rules in ztick.",
-    "version": "0.1.0",
+    "version": "__VERSION__",
     "license": {
       "name": "MIT",
       "identifier": "MIT"

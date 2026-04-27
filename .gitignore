@@ -29,3 +29,6 @@ npm-cache/
 
 .grepai/
 .specify/
+
+# Git worktrees
+.worktrees/

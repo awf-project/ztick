@@ -8,6 +8,10 @@
             .url = "git+https://github.com/zig-o11y/opentelemetry-sdk?ref=v0.1.1#60d797fc6420e3875e61cbb63b6008fcd6e3102a",
             .hash = "opentelemetry-0.0.1-U_uKJyFJDwDLwd8vv1ulDIoJKWYsLX_hEvebqryQzYdy",
         },
+        .cli = .{
+            .url = "git+https://github.com/sam701/zig-cli?ref=zig-0.15#cb44aade25a3c1eddd8b6f990b50c2189442c1e2",
+            .hash = "cli-0.10.0-2eKe_5kEAQBeHqKxUHNTGnETzu81rqKWwT1WPt1jXBt0",
+        },
     },
     .paths = .{
         "build.zig",

@@ -18,9 +18,17 @@ pub fn build(b: *std.Build) void {
 
     const amqp_int = b.option(bool, "amqp-integration", "Run AMQP integration tests against a real broker") orelse false;
     const redis_int = b.option(bool, "redis-integration", "Run Redis integration tests against a real broker") orelse false;
+
+    // Single source of truth for the version: build.zig.zon. `src/version.zig`
+    // re-exports `build_options.version`, so every consumer (CLI, telemetry,
+    // OpenAPI spec) sees the ZON value.
+    const zon = @import("build.zig.zon");
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "amqp_integration", amqp_int);
     build_options.addOption(bool, "redis_integration", redis_int);
+    build_options.addOption([]const u8, "version", zon.version);
+    const build_options_module = build_options.createModule();
 
     // OpenTelemetry SDK dependency (ADR-0004)
     const otel_dep = b.dependency("opentelemetry", .{
@@ -29,12 +37,38 @@ pub fn build(b: *std.Build) void {
     });
     const otel_module = otel_dep.module("sdk");
 
+    // zig-cli dependency (sam701/zig-cli) for argument parsing, --version,
+    // --help, and subcommand dispatch.
+    const cli_dep = b.dependency("cli", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const cli_module = cli_dep.module("cli");
+
+    // Helper to register the standard module imports on a freshly-created module.
+    const ModuleDeps = struct {
+        otel: *std.Build.Module,
+        cli: *std.Build.Module,
+        build_options: *std.Build.Module,
+
+        fn install(self: @This(), m: *std.Build.Module) void {
+            m.addImport("opentelemetry", self.otel);
+            m.addImport("cli", self.cli);
+            m.addImport("build_options", self.build_options);
+        }
+    };
+    const deps = ModuleDeps{
+        .otel = otel_module,
+        .cli = cli_module,
+        .build_options = build_options_module,
+    };
+
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    root_module.addImport("opentelemetry", otel_module);
+    deps.install(root_module);
 
     const exe = b.addExecutable(.{
         .name = "ztick",
@@ -67,10 +101,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
-        layer_module.addImport("opentelemetry", otel_module);
-        if (std.mem.eql(u8, layer.name, "test-infrastructure")) {
-            layer_module.addImport("build_options", build_options.createModule());
-        }
+        deps.install(layer_module);
         const layer_test = b.addTest(.{ .root_module = layer_module });
         if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(layer_test);
         const run_layer_test = b.addRunArtifact(layer_test);
@@ -84,8 +115,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    main_test_module.addImport("opentelemetry", otel_module);
-    main_test_module.addImport("build_options", build_options.createModule());
+    deps.install(main_test_module);
     const main_tests = b.addTest(.{ .root_module = main_test_module });
     if (tls_enabled) link_openssl(main_tests);
     const run_main_tests = b.addRunArtifact(main_tests);
@@ -97,8 +127,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    functional_module.addImport("opentelemetry", otel_module);
-    functional_module.addImport("build_options", build_options.createModule());
+    deps.install(functional_module);
     const functional_test = b.addTest(.{
         .root_module = functional_module,
     });
@@ -132,10 +161,7 @@ pub fn build(b: *std.Build) void {
             .sanitize_c = .full,
             .sanitize_thread = true,
         });
-        san_module.addImport("opentelemetry", otel_module);
-        if (std.mem.eql(u8, layer.name, "test-infrastructure")) {
-            san_module.addImport("build_options", build_options.createModule());
-        }
+        deps.install(san_module);
         san_module.addEmbedPath(b.path("."));
         const san_test = b.addTest(.{ .root_module = san_module });
         if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(san_test);
@@ -150,8 +176,7 @@ pub fn build(b: *std.Build) void {
         .sanitize_c = .full,
         .sanitize_thread = true,
     });
-    san_main_module.addImport("opentelemetry", otel_module);
-    san_main_module.addImport("build_options", build_options.createModule());
+    deps.install(san_main_module);
     const san_main_tests = b.addTest(.{ .root_module = san_main_module });
     if (tls_enabled) link_openssl(san_main_tests);
     sanitize_step.dependOn(&b.addRunArtifact(san_main_tests).step);
@@ -163,8 +188,7 @@ pub fn build(b: *std.Build) void {
         .sanitize_c = .full,
         .sanitize_thread = true,
     });
-    san_func_module.addImport("opentelemetry", otel_module);
-    san_func_module.addImport("build_options", build_options.createModule());
+    deps.install(san_func_module);
     const san_func_test = b.addTest(.{ .root_module = san_func_module });
     if (tls_enabled) link_openssl(san_func_test);
     const run_san_func = b.addRunArtifact(san_func_test);
