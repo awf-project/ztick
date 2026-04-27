@@ -1,4 +1,6 @@
-# Configuring Client Authentication
+---
+title: "Configuring Client Authentication"
+---
 
 Token-based client authentication restricts access to the ztick scheduler by requiring clients to authenticate before issuing commands.
 

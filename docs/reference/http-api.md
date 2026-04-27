@@ -1,4 +1,6 @@
-# HTTP API Reference
+---
+title: "HTTP API Reference"
+---
 
 The ztick HTTP API provides a RESTful interface for managing scheduled jobs and rules. This is an optional interface that runs alongside the native TCP protocol.
 

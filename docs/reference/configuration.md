@@ -1,4 +1,6 @@
-# Configuration Reference
+---
+title: "Configuration Reference"
+---
 
 Complete specification of all TOML configuration options.
 

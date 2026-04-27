@@ -1,4 +1,6 @@
-# Monitoring Server Health
+---
+title: "Monitoring Server Health"
+---
 
 The `STAT` command provides a real-time snapshot of server health metrics. Use it to verify the server is running correctly, detect connection leaks, and inspect the execution pipeline.
 

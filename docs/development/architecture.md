@@ -1,4 +1,6 @@
-# Hexagonal Architecture
+---
+title: "Hexagonal Architecture"
+---
 
 ztick uses **hexagonal architecture** (also called "ports and adapters") to maintain a clean separation of concerns and testability.
 

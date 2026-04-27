@@ -1,4 +1,6 @@
-# 0006: Redis Runner Design
+---
+title: "0006: Redis Runner Design"
+---
 
 **Status**: Accepted
 **Date**: 2026-04-27

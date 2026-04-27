@@ -32,3 +32,10 @@ npm-cache/
 
 # Git worktrees
 .worktrees/
+
+# Hugo site
+site/node_modules/
+site/public/
+site/resources/
+site/.hugo_build.lock
+site/hugo_stats.json

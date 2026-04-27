@@ -1,4 +1,6 @@
-# Persistence Format
+---
+title: "Persistence Format"
+---
 
 Specification of ztick's binary persistence format used for logfiles.
 
