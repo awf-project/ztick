@@ -100,6 +100,12 @@ fn runner_encoded_size(runner: domain.runner.Runner) !usize {
             if (h.url.len > std.math.maxInt(u16)) return error.Overflow;
             break :blk 1 + 2 + h.method.len + 2 + h.url.len;
         },
+        .redis => |r| blk: {
+            if (r.url.len > std.math.maxInt(u16)) return error.Overflow;
+            if (r.command.len > std.math.maxInt(u16)) return error.Overflow;
+            if (r.key.len > std.math.maxInt(u16)) return error.Overflow;
+            break :blk 1 + 2 + r.url.len + 2 + r.command.len + 2 + r.key.len;
+        },
     };
 }
 
@@ -170,6 +176,23 @@ fn encode_runner(runner: domain.runner.Runner, buf: []u8) void {
             std.mem.writeInt(u16, buf[pos..][0..2], @intCast(h.url.len), .big);
             pos += 2;
             @memcpy(buf[pos..], h.url);
+        },
+        .redis => |r| {
+            // discriminant 5 — spec FR-006 said 2 but 2=direct is already on disk;
+            // see plan.md Key Decisions and ADR-0006 for the deviation rationale.
+            buf[pos] = 5;
+            pos += 1;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(r.url.len), .big);
+            pos += 2;
+            @memcpy(buf[pos .. pos + r.url.len], r.url);
+            pos += r.url.len;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(r.command.len), .big);
+            pos += 2;
+            @memcpy(buf[pos .. pos + r.command.len], r.command);
+            pos += r.command.len;
+            std.mem.writeInt(u16, buf[pos..][0..2], @intCast(r.key.len), .big);
+            pos += 2;
+            @memcpy(buf[pos..], r.key);
         },
     }
 }
@@ -328,6 +351,26 @@ fn decode_inner(allocator: std.mem.Allocator, data: []const u8) !Entry {
                         .runner = .{ .http = .{ .method = method_copy, .url = url_copy } },
                     } };
                 },
+                5 => {
+                    const url_slice = try read_sized_string(data, &pos);
+                    const command_slice = try read_sized_string(data, &pos);
+                    const key_slice = try read_sized_string(data, &pos);
+                    if (pos != data.len) return error.InvalidData;
+                    const id_copy = try allocator.dupe(u8, id_slice);
+                    errdefer allocator.free(id_copy);
+                    const pat_copy = try allocator.dupe(u8, pat_slice);
+                    errdefer allocator.free(pat_copy);
+                    const url_copy = try allocator.dupe(u8, url_slice);
+                    errdefer allocator.free(url_copy);
+                    const command_copy = try allocator.dupe(u8, command_slice);
+                    errdefer allocator.free(command_copy);
+                    const key_copy = try allocator.dupe(u8, key_slice);
+                    return .{ .rule = .{
+                        .identifier = id_copy,
+                        .pattern = pat_copy,
+                        .runner = .{ .redis = .{ .url = url_copy, .command = command_copy, .key = key_copy } },
+                    } };
+                },
                 else => return error.InvalidData,
             }
         },
@@ -387,6 +430,11 @@ pub fn free_entry_fields(entry: Entry, allocator: std.mem.Allocator) void {
                 .http => |h| {
                     allocator.free(h.method);
                     allocator.free(h.url);
+                },
+                .redis => |redis| {
+                    allocator.free(redis.url);
+                    allocator.free(redis.command);
+                    allocator.free(redis.key);
                 },
             }
         },
@@ -806,6 +854,70 @@ test "decode error on truncated awf runner" {
     // Truncated mid-workflow field
     const data = [_]u8{ 1, 0, 1, 97, 0, 1, 98, 3, 0, 5, 104 };
     try std.testing.expectError(DecodeError.InvalidData, decode(std.testing.allocator, &data));
+}
+
+test "encode rule redis runner with discriminant 5" {
+    const rule = domain.rule.Rule{
+        .identifier = "a",
+        .pattern = "b",
+        .runner = .{ .redis = .{ .url = "redis://x", .command = "PUBLISH", .key = "ch" } },
+    };
+    const result = try encode(std.testing.allocator, .{ .rule = rule });
+    defer std.testing.allocator.free(result);
+    // type=1, id=[0,1,'a'], pat=[0,1,'b'], runner_type=5, url=[0,9,"redis://x"], command=[0,7,"PUBLISH"], key=[0,2,"ch"]
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 1, 97, 0, 1, 98, 5, 0, 9, 114, 101, 100, 105, 115, 58, 47, 47, 120, 0, 7, 80, 85, 66, 76, 73, 83, 72, 0, 2, 99, 104 }, result);
+}
+
+test "decode rule redis runner with discriminant 5" {
+    const data = [_]u8{ 1, 0, 1, 97, 0, 1, 98, 5, 0, 9, 114, 101, 100, 105, 115, 58, 47, 47, 120, 0, 7, 80, 85, 66, 76, 73, 83, 72, 0, 2, 99, 104 };
+    const result = try decode(std.testing.allocator, &data);
+    defer std.testing.allocator.free(result.rule.identifier);
+    defer std.testing.allocator.free(result.rule.pattern);
+    defer std.testing.allocator.free(result.rule.runner.redis.url);
+    defer std.testing.allocator.free(result.rule.runner.redis.command);
+    defer std.testing.allocator.free(result.rule.runner.redis.key);
+    try std.testing.expectEqualStrings("a", result.rule.identifier);
+    try std.testing.expectEqualStrings("b", result.rule.pattern);
+    try std.testing.expectEqualStrings("redis://x", result.rule.runner.redis.url);
+    try std.testing.expectEqualStrings("PUBLISH", result.rule.runner.redis.command);
+    try std.testing.expectEqualStrings("ch", result.rule.runner.redis.key);
+}
+
+test "encode decode redis runner round trip preserves url command key" {
+    const rule = domain.rule.Rule{
+        .identifier = "rule.notify",
+        .pattern = "deploy.*",
+        .runner = .{ .redis = .{ .url = "redis://localhost:6379/0", .command = "PUBLISH", .key = "deploy:events" } },
+    };
+    const encoded = try encode(std.testing.allocator, .{ .rule = rule });
+    defer std.testing.allocator.free(encoded);
+    const decoded = try decode(std.testing.allocator, encoded);
+    defer std.testing.allocator.free(decoded.rule.identifier);
+    defer std.testing.allocator.free(decoded.rule.pattern);
+    defer std.testing.allocator.free(decoded.rule.runner.redis.url);
+    defer std.testing.allocator.free(decoded.rule.runner.redis.command);
+    defer std.testing.allocator.free(decoded.rule.runner.redis.key);
+    try std.testing.expectEqualStrings("rule.notify", decoded.rule.identifier);
+    try std.testing.expectEqualStrings("deploy.*", decoded.rule.pattern);
+    try std.testing.expectEqualStrings("redis://localhost:6379/0", decoded.rule.runner.redis.url);
+    try std.testing.expectEqualStrings("PUBLISH", decoded.rule.runner.redis.command);
+    try std.testing.expectEqualStrings("deploy:events", decoded.rule.runner.redis.key);
+}
+
+test "free_entry_fields frees redis runner rule fields without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "rule.notify");
+    const pattern = try allocator.dupe(u8, "deploy.*");
+    const url = try allocator.dupe(u8, "redis://localhost:6379/0");
+    const command = try allocator.dupe(u8, "PUBLISH");
+    const key = try allocator.dupe(u8, "deploy:events");
+    const entry = Entry{ .rule = .{
+        .identifier = id,
+        .pattern = pattern,
+        .runner = .{ .redis = .{ .url = url, .command = command, .key = key } },
+    } };
+    free_entry_fields(entry, allocator);
+    allocator.free(id);
 }
 
 test "encode decode direct runner round trip" {

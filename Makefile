@@ -1,4 +1,4 @@
-.PHONY: build test test-functional test-all test-sanitize test-valgrind test-amqp fmt lint clean
+.PHONY: build test test-functional test-all test-sanitize test-valgrind test-amqp test-redis fmt lint clean
 
 build:
 	zig build --summary all
@@ -21,6 +21,12 @@ test-valgrind: build
 test-amqp:
 	docker compose up -d --wait
 	zig build test-infrastructure -Damqp-integration --summary all; status=$$?; \
+		docker compose down; \
+		exit $$status
+
+test-redis:
+	docker compose up -d --wait
+	zig build test-functional -Dredis-integration --summary all; status=$$?; \
 		docker compose down; \
 		exit $$status
 

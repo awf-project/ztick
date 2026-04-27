@@ -28,7 +28,7 @@ The codebase is organized into 4 layers, with a strict dependency direction (inw
 - `Job` — Scheduled action with status
 - `JobStatus` — `planned`, `triggered`, `executed`, `failed`
 - `Rule` — Pattern-based job-to-runner mapping
-- `Runner` — Tagged union of `shell`, `direct`, `http`, `awf`, `amqp`
+- `Runner` — Tagged union of `shell`, `direct`, `http`, `awf`, `amqp`, `redis`
 - `Instruction` — `set`, `remove`, `query` operations
 - `Request`/`Response` — Query protocol
 

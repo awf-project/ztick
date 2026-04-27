@@ -246,8 +246,8 @@ List all configured rules.
 |-------|-------------|
 | `rule_id` | The rule's identifier |
 | `pattern` | Prefix pattern the rule matches against |
-| `runner_type` | Runner type: `shell`, `direct`, `http`, `awf`, or `amqp` |
-| `runner_args` | Shell: `<command>`. Direct: `<executable> [args...]`. HTTP: `<method> <url>`. AWF: `<workflow> [--input key=value ...]`. AMQP: `<dsn> <exchange> <routing_key>` |
+| `runner_type` | Runner type: `shell`, `direct`, `http`, `awf`, `amqp`, or `redis` |
+| `runner_args` | Shell: `<command>`. Direct: `<executable> [args...]`. HTTP: `<method> <url>`. AWF: `<workflow> [--input key=value ...]`. AMQP: `<dsn> <exchange> <routing_key>`. Redis: `<url> <command> <key>` |
 
 **Examples**:
 ```bash
@@ -261,6 +261,7 @@ echo 'req-1 LISTRULES' | socat - TCP:localhost:5678
 # req-1 rule.review code-review. awf code-review
 # req-1 rule.report report. awf generate-report --input format=pdf --input target=main
 # req-1 rule.notify notify. amqp amqp://broker:5672 jobs notifications
+# req-1 rule.publish deploy. redis redis://127.0.0.1:6379/0 PUBLISH deploy:events
 # req-1 OK
 
 # List rules when none are loaded
@@ -424,6 +425,11 @@ Create or update a rule that matches jobs by prefix and assigns a runner.
 <request_id> RULE SET <rule_identifier> <pattern> amqp <dsn> <exchange> <routing_key>
 ```
 
+**Syntax (redis runner)**:
+```
+<request_id> RULE SET <rule_identifier> <pattern> redis <url> <command> <key>
+```
+
 **Parameters**:
 - `rule_identifier` (string): Unique rule identifier (e.g., `rule.backup`)
 - `pattern` (string): Prefix to match job identifiers (e.g., `backup.` matches `backup.daily`)
@@ -432,6 +438,7 @@ Create or update a rule that matches jobs by prefix and assigns a runner.
 - `http <method> <url>`: Trigger an external webhook via HTTP/HTTPS request. Methods: `GET`, `POST`, `PUT`, `DELETE`. The URL must include a scheme (`http://` or `https://`). POST and PUT requests include a JSON body `{"job_id":"<identifier>","execution":<timestamp_ns>}`; GET and DELETE send no body. HTTP 2xx status codes indicate success; all others indicate failure. Connection and read timeouts are 30 seconds.
 - `awf <workflow> [--input <key=value> ...]`: Execute an AWF workflow. The workflow name is required. The optional `--input` flag can be repeated to pass key=value parameters to the workflow (e.g., `awf generate-report --input format=pdf --input target=main`)
 - `amqp <dsn> <exchange> <routing_key>`: Publish a message to an AMQP 0-9-1 broker. The DSN follows the `amqp://[user[:password]@]host[:port][/vhost]` format (plaintext only — TLS is not yet supported). The message body is the job identifier. Each execution opens a fresh connection, publishes one `basic.publish` frame, and closes the connection. Connect/send/receive timeout: 30 seconds. Connection refused, auth rejection, or DSN parse errors return failure without crashing the processor.
+- `redis <url> <command> <key>`: Send a single Redis command per matching job. Requires exactly four runner tokens (`redis` + url + command + key). The URL follows the `redis://[user[:password]@]host[:port][/db]` format (plaintext only — `rediss://` is rejected at parse time). The `<command>` token must be one of `PUBLISH`, `RPUSH`, `LPUSH`, `SET` (case-sensitive); any other value rejects the rule with `ERROR` before persistence. The job identifier is sent as the value/payload. Each execution opens a fresh TCP connection, optionally sends `AUTH` then `SELECT <db>` when applicable, sends the configured command, then closes. Connect/send/receive timeout: 30 seconds. Credentials in the URL are redacted from logs.
 
 **Examples**:
 ```bash
@@ -462,6 +469,14 @@ echo 'req-8 RULE SET rule.health health. http GET https://api.internal/trigger' 
 # AMQP runner
 echo 'req-9 RULE SET rule.notify notify. amqp amqp://guest:guest@localhost:5672/ jobs notifications' | socat - TCP:localhost:5678
 # Response: req-9 OK
+
+# Redis runner (PUBLISH)
+echo 'req-10 RULE SET rule.publish deploy. redis redis://127.0.0.1:6379/0 PUBLISH deploy:events' | socat - TCP:localhost:5678
+# Response: req-10 OK
+
+# Redis runner (RPUSH)
+echo 'req-11 RULE SET rule.queue backup. redis redis://127.0.0.1:6379/0 RPUSH backup:tasks' | socat - TCP:localhost:5678
+# Response: req-11 OK
 ```
 
 ## Pattern Matching

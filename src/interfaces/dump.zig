@@ -40,6 +40,7 @@ pub fn format_entry_text(writer: anytype, entry: Entry) !void {
                     try writer.writeByte('\n');
                 },
                 .http => |h| try writer.print("RULE SET {s} {s} http {s} {s}\n", .{ rule.identifier, rule.pattern, h.method, h.url }),
+                .redis => |r| try writer.print("RULE SET {s} {s} redis {s} {s} {s}\n", .{ rule.identifier, rule.pattern, r.url, r.command, r.key }),
             }
         },
         .job_removal => |r| try writer.print("REMOVE {s}\n", .{r.identifier}),
@@ -118,6 +119,15 @@ pub fn format_entry_json(writer: anytype, entry: Entry) !void {
                     try write_json_string(writer, h.method);
                     try writer.writeAll(",\"url\":");
                     try write_json_string(writer, h.url);
+                    try writer.writeAll("}}");
+                },
+                .redis => |r| {
+                    try writer.writeAll("{\"type\":\"redis\",\"url\":");
+                    try write_json_string(writer, r.url);
+                    try writer.writeAll(",\"command\":");
+                    try write_json_string(writer, r.command);
+                    try writer.writeAll(",\"key\":");
+                    try write_json_string(writer, r.key);
                     try writer.writeAll("}}");
                 },
             }
