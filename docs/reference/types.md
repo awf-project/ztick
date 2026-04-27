@@ -167,10 +167,15 @@ pub const Runner = union(enum) {
   - HTTP request: `{"pattern": "...", "runner": "awf", "args": ["<workflow>", "--input", "key=value", ...]}`
   - Example: `awf code-review` or `awf generate-report --input format=pdf --input target=main`
 
-- **amqp**: Send a message to AMQP broker
+- **amqp**: Publish a message to an AMQP 0-9-1 broker
   - Supported via TCP protocol only (not exposed in HTTP API)
   - Fields: `dsn` (connection string), `exchange`, `routing_key`
-  - Deferred: Consider for future HTTP API expansion
+  - DSN format: `amqp://[user[:password]@]host[:port][/vhost]`
+  - Message body is the job identifier (u128 hex string)
+  - TCP syntax: `amqp <dsn> <exchange> <routing_key>` (e.g. `amqp amqp://guest:guest@localhost:5672/ jobs notifications`)
+  - Plaintext AMQP only; TLS support (`amqps://`) deferred
+  - Per-execution connect/handshake/publish/close (no pooling); 30-second socket timeout
+  - See [user-guide/writing-rules.md#amqp-runner](../user-guide/writing-rules.md#amqp-runner) for end-to-end usage, broker setup, verification, and troubleshooting
 
 ### Instruction
 
@@ -280,6 +285,20 @@ const http_get_rule = Rule{
     .identifier = "rule.ping",
     .pattern = "health.",
     .runner = .{ .http = .{ .method = "GET", .url = "https://api.internal/trigger" } },
+};
+```
+
+### Creating an AMQP Rule
+
+```zig
+const amqp_rule = Rule{
+    .identifier = "rule.notify",
+    .pattern = "notify.",
+    .runner = .{ .amqp = .{
+        .dsn = "amqp://guest:guest@localhost:5672/",
+        .exchange = "jobs",
+        .routing_key = "notifications",
+    } },
 };
 ```
 

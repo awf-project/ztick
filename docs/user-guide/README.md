@@ -12,7 +12,7 @@ Task-oriented how-to guides for common ztick operations.
 
 - **[Writing Rules](writing-rules.md)** — Match jobs and specify actions
   - Pattern matching and priority (longest match wins)
-  - Runner types (Shell)
+  - Runner types (Shell, Direct, HTTP, AWF, AMQP)
   - Rule management and removal with `REMOVERULE`
   - Best practices
 

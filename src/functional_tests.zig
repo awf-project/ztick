@@ -2,11 +2,13 @@ const std = @import("std");
 const domain_job = @import("domain/job.zig");
 const domain_rule = @import("domain/rule.zig");
 const domain_query = @import("domain/query.zig");
+const domain_execution = @import("domain/execution.zig");
 const application_scheduler = @import("application/scheduler.zig");
 const persistence_encoder = @import("infrastructure/persistence/encoder.zig");
 const persistence_logfile = @import("infrastructure/persistence/logfile.zig");
 const persistence_backend = @import("infrastructure/persistence/backend.zig");
 const infrastructure_telemetry = @import("infrastructure/telemetry.zig");
+const infrastructure_runner = @import("infrastructure/runner.zig");
 const interfaces_config = @import("interfaces/config.zig");
 const main = @import("main.zig");
 const protocol_parser = @import("infrastructure/protocol/parser.zig");
@@ -3503,9 +3505,11 @@ test "job lifecycle via HTTP creates retrieves and deletes a job" {
     {
         var stream = try http_connect(19893);
         defer stream.close();
+        // Far-future execution keeps the job in .planned status; a past date would let the
+        // scheduler tick transition it to .failed (no matching rule) before the GET below.
         const response = try send_http_request(
             stream,
-            "PUT /jobs/deploy.v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2026-04-10T12:00:00Z\"}",
+            "PUT /jobs/deploy.v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2099-12-31T23:59:59Z\"}",
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "\"id\"") != null);
@@ -3618,9 +3622,11 @@ test "job created via HTTP is retrievable via TCP" {
     {
         var stream = try http_connect(19901);
         defer stream.close();
+        // Far-future execution keeps the job in .planned status; the TCP GET below asserts
+        // on "planned", which would not appear if the scheduler transitioned the job to .failed.
         const response = try send_http_request(
             stream,
-            "PUT /jobs/cross.1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2026-04-10T12:00:00Z\"}",
+            "PUT /jobs/cross.1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2099-12-31T23:59:59Z\"}",
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
     }
@@ -4226,4 +4232,125 @@ test "stat command succeeds for namespace-scoped authenticated client" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-ns auth_enabled 1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "req-stat-ns OK\n") != null);
+}
+
+// Feature: F019
+
+test "scheduler dispatches AMQP runner request when matching job triggers" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-rule",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.notify",
+            .pattern = "notify.",
+            .runner = .{ .amqp = .{
+                .dsn = "amqp://guest:guest@localhost:5672/",
+                .exchange = "jobs",
+                .routing_key = "notifications",
+            } },
+        } },
+    });
+
+    _ = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-job",
+        .instruction = .{ .set = .{ .identifier = "notify.alert.1", .execution = 1000 } },
+    });
+
+    try scheduler.tick(1000);
+
+    try std.testing.expectEqual(JobStatus.triggered, scheduler.job_storage.get("notify.alert.1").?.status);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.execution_client.pending.items.len);
+
+    const dispatched = scheduler.execution_client.pending.items[0];
+    try std.testing.expectEqualStrings("notify.alert.1", dispatched.job_identifier);
+    switch (dispatched.runner) {
+        .amqp => |a| {
+            try std.testing.expectEqualStrings("amqp://guest:guest@localhost:5672/", a.dsn);
+            try std.testing.expectEqualStrings("jobs", a.exchange);
+            try std.testing.expectEqualStrings("notifications", a.routing_key);
+        },
+        else => return error.TestUnexpectedRunnerVariant,
+    }
+}
+
+test "persisted AMQP rule replays and dispatches matching job after reload" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const persisted_rule = Rule{
+        .identifier = "rule.publish",
+        .pattern = "events.",
+        .runner = .{ .amqp = .{
+            .dsn = "amqp://guest:guest@localhost:5672/",
+            .exchange = "exchange_name",
+            .routing_key = "routing.key",
+        } },
+    };
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = persisted_rule },
+    });
+    defer allocator.free(logfile_data);
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var decode_arena = try replay_into_scheduler(allocator, logfile_data, &scheduler);
+    defer decode_arena.deinit();
+
+    const restored = scheduler.rule_storage.get("rule.publish");
+    try std.testing.expect(restored != null);
+    switch (restored.?.runner) {
+        .amqp => |a| {
+            try std.testing.expectEqualStrings("amqp://guest:guest@localhost:5672/", a.dsn);
+            try std.testing.expectEqualStrings("exchange_name", a.exchange);
+            try std.testing.expectEqualStrings("routing.key", a.routing_key);
+        },
+        else => return error.TestUnexpectedRunnerVariant,
+    }
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-job",
+        .instruction = .{ .set = .{ .identifier = "events.signup.42", .execution = 2000 } },
+    });
+
+    try scheduler.tick(2000);
+
+    try std.testing.expectEqual(JobStatus.triggered, scheduler.job_storage.get("events.signup.42").?.status);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.execution_client.pending.items.len);
+    try std.testing.expect(scheduler.execution_client.pending.items[0].runner == .amqp);
+}
+
+test "shell runner dispatches AMQP runner without raising when broker unreachable" {
+    const refused_port: u16 = blk: {
+        const a = try std.net.Address.parseIp4("127.0.0.1", 0);
+        var s = try a.listen(.{ .reuse_address = true });
+        const p = s.listen_address.in.getPort();
+        s.deinit();
+        break :blk p;
+    };
+    const dsn = try std.fmt.allocPrint(std.testing.allocator, "amqp://guest:guest@127.0.0.1:{d}/", .{refused_port});
+    defer std.testing.allocator.free(dsn);
+
+    const shell_config = interfaces_config.ShellConfig{ .path = "/bin/sh", .args = &.{"-c"} };
+    const request = domain_execution.Request{
+        .identifier = 0xF019_F019_F019_F019,
+        .job_identifier = "notify.unreachable",
+        .runner = .{ .amqp = .{ .dsn = dsn, .exchange = "jobs", .routing_key = "notifications" } },
+    };
+
+    const response = infrastructure_runner.execute(std.testing.allocator, shell_config, request);
+
+    try std.testing.expectEqual(@as(u128, 0xF019_F019_F019_F019), response.identifier);
+    try std.testing.expect(!response.success);
 }

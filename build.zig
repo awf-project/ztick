@@ -16,6 +16,10 @@ pub fn build(b: *std.Build) void {
         break :blk true;
     };
 
+    const amqp_int = b.option(bool, "amqp-integration", "Run AMQP integration tests against a real broker") orelse false;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "amqp_integration", amqp_int);
+
     // OpenTelemetry SDK dependency (ADR-0004)
     const otel_dep = b.dependency("opentelemetry", .{
         .target = target,
@@ -62,6 +66,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         layer_module.addImport("opentelemetry", otel_module);
+        if (std.mem.eql(u8, layer.name, "test-infrastructure")) {
+            layer_module.addImport("build_options", build_options.createModule());
+        }
         const layer_test = b.addTest(.{ .root_module = layer_module });
         if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(layer_test);
         const run_layer_test = b.addRunArtifact(layer_test);
@@ -76,6 +83,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     main_test_module.addImport("opentelemetry", otel_module);
+    main_test_module.addImport("build_options", build_options.createModule());
     const main_tests = b.addTest(.{ .root_module = main_test_module });
     if (tls_enabled) link_openssl(main_tests);
     const run_main_tests = b.addRunArtifact(main_tests);
@@ -88,6 +96,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     functional_module.addImport("opentelemetry", otel_module);
+    functional_module.addImport("build_options", build_options.createModule());
     const functional_test = b.addTest(.{
         .root_module = functional_module,
     });
@@ -122,6 +131,9 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = true,
         });
         san_module.addImport("opentelemetry", otel_module);
+        if (std.mem.eql(u8, layer.name, "test-infrastructure")) {
+            san_module.addImport("build_options", build_options.createModule());
+        }
         san_module.addEmbedPath(b.path("."));
         const san_test = b.addTest(.{ .root_module = san_module });
         if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(san_test);
@@ -137,6 +149,7 @@ pub fn build(b: *std.Build) void {
         .sanitize_thread = true,
     });
     san_main_module.addImport("opentelemetry", otel_module);
+    san_main_module.addImport("build_options", build_options.createModule());
     const san_main_tests = b.addTest(.{ .root_module = san_main_module });
     if (tls_enabled) link_openssl(san_main_tests);
     sanitize_step.dependOn(&b.addRunArtifact(san_main_tests).step);
@@ -149,6 +162,7 @@ pub fn build(b: *std.Build) void {
         .sanitize_thread = true,
     });
     san_func_module.addImport("opentelemetry", otel_module);
+    san_func_module.addImport("build_options", build_options.createModule());
     const san_func_test = b.addTest(.{ .root_module = san_func_module });
     if (tls_enabled) link_openssl(san_func_test);
     const run_san_func = b.addRunArtifact(san_func_test);

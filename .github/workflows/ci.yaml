@@ -16,19 +16,36 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: latest
+          version: 0.15.2
 
       - name: Check formatting
         run: zig fmt --check .
 
   test:
     runs-on: ubuntu-latest
+
+    services:
+      rabbitmq:
+        image: rabbitmq:4.3-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: latest
+          version: 0.15.2
 
       - uses: awf-project/setup-awf@v1
 
@@ -43,7 +60,7 @@ jobs:
             -days 3650 -nodes -subj "/CN=localhost"
 
       - name: Run tests
-        run: zig build test
+        run: zig build test -Damqp-integration
 
   sanitize:
     runs-on: ubuntu-latest
@@ -52,7 +69,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: latest
+          version: 0.15.2
 
       - uses: awf-project/setup-awf@v1
 
@@ -77,7 +94,7 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          version: latest
+          version: 0.15.2
 
       - name: Install OpenSSL dev headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev

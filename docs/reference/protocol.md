@@ -431,7 +431,7 @@ Create or update a rule that matches jobs by prefix and assigns a runner.
 - `direct <executable> [args...]`: Execute a binary directly via execve without shell interpretation. The first token after `direct` is the executable path; remaining tokens are passed as literal argv elements. Shell metacharacters are not interpreted, eliminating shell injection risks.
 - `http <method> <url>`: Trigger an external webhook via HTTP/HTTPS request. Methods: `GET`, `POST`, `PUT`, `DELETE`. The URL must include a scheme (`http://` or `https://`). POST and PUT requests include a JSON body `{"job_id":"<identifier>","execution":<timestamp_ns>}`; GET and DELETE send no body. HTTP 2xx status codes indicate success; all others indicate failure. Connection and read timeouts are 30 seconds.
 - `awf <workflow> [--input <key=value> ...]`: Execute an AWF workflow. The workflow name is required. The optional `--input` flag can be repeated to pass key=value parameters to the workflow (e.g., `awf generate-report --input format=pdf --input target=main`)
-- `amqp <dsn> <exchange> <routing_key>`: Publish to an AMQP broker (deferred — not yet operational)
+- `amqp <dsn> <exchange> <routing_key>`: Publish a message to an AMQP 0-9-1 broker. The DSN follows the `amqp://[user[:password]@]host[:port][/vhost]` format (plaintext only — TLS is not yet supported). The message body is the job identifier. Each execution opens a fresh connection, publishes one `basic.publish` frame, and closes the connection. Connect/send/receive timeout: 30 seconds. Connection refused, auth rejection, or DSN parse errors return failure without crashing the processor.
 
 **Examples**:
 ```bash
@@ -460,8 +460,8 @@ echo 'req-8 RULE SET rule.health health. http GET https://api.internal/trigger' 
 # Response: req-8 OK
 
 # AMQP runner
-echo 'req-9 RULE SET rule.notify notify. amqp amqp://broker:5672 jobs notifications' | socat - TCP:localhost:5678
-# Response: req-7 OK
+echo 'req-9 RULE SET rule.notify notify. amqp amqp://guest:guest@localhost:5672/ jobs notifications' | socat - TCP:localhost:5678
+# Response: req-9 OK
 ```
 
 ## Pattern Matching

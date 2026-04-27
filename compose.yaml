@@ -1,0 +1,31 @@
+name: ztick
+
+services:
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    configs:
+      - source: enabled_plugins
+        target: /etc/rabbitmq/enabled_plugins
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+configs:
+  enabled_plugins:
+    content: "[rabbitmq_management]."
+
+volumes:
+  rabbitmq-data:
