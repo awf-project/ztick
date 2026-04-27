@@ -71,10 +71,38 @@ jobs:
             -days 3650 -nodes -subj "/CN=localhost"
 
       - name: Run tests
-        run: zig build test -Damqp-integration -Dredis-integration
+        run: zig build test -Damqp-integration -Dredis-integration --summary all
 
   sanitize:
     runs-on: ubuntu-latest
+
+    services:
+      rabbitmq:
+        image: rabbitmq:4.3-management
+        ports:
+          - 5672:5672
+          - 15672:15672
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 10s
+
     steps:
       - uses: actions/checkout@v4
 
@@ -95,7 +123,7 @@ jobs:
             -days 3650 -nodes -subj "/CN=localhost"
 
       - name: Run tests with sanitizers
-        run: zig build test-sanitize
+        run: zig build test-sanitize -Damqp-integration -Dredis-integration --summary all
 
   build:
     needs: [lint, test, sanitize]

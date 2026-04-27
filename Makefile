@@ -1,7 +1,17 @@
 .DEFAULT_GOAL := help
-.PHONY: help build release install test test-functional test-all test-sanitize test-valgrind test-amqp test-redis fmt lint clean check
+.PHONY: help build release install test test-functional test-all test-sanitize test-valgrind test-amqp test-redis fmt lint clean check compose-up compose-down
 
 INSTALL_DIR ?= $(HOME)/.local/bin
+INTEGRATION_FLAGS ?= -Damqp-integration -Dredis-integration
+
+# Bring up brokers, run a zig build target with integration flags, always tear down.
+# Usage: $(call run_with_compose,<zig-build-target>,<extra-flags>)
+define run_with_compose
+	docker compose up -d --wait rabbitmq redis
+	zig build $(1) $(2) --summary all; status=$$?; \
+		docker compose down rabbitmq redis; \
+		exit $$status
+endef
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -22,32 +32,32 @@ install: release ## Install optimized binary to $(INSTALL_DIR) (default: ~/.loca
 		   echo "  Add to your shell profile: export PATH=\"\$$PATH:$(INSTALL_DIR)\"" ;; \
 	esac
 
-test: ## Run unit tests
-	zig build test --summary all
+compose-up: ## Start AMQP/Redis brokers for integration tests
+	docker compose up -d --wait rabbitmq redis
 
-test-functional: ## Run functional tests
-	zig build test-functional --summary all
+compose-down: ## Stop AMQP/Redis brokers
+	docker compose down rabbitmq redis
 
-test-all: ## Run all unit and functional tests
-	zig build test-all --summary all
+test: ## Run unit tests with integration brokers (boots docker, tears down on exit)
+	$(call run_with_compose,test,$(INTEGRATION_FLAGS))
 
-test-sanitize: ## Run all tests with sanitizers enabled
-	zig build test-sanitize --summary all
+test-functional: ## Run functional tests with integration brokers (boots docker, tears down on exit)
+	$(call run_with_compose,test-functional,$(INTEGRATION_FLAGS))
+
+test-all: ## Run all unit and functional tests with integration brokers
+	$(call run_with_compose,test-all,$(INTEGRATION_FLAGS))
+
+test-sanitize: ## Run all tests with sanitizers and integration brokers
+	$(call run_with_compose,test-sanitize,$(INTEGRATION_FLAGS))
 
 test-valgrind: build ## Run binary under valgrind to detect memory leaks
 	valgrind --leak-check=full --error-exitcode=1 zig-out/bin/ztick --help
 
 test-amqp: ## Run AMQP integration tests against a real broker
-	docker compose up -d --wait
-	zig build test-infrastructure -Damqp-integration --summary all; status=$$?; \
-		docker compose down; \
-		exit $$status
+	$(call run_with_compose,test-infrastructure,-Damqp-integration)
 
 test-redis: ## Run Redis integration tests against a real broker
-	docker compose up -d --wait
-	zig build test-functional -Dredis-integration --summary all; status=$$?; \
-		docker compose down; \
-		exit $$status
+	$(call run_with_compose,test-infrastructure,-Dredis-integration)
 
 fmt: ## Format source code
 	zig fmt .

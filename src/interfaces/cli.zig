@@ -49,8 +49,8 @@ fn dump_action() !void {
     } } };
 }
 
-/// Returns true when argv[1] is a known subcommand or a top-level help/version
-/// flag — i.e., when zig-cli can dispatch directly. Otherwise, the user invoked
+/// Returns true when argv[1] is a known subcommand or a top-level help flag
+/// — i.e., when zig-cli can dispatch directly. Otherwise, the user invoked
 /// `ztick` (no args) or `ztick -c PATH`, and we transparently default to
 /// `server` mode to preserve the daemon-style UX.
 fn has_recognized_subcommand(argv: []const []const u8) bool {
@@ -59,9 +59,17 @@ fn has_recognized_subcommand(argv: []const []const u8) bool {
     return std.mem.eql(u8, first, "server") or
         std.mem.eql(u8, first, "dump") or
         std.mem.eql(u8, first, "--help") or
-        std.mem.eql(u8, first, "-h") or
-        std.mem.eql(u8, first, "--version") or
-        std.mem.eql(u8, first, "-v");
+        std.mem.eql(u8, first, "-h");
+}
+
+fn is_version_flag(argv: []const []const u8) bool {
+    if (argv.len < 2) return false;
+    const first = argv[1];
+    return std.mem.eql(u8, first, "--version") or std.mem.eql(u8, first, "-v");
+}
+
+fn print_version(writer: anytype) !void {
+    try writer.print("ztick {s}\n", .{version_info.version});
 }
 
 /// Inline parser for the implicit-server form (`ztick`, `ztick -c PATH`).
@@ -89,6 +97,12 @@ fn parse_implicit_server(allocator: std.mem.Allocator, argv: []const []const u8)
 pub fn parse(allocator: std.mem.Allocator) !Command {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
+
+    if (is_version_flag(argv)) {
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        print_version(stdout) catch {};
+        std.process.exit(0);
+    }
 
     if (!has_recognized_subcommand(argv)) {
         return parse_implicit_server(allocator, argv);
@@ -213,13 +227,27 @@ test "implicit-server parser rejects unknown flag" {
     try std.testing.expectError(CliError.UnknownFlag, parse_implicit_server(allocator, &.{ "ztick", "--unknown" }));
 }
 
-test "has_recognized_subcommand detects server, dump, --help, --version" {
+test "has_recognized_subcommand detects server, dump, --help" {
     try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "server" }));
     try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "dump" }));
     try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "--help" }));
     try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "-h" }));
-    try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "--version" }));
-    try std.testing.expect(has_recognized_subcommand(&.{ "ztick", "-v" }));
     try std.testing.expect(!has_recognized_subcommand(&.{"ztick"}));
     try std.testing.expect(!has_recognized_subcommand(&.{ "ztick", "-c", "/etc/ztick.toml" }));
+}
+
+test "is_version_flag detects --version and -v at first position" {
+    try std.testing.expect(is_version_flag(&.{ "ztick", "--version" }));
+    try std.testing.expect(is_version_flag(&.{ "ztick", "-v" }));
+    try std.testing.expect(!is_version_flag(&.{"ztick"}));
+    try std.testing.expect(!is_version_flag(&.{ "ztick", "server" }));
+    try std.testing.expect(!is_version_flag(&.{ "ztick", "--help" }));
+}
+
+test "print_version emits ztick prefix and version with trailing newline" {
+    var buf: [64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try print_version(fbs.writer());
+    const expected = "ztick " ++ version_info.version ++ "\n";
+    try std.testing.expectEqualStrings(expected, fbs.getWritten());
 }
