@@ -1,4 +1,7 @@
-# Getting Started with ztick
+---
+title: "Getting Started with ztick"
+slug: "getting-started"
+---
 
 This tutorial walks you through building, configuring, and running ztick for the first time.
 

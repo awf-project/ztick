@@ -1,4 +1,6 @@
-# Building the Project
+---
+title: "Building the Project"
+---
 
 Guide to compiling, testing, and packaging ztick from source.
 

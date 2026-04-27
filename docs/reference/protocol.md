@@ -1,4 +1,6 @@
-# Protocol Reference
+---
+title: "Protocol Reference"
+---
 
 The ztick protocol is a simple line-based text protocol for communicating with the scheduler over TCP.
 

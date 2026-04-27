@@ -1,4 +1,6 @@
-# Inspecting Logfiles
+---
+title: "Inspecting Logfiles"
+---
 
 Guide to offline inspection and debugging of ztick's binary persistence logfiles.
 

@@ -1,4 +1,6 @@
-# Data Types Reference
+---
+title: "Data Types Reference"
+---
 
 Complete specification of all core ztick data types.
 

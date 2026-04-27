@@ -1,4 +1,6 @@
-# 0004: OpenTelemetry SDK Dependency for Instrumentation
+---
+title: "0004: OpenTelemetry SDK Dependency for Instrumentation"
+---
 
 **Status**: Accepted
 **Date**: 2026-03-31

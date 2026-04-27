@@ -74,16 +74,19 @@ jobs:
       - name: Run tests
         run: zig build test -Damqp-integration -Dredis-integration
 
-  build-linux:
+  build:
     needs: [lint, test]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: linux-x86_64
-            zig_target: x86_64-linux-gnu
+            runner: ubuntu-latest
           - target: linux-arm64
-            zig_target: aarch64-linux-gnu
-    runs-on: ubuntu-latest
+            runner: ubuntu-24.04-arm
+          - target: darwin-arm64
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -91,17 +94,20 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Install OpenSSL dev headers
+      - name: Install OpenSSL (Linux)
+        if: startsWith(matrix.target, 'linux-')
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
-      - name: Install ARM64 cross-compilation toolchain
-        if: matrix.target == 'linux-arm64'
-        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Install OpenSSL (macOS)
+        if: startsWith(matrix.target, 'darwin-')
+        run: |
+          brew install openssl@3
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
+          echo "C_INCLUDE_PATH=$(brew --prefix openssl@3)/include" >> "$GITHUB_ENV"
 
       - name: Build release binary
-        env:
-          ZIG_TARGET: ${{ matrix.zig_target }}
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=$ZIG_TARGET
+        run: zig build -Doptimize=ReleaseSafe
 
       - name: Stage artifact
         env:
@@ -113,46 +119,8 @@ jobs:
           name: ztick-${{ matrix.target }}
           path: zig-out/bin/ztick-${{ matrix.target }}
 
-  build-darwin-universal:
-    needs: [lint, test]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Install llvm-lipo
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y llvm
-
-      - name: Build aarch64-macos
-        run: |
-          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
-          mv zig-out/bin/ztick ztick-arm64
-
-      - name: Build x86_64-macos
-        run: |
-          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos
-          mv zig-out/bin/ztick ztick-x86_64
-
-      - name: Fuse into universal binary
-        run: |
-          # On Ubuntu the llvm package ships tools as `llvm-lipo-<version>`;
-          # resolve whichever version is present.
-          LIPO="$(command -v llvm-lipo || ls /usr/bin/llvm-lipo-* 2>/dev/null | sort -V | tail -1)"
-          [ -n "$LIPO" ] || { echo "llvm-lipo not found" >&2; exit 1; }
-          "$LIPO" -create ztick-arm64 ztick-x86_64 -output ztick-darwin-universal
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ztick-darwin-universal
-          path: ztick-darwin-universal
-
   release:
-    needs: [build-linux, build-darwin-universal]
+    needs: [build]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
@@ -183,7 +151,7 @@ jobs:
           fi
 
   dev-release:
-    needs: [build-linux, build-darwin-universal]
+    needs: [build]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
