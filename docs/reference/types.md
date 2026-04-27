@@ -2,7 +2,7 @@
 
 Complete specification of all core ztick data types.
 
-> **HTTP API Users**: These Zig types correspond directly to the HTTP API schemas defined in [openapi.yaml](../../openapi.yaml) and documented in the [HTTP API Reference](http-api.md). The HTTP API uses the field names shown in the "HTTP Schema" sections below.
+> **HTTP API Users**: These Zig types correspond directly to the HTTP API schemas defined in [openapi.json](../../src/infrastructure/openapi.json) and documented in the [HTTP API Reference](http-api.md). The HTTP API uses the field names shown in the "HTTP Schema" sections below.
 
 ## Core Types
 

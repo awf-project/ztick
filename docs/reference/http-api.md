@@ -4,10 +4,10 @@ The ztick HTTP API provides a RESTful interface for managing scheduled jobs and 
 
 ## OpenAPI Specification
 
-The complete API contract is defined in **[openapi.yaml](../../openapi.yaml)** at the repository root, written in OpenAPI v3.1.1 format. You can import this specification into:
+The complete API contract is defined in **[openapi.json](../../src/infrastructure/openapi.json)**, written in OpenAPI v3.1.1 format. The spec is colocated with the HTTP server that embeds it, and is also served live at `GET /openapi.json`. You can import it into:
 
-- **Swagger Editor** — https://editor.swagger.io/ (paste the raw YAML)
-- **Postman** — File → Import → paste `openapi.yaml`
+- **Swagger Editor** — https://editor.swagger.io/ (paste the raw JSON)
+- **Postman** — File → Import → paste `openapi.json`
 - **Code generation tools** — Generate client SDKs in your language
 - **API documentation tools** — Swagger UI, ReDoc, etc.
 

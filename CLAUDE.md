@@ -49,7 +49,7 @@
 ## Protocol (HTTP)
 
 - RESTful JSON API over HTTP/1.1; disabled by default, enabled via `[http] listen` in config
-- Uses std.http.Server for parsing/responses; OpenAPI 3.1.1 spec embedded via @embedFile (symlink from src/infrastructure/ to root openapi.json)
+- Uses std.http.Server for parsing/responses; OpenAPI 3.1.1 spec embedded via @embedFile from src/infrastructure/openapi.json (single source of truth, colocated with consumer)
 - Endpoints: GET/PUT/DELETE /jobs/{id}, GET /jobs?prefix=, GET/PUT/DELETE /rules/{id}, GET /rules?prefix=, GET /health, GET /openapi.json
 - DELETE returns 204 No Content; PUT/GET return 200 with JSON body; errors return 400/401/404/405/413 with `{"error":"message"}`
 - Optional Bearer token authentication; /health and /openapi.json are public (no auth required)
@@ -87,7 +87,7 @@
 - Always log failed background compression at ERROR level with .to_compress file path; retention of orphaned compression files is required for data recovery
 - Always validate shell executables with execute mode (.{ .mode = .execute }), not default read-only mode; default mode misses executable permission failures that fail at runtime
 - Always unescape TOML escape sequences when parsing array values; skipping escape bytes and copying raw backslashes produces literal backslashes instead of unescaped values
-- Never duplicate specification details across files (openapi.yaml, http-api.md, types.md); maintain single source of truth per spec element (schema descriptions, format rules, field definitions)
+- Never duplicate specification details across files (openapi.json, http-api.md, types.md); maintain single source of truth per spec element (schema descriptions, format rules, field definitions)
 - Never commit stub barrel files without implementation; add `@compileError` to unimplemented public functions to prevent partial feature merges
 - Add all compiled binaries and build artifacts (test_zig, *.o, *.a, *.so) to .gitignore; build outputs must never be staged or committed
 - Enforce 5-second auth timeout using poll-based socket reads; close connection if AUTH not received within timeout

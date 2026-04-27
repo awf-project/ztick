@@ -8,7 +8,7 @@ Technical specification and API documentation for ztick.
 - **[Protocol](protocol.md)** — Client communication format and commands
 - **[Data Types](types.md)** — Core domain structures
 - **[Persistence Format](persistence.md)** — Binary logfile encoding
-- **[HTTP API (OpenAPI)](../../openapi.yaml)** — OpenAPI v3.1.1 specification for the REST API
+- **[HTTP API (OpenAPI)](../../src/infrastructure/openapi.json)** — OpenAPI v3.1.1 specification for the REST API
 
 ## Quick Links
 
