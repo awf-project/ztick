@@ -1,4 +1,6 @@
-# Configuration
+---
+title: "Configuration"
+---
 
 This guide covers setting up and customizing ztick through TOML configuration files.
 

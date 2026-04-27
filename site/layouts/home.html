@@ -1,0 +1,58 @@
+{{ define "main" }}
+<section class="section container-fluid mt-n3 pb-3">
+  <div class="row justify-content-center">
+    <div class="col-lg-12 text-center">
+      <h1>{{ .Title }}</h1>
+    </div>
+    <div class="col-lg-9 col-xl-8 text-center">
+      <p class="lead">{{ .Params.lead | safeHTML }}</p>
+      <a class="btn btn-primary btn-cta rounded-pill btn-lg my-3" href="/ztick/docs/tutorials/getting-started/" role="button">Get Started</a>
+      <a class="btn btn-outline-primary rounded-pill btn-lg my-3" href="https://github.com/awf-project/ztick" role="button">GitHub</a>
+      {{ .Content }}
+    </div>
+  </div>
+</section>
+{{ end }}
+
+{{ define "sidebar-prefooter" }}
+  {{ if site.Params.doks.backgroundDots -}}
+  <div class="d-flex justify-content-start">
+    <div class="bg-dots"></div>
+  </div>
+  {{ end -}}
+  <section class="section section-md section-features">
+    <div class="container">
+      <div class="row justify-content-center text-center">
+        <div class="col-lg-5">
+          <h2 class="h4">Explicit Push Model</h2>
+          <p>Your application decides when to schedule. ztick listens on TCP, accepts <code>SET</code> commands with explicit timestamps, and executes them at the requested time — no periodic triggers, no surprise overlaps.</p>
+        </div>
+        <div class="col-lg-5">
+          <h2 class="h4">Multiple Runners</h2>
+          <p>Match jobs by prefix and dispatch to shell commands, direct execve, HTTP webhooks, AWF workflows, AMQP publishers, or Redis commands — all configured through the same protocol.</p>
+        </div>
+        <div class="col-lg-5">
+          <h2 class="h4">Durable Persistence</h2>
+          <p>Append-only logfile with binary length-prefixed framing, automatic background compression, and a <code>memory</code> mode for ephemeral CI runs without disk I/O.</p>
+        </div>
+        <div class="col-lg-5">
+          <h2 class="h4">Built with Zig</h2>
+          <p>Hexagonal architecture, four-thread design, optional TLS via system OpenSSL, OpenTelemetry export — packaged in a small static binary with explicit memory management.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+{{ end }}
+
+{{ define "sidebar-footer" }}
+{{ if site.Params.doks.sectionFooter -}}
+<section class="section section-md container-fluid bg-light">
+  <div class="row justify-content-center text-center">
+    <div class="col-lg-7">
+      <h2 class="mt-2">Start scheduling with ztick today</h2>
+      <a class="btn btn-primary rounded-pill px-4 my-2" href="/ztick/docs/tutorials/getting-started/" role="button">Get Started</a>
+    </div>
+  </div>
+</section>
+{{ end -}}
+{{ end }}

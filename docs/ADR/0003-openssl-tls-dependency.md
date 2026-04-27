@@ -1,4 +1,6 @@
-# 0003: System OpenSSL for Server-Side TLS
+---
+title: "0003: System OpenSSL for Server-Side TLS"
+---
 
 **Status**: Accepted
 **Date**: 2026-03-30

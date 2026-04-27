@@ -1,4 +1,6 @@
-# 0005: AMQP Runner Design
+---
+title: "0005: AMQP Runner Design"
+---
 
 **Status**: Accepted
 **Date**: 2026-04-26

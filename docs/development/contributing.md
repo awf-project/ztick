@@ -1,4 +1,6 @@
-# Contributing to ztick
+---
+title: "Contributing to ztick"
+---
 
 This guide explains how to contribute code, documentation, and bug reports to ztick.
 

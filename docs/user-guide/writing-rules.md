@@ -1,4 +1,6 @@
-# Writing Rules
+---
+title: "Writing Rules"
+---
 
 A **Rule** matches job identifiers by prefix and specifies what happens when a matching job triggers. This guide covers rule creation, pattern matching, and runner configuration.
 

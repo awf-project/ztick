@@ -1,4 +1,6 @@
-# 0002: Zig Language Choice
+---
+title: "0002: Zig Language Choice"
+---
 
 **Status**: Accepted
 **Date**: 2026-03-28

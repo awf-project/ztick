@@ -1,4 +1,6 @@
-# 0001: Hexagonal Architecture (Ports and Adapters)
+---
+title: "0001: Hexagonal Architecture (Ports and Adapters)"
+---
 
 **Status**: Accepted
 **Date**: 2026-03-28
