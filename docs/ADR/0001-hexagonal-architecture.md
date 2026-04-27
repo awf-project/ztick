@@ -70,6 +70,17 @@ Adopt **hexagonal architecture** with **4 strict layers**:
 | No ambiguous boundaries | Compliant | Each layer has a single responsibility; imports follow strict direction |
 | Minimal Abstraction | Compliant | No interfaces without 2+ implementations; single canonical `Runner` union |
 
+## Runner Implementation Status
+
+The `Runner` tagged union in `src/domain/` defines the set of supported runner types. The table below tracks implementation status:
+
+| Runner | Status |
+|--------|--------|
+| Shell | Implemented |
+| HTTP | Implemented |
+| AMQP | Implemented — see [ADR-0005](0005-amqp-runner-design.md) for design decisions |
+
 ## References
 
 - **Implementation**: See `docs/development/architecture.md` for code examples
+- **ADR-0005**: `docs/ADR/0005-amqp-runner-design.md` (AMQP runner design decisions)

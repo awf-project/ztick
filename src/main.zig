@@ -19,7 +19,7 @@ const application_token_store = @import("application/token_store.zig");
 const infrastructure_auth = @import("infrastructure/auth.zig");
 const infrastructure_channel = @import("infrastructure/channel.zig");
 const infrastructure_clock = @import("infrastructure/clock.zig");
-const infrastructure_shell_runner = @import("infrastructure/shell_runner.zig");
+const infrastructure_runner = @import("infrastructure/runner.zig");
 const infrastructure_tcp_server = @import("infrastructure/tcp_server.zig");
 const infrastructure_http = @import("infrastructure/http.zig");
 const infrastructure_tls_context = @import("infrastructure/tls_context.zig");
@@ -68,7 +68,6 @@ fn log_fn(
 const Channel = infrastructure_channel.Channel;
 const TcpServer = infrastructure_tcp_server.TcpServer;
 const Scheduler = application_scheduler.Scheduler;
-const ShellRunner = infrastructure_shell_runner.ShellRunner;
 const Clock = infrastructure_clock.Clock;
 const query = domain_query;
 const execution = domain_execution;
@@ -93,7 +92,7 @@ test {
     _ = infrastructure_auth;
     _ = infrastructure_channel;
     _ = infrastructure_clock;
-    _ = infrastructure_shell_runner;
+    _ = infrastructure_runner;
     _ = infrastructure_tcp_server;
     _ = infrastructure_http;
     _ = infrastructure_tls_context;
@@ -255,10 +254,7 @@ const TickContext = struct {
 
 fn run_processor(ctx: ProcessorContext) void {
     while (ctx.exec_request_ch.receive()) |req| {
-        const resp = ShellRunner.execute(ctx.allocator, ctx.shell_config, req) catch execution.Response{
-            .identifier = req.identifier,
-            .success = false,
-        };
+        const resp = infrastructure_runner.execute(ctx.allocator, ctx.shell_config, req);
         ctx.exec_response_ch.send(resp) catch return;
     }
 }

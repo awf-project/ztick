@@ -197,15 +197,105 @@ Spawns: `awf run generate-report --input format=pdf --input target=main`
 
 Each `--input` flag passes one key=value pair. Repeat the flag for multiple parameters.
 
-### AMQP Runner (Deferred)
+### AMQP Runner
 
-Publish a message to an AMQP broker. The AMQP runner is defined in the protocol but not yet operational.
+Publish a message to an AMQP 0-9-1 broker (e.g. RabbitMQ) when a matching job triggers. Useful for fanning out scheduled events to downstream consumers without coupling them to ztick.
 
 ```bash
-echo 'r1 RULE SET rule.notify notify. amqp amqp://broker:5672 jobs notifications' | socat - TCP:localhost:5678
+echo 'r1 RULE SET rule.notify notify. amqp amqp://guest:guest@localhost:5672/ jobs notifications' | socat - TCP:localhost:5678
 ```
 
 **Parameters**: `amqp <dsn> <exchange> <routing_key>`
+
+**Characteristics**:
+- AMQP 0-9-1 protocol over plaintext TCP (default port 5672)
+- DSN format: `amqp://[user[:password]@]host[:port][/vhost]` — credentials are redacted from logs
+- Each execution opens a new TCP connection, performs the handshake, publishes one `basic.publish` frame, then closes cleanly
+- Message body is the job identifier (u128 hex string); richer payloads are a future addition
+- Connect/send/receive timeout: 30 seconds — broker latency cannot starve the processor thread
+- Fire-and-forget: success means the publish frame was accepted by the broker at TCP level (no publisher confirms in v1)
+- Connection refused, authentication failure, or malformed DSN return `success = false` without crashing the processor
+
+**Limitations**:
+- TLS (`amqps://`) is not supported — use a stunnel sidecar or wait for a future revision if you need encryption in transit
+- Exchange existence is not validated; if the exchange is missing the broker silently drops the message (consult RabbitMQ logs)
+- No connection pooling — each execution pays a fresh handshake (~10 ms on localhost)
+
+**Example: Notify on Deploy**
+
+```bash
+echo 'r1 RULE SET rule.deploy deploy. amqp amqp://guest:guest@rabbitmq:5672/ jobs deploy.events' | socat - TCP:localhost:5678
+```
+
+When a job matching `deploy.*` triggers, ztick publishes the job identifier to exchange `jobs` with routing key `deploy.events`.
+
+**Local Development Stack**
+
+A `compose.yaml` at the repository root boots a RabbitMQ broker with the management UI on `http://localhost:15672` (default credentials `guest` / `guest`):
+
+```bash
+docker compose up -d
+```
+
+**Prepare the broker (declare exchange / queue / binding)**
+
+ztick publishes to whatever exchange + routing-key the rule names. RabbitMQ accepts the publish at TCP level even when no queue is bound (without publisher confirms — see the *Limitations* above), so messages disappear silently if the topology is missing. Declare it once before sending real traffic.
+
+Using the bundled CLI (RabbitMQ 4.x — note the `--name` flag syntax, **not** the legacy `name=value`):
+
+```bash
+docker compose exec rabbitmq rabbitmqadmin declare exchange --name jobs --type direct --durable true
+docker compose exec rabbitmq rabbitmqadmin declare queue --name notifications --durable true
+docker compose exec rabbitmq rabbitmqadmin declare binding --source jobs --destination notifications --destination-type queue --routing-key notifications
+```
+
+The shorthand alternative is to publish to the *default exchange* (`""`) with the routing key set to the queue name — RabbitMQ then routes directly to that queue, no binding needed:
+
+```bash
+docker compose exec rabbitmq rabbitmqadmin declare queue --name ztick.events --durable true
+# Then in the rule: amqp amqp://guest:guest@localhost:5672/ "" ztick.events
+```
+
+The management UI on `http://localhost:15672` exposes the same actions under the *Exchanges* and *Queues* tabs.
+
+**Verifying messages arrive**
+
+Without publisher confirms, ztick reports `success = true` as soon as the publish frame leaves the socket — the broker may still drop the message if no queue is bound. Two cheap ways to confirm receipt:
+
+```bash
+# Drain one message (acknowledges and removes it from the queue)
+docker compose exec rabbitmq rabbitmqadmin get messages --queue notifications --count 1
+
+# Or watch the queue depth without consuming
+watch -n 1 'docker compose exec rabbitmq rabbitmqadmin list queues name messages'
+```
+
+The management UI's *Queues → notifications → Get messages* (with *Ack mode = Reject requeue true*) inspects without draining.
+
+A successful publish from ztick produces a body equal to the job identifier formatted as a u128 hex string, for example:
+
+```
+Body: 0x1a2b3c4d5e6f70809a0b1c2d3e4f5a6b
+```
+
+Consumers should treat the body as opaque text and look up the job's actual data via ztick's TCP `GET <job_id>` if richer context is needed.
+
+**Troubleshooting**
+
+The runner never propagates errors to the processor — every failure path returns `success = false` and emits one warning to stderr (with the DSN credentials stripped). Map the warning text to the likely cause:
+
+| Warning line | Likely cause | Fix |
+|---|---|---|
+| `amqp runner: dsn parse failed: ... err=error.InvalidScheme` | DSN does not start with `amqp://`, or uses `amqps://` (TLS not supported) | Correct the scheme; remove `s` suffix |
+| `amqp runner: dsn parse failed: ... err=error.MissingUserInfo` | DSN omits the `@` separator (e.g. `amqp://host/`) | Add credentials, even `guest:guest@` |
+| `amqp runner: dsn parse failed: ... err=error.MissingHost` | Empty host (e.g. `amqp://user:pass@:5672/`) | Provide a hostname or IP |
+| `amqp runner: dsn parse failed: ... err=error.InvalidPort` | Port is non-numeric or > 65535 | Fix the port |
+| `amqp runner: tcp connect failed: ... err=error.ConnectionRefused` | Broker is not listening on that host:port | `docker compose ps`; check `[http]` is on the right port; firewall |
+| `amqp runner: tcp connect failed: ... err=error.ConnectionTimedOut` | Broker reachable but slow to accept (overload, network); 30 s timeout exhausted | Investigate broker health; consider raising broker resources |
+| `amqp runner: handshake failed: ... err=error.PeerClose` | Broker closed the connection during handshake — almost always authentication failure (AMQP reply-code 403) | Verify credentials in the DSN; check broker user permissions |
+| `amqp runner: handshake failed: ... err=error.EndOfStream` | Broker closed mid-handshake without sending Connection.Close (rare) | Check broker logs for protocol errors |
+
+If the publish *appears* to succeed (no warning) but the queue stays empty, the topology is the suspect — see *Prepare the broker* and *Verifying messages arrive* above.
 
 ## Updating a Rule
 

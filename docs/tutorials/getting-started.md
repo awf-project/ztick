@@ -208,6 +208,14 @@ See [Protocol Reference](../reference/protocol.md) for full details.
 
 **Want to secure your deployment?** See the [TLS Setup Guide](../user-guide/configuration.md#setting-up-tls) for encrypting protocol traffic.
 
+**Want to publish to a broker?** ztick can publish to AMQP 0-9-1 brokers (e.g. RabbitMQ) when a rule fires. A `compose.yaml` at the repo root boots a local RabbitMQ broker with the management UI on `http://localhost:15672`:
+
+```bash
+docker compose up -d
+```
+
+Then declare a rule whose runner is `amqp` and point it at the broker. See [Writing Rules → AMQP Runner](../user-guide/writing-rules.md#amqp-runner) for the full walkthrough including topology setup, message verification, and troubleshooting.
+
 ## Troubleshooting
 
 ### "Address already in use"

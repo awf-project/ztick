@@ -32,6 +32,7 @@ Numbers are never reused. If a decision is reversed, the original ADR is marked 
 | [0002](0002-zig-language-choice.md) | Zig Language Choice | Accepted |
 | [0003](0003-openssl-tls-dependency.md) | System OpenSSL for Server-Side TLS | Accepted |
 | [0004](0004-opentelemetry-sdk-dependency.md) | OpenTelemetry SDK Dependency for Instrumentation | Accepted |
+| [0005](0005-amqp-runner-design.md) | AMQP Runner Design | Accepted |
 
 ## Creating a New ADR
 

@@ -1,4 +1,4 @@
-.PHONY: build test test-functional test-all test-sanitize test-valgrind fmt lint clean
+.PHONY: build test test-functional test-all test-sanitize test-valgrind test-amqp fmt lint clean
 
 build:
 	zig build --summary all
@@ -17,6 +17,12 @@ test-sanitize:
 
 test-valgrind: build
 	valgrind --leak-check=full --error-exitcode=1 zig-out/bin/ztick --help
+
+test-amqp:
+	docker compose up -d --wait
+	zig build test-infrastructure -Damqp-integration --summary all; status=$$?; \
+		docker compose down; \
+		exit $$status
 
 fmt:
 	zig fmt .
