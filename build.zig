@@ -17,8 +17,10 @@ pub fn build(b: *std.Build) void {
     };
 
     const amqp_int = b.option(bool, "amqp-integration", "Run AMQP integration tests against a real broker") orelse false;
+    const redis_int = b.option(bool, "redis-integration", "Run Redis integration tests against a real broker") orelse false;
     const build_options = b.addOptions();
     build_options.addOption(bool, "amqp_integration", amqp_int);
+    build_options.addOption(bool, "redis_integration", redis_int);
 
     // OpenTelemetry SDK dependency (ADR-0004)
     const otel_dep = b.dependency("opentelemetry", .{

@@ -297,6 +297,85 @@ The runner never propagates errors to the processor — every failure path retur
 
 If the publish *appears* to succeed (no warning) but the queue stays empty, the topology is the suspect — see *Prepare the broker* and *Verifying messages arrive* above.
 
+### Redis Runner
+
+Send a single Redis command to a Redis server when a matching job triggers. Useful for fanning out events on a pub/sub channel or pushing job identifiers onto a Redis-backed worker queue without deploying a heavyweight broker.
+
+```bash
+echo 'r1 RULE SET rule.publish deploy. redis redis://127.0.0.1:6379/0 PUBLISH deploy:events' | socat - TCP:localhost:5678
+```
+
+**Parameters**: `redis <url> <command> <key>`
+
+**Characteristics**:
+- Plaintext RESP2 over TCP (default port 6379)
+- URL format: `redis://[user[:password]@]host[:port][/db]` — credentials are redacted from logs
+- Allowed commands (case-sensitive, validated at `RULE SET` parse time): `PUBLISH`, `RPUSH`, `LPUSH`, `SET`
+- Each execution opens a new TCP connection, optionally sends `AUTH` (single-arg or ACL two-arg form), optionally sends `SELECT <db>` when `db != 0`, sends the configured command with the job identifier as the value/payload, then closes
+- Connect/send/receive timeout: 30 seconds — Redis latency cannot starve the processor thread
+- Fire-and-forget: `PUBLISH` with zero subscribers is treated as success (matches `redis-cli` defaults); a RESP error reply (`-ERR ...`) is treated as failure
+- Connection refused, auth rejection, malformed URL, or unsupported commands return `success = false` without crashing the processor
+
+**Limitations**:
+- TLS (`rediss://`) is not supported — rejected at parse time. Wait for the general TLS-support track if you need encryption in transit
+- Only `PUBLISH`, `RPUSH`, `LPUSH`, `SET` are supported in v1 (no `HSET`, `SADD`, `XADD`, etc.)
+- No connection pooling — each execution pays a fresh handshake (~1 ms on localhost)
+- Payload is the raw job identifier; structured JSON envelopes are deferred
+
+**Example: Publish on Deploy (PUBLISH)**
+
+```bash
+echo 'r1 RULE SET rule.publish deploy. redis redis://127.0.0.1:6379/0 PUBLISH deploy:events' | socat - TCP:localhost:5678
+```
+
+When a job matching `deploy.*` triggers, ztick connects to Redis and runs `PUBLISH deploy:events <job_id>`. Subscribers on the `deploy:events` channel receive the job identifier as the message payload.
+
+Verify the channel locally:
+
+```bash
+# In one terminal: subscribe
+docker compose exec redis redis-cli SUBSCRIBE deploy:events
+
+# In another terminal: schedule a matching job
+echo 'r2 SET deploy.release.v1 2026-04-27 12:00:00' | socat - TCP:localhost:5678
+```
+
+**Example: Worker Queue (RPUSH)**
+
+```bash
+echo 'r1 RULE SET rule.queue backup. redis redis://127.0.0.1:6379/0 RPUSH backup:tasks' | socat - TCP:localhost:5678
+```
+
+When a job matching `backup.*` triggers, ztick runs `RPUSH backup:tasks <job_id>`, appending the job identifier to the tail of the `backup:tasks` list. Workers can drain the list with `BLPOP backup:tasks 0`.
+
+Verify the queue:
+
+```bash
+# Inspect the list contents (does not consume)
+docker compose exec redis redis-cli LRANGE backup:tasks 0 -1
+
+# Pop the next task (consumes)
+docker compose exec redis redis-cli LPOP backup:tasks
+```
+
+**Example: Authenticated Redis with Non-Zero Database**
+
+```bash
+echo 'r1 RULE SET rule.notify notify. redis redis://app:s3cr3t@redis.internal:6379/3 PUBLISH notify:events' | socat - TCP:localhost:5678
+```
+
+Triggers send `AUTH app s3cr3t`, then `SELECT 3`, then `PUBLISH notify:events <job_id>`. When the URL contains only a password (`redis://:s3cr3t@host/0`), ztick falls back to the legacy single-arg `AUTH s3cr3t`.
+
+**Local Development Stack**
+
+The bundled `compose.yaml` boots a Redis service on `127.0.0.1:6379` with no auth and database `0`:
+
+```bash
+docker compose up -d redis
+docker compose exec redis redis-cli ping
+# PONG
+```
+
 ## Updating a Rule
 
 Overwrite a rule by sending RULE SET with the same identifier:

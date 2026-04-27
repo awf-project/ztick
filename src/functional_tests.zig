@@ -4354,3 +4354,222 @@ test "shell runner dispatches AMQP runner without raising when broker unreachabl
     try std.testing.expectEqual(@as(u128, 0xF019_F019_F019_F019), response.identifier);
     try std.testing.expect(!response.success);
 }
+
+test "scheduler dispatches Redis runner request when matching job triggers" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-rule",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.notify",
+            .pattern = "deploy.",
+            .runner = .{ .redis = .{
+                .url = "redis://localhost:6379/0",
+                .command = "PUBLISH",
+                .key = "deploy:events",
+            } },
+        } },
+    });
+
+    _ = try scheduler.handle_query(Request{
+        .client = 2,
+        .identifier = "req-job",
+        .instruction = .{ .set = .{ .identifier = "deploy.release.1", .execution = 1000 } },
+    });
+
+    try scheduler.tick(1000);
+
+    try std.testing.expectEqual(JobStatus.triggered, scheduler.job_storage.get("deploy.release.1").?.status);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.execution_client.pending.items.len);
+
+    const dispatched = scheduler.execution_client.pending.items[0];
+    try std.testing.expectEqualStrings("deploy.release.1", dispatched.job_identifier);
+    switch (dispatched.runner) {
+        .redis => |r| {
+            try std.testing.expectEqualStrings("redis://localhost:6379/0", r.url);
+            try std.testing.expectEqualStrings("PUBLISH", r.command);
+            try std.testing.expectEqualStrings("deploy:events", r.key);
+        },
+        else => return error.TestUnexpectedRunnerVariant,
+    }
+}
+
+test "persisted Redis rule replays and dispatches matching job after reload" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const persisted_rule = Rule{
+        .identifier = "rule.publish",
+        .pattern = "events.",
+        .runner = .{ .redis = .{
+            .url = "redis://localhost:6379/0",
+            .command = "RPUSH",
+            .key = "backup:tasks",
+        } },
+    };
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = persisted_rule },
+    });
+    defer allocator.free(logfile_data);
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var decode_arena = try replay_into_scheduler(allocator, logfile_data, &scheduler);
+    defer decode_arena.deinit();
+
+    const restored = scheduler.rule_storage.get("rule.publish");
+    try std.testing.expect(restored != null);
+    switch (restored.?.runner) {
+        .redis => |r| {
+            try std.testing.expectEqualStrings("redis://localhost:6379/0", r.url);
+            try std.testing.expectEqualStrings("RPUSH", r.command);
+            try std.testing.expectEqualStrings("backup:tasks", r.key);
+        },
+        else => return error.TestUnexpectedRunnerVariant,
+    }
+
+    _ = try scheduler.handle_query(Request{
+        .client = 1,
+        .identifier = "req-job",
+        .instruction = .{ .set = .{ .identifier = "events.signup.42", .execution = 2000 } },
+    });
+
+    try scheduler.tick(2000);
+
+    try std.testing.expectEqual(JobStatus.triggered, scheduler.job_storage.get("events.signup.42").?.status);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.execution_client.pending.items.len);
+    try std.testing.expect(scheduler.execution_client.pending.items[0].runner == .redis);
+}
+
+test "runner dispatches Redis runner without raising when broker unreachable" {
+    const refused_port: u16 = blk: {
+        const a = try std.net.Address.parseIp4("127.0.0.1", 0);
+        var s = try a.listen(.{ .reuse_address = true });
+        const p = s.listen_address.in.getPort();
+        s.deinit();
+        break :blk p;
+    };
+    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://127.0.0.1:{d}/0", .{refused_port});
+    defer std.testing.allocator.free(url);
+
+    const shell_config = interfaces_config.ShellConfig{ .path = "/bin/sh", .args = &.{"-c"} };
+    const request = domain_execution.Request{
+        .identifier = 0xF020_F020_F020_F020,
+        .job_identifier = "deploy.unreachable",
+        .runner = .{ .redis = .{ .url = url, .command = "PUBLISH", .key = "deploy:events" } },
+    };
+
+    const response = infrastructure_runner.execute(std.testing.allocator, shell_config, request);
+
+    try std.testing.expectEqual(@as(u128, 0xF020_F020_F020_F020), response.identifier);
+    try std.testing.expect(!response.success);
+}
+
+test "logfile containing shell amqp direct awf http rules replays under F020 (discriminant 5 does not clash with existing values)" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const direct_args = [_][]const u8{ "-s", "http://example.com" };
+    const awf_inputs = [_][]const u8{ "format=pdf", "target=main" };
+
+    const logfile_data = try build_logfile_bytes(allocator, &.{
+        .{ .rule = .{
+            .identifier = "rule.legacy.shell",
+            .pattern = "shell.",
+            .runner = .{ .shell = .{ .command = "/bin/echo legacy" } },
+        } },
+        .{ .rule = .{
+            .identifier = "rule.legacy.amqp",
+            .pattern = "amqp.",
+            .runner = .{ .amqp = .{
+                .dsn = "amqp://127.0.0.1:5672/",
+                .exchange = "events",
+                .routing_key = "deploy",
+            } },
+        } },
+        .{ .rule = .{
+            .identifier = "rule.legacy.direct",
+            .pattern = "fetch.",
+            .runner = .{ .direct = .{ .executable = "/usr/bin/curl", .args = &direct_args } },
+        } },
+        .{ .rule = .{
+            .identifier = "rule.legacy.awf",
+            .pattern = "report.",
+            .runner = .{ .awf = .{ .workflow = "generate-report", .inputs = &awf_inputs } },
+        } },
+        .{ .rule = .{
+            .identifier = "rule.legacy.http",
+            .pattern = "webhook.",
+            .runner = .{ .http = .{ .method = "POST", .url = "https://hooks.example.com/webhook" } },
+        } },
+    });
+    defer allocator.free(logfile_data);
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    var decode_arena = try replay_into_scheduler(allocator, logfile_data, &scheduler);
+    defer decode_arena.deinit();
+
+    const shell_rule = scheduler.rule_storage.get("rule.legacy.shell");
+    try std.testing.expect(shell_rule != null);
+    switch (shell_rule.?.runner) {
+        .shell => |s| try std.testing.expectEqualStrings("/bin/echo legacy", s.command),
+        else => return error.TestUnexpectedRunnerVariant,
+    }
+
+    const amqp_rule = scheduler.rule_storage.get("rule.legacy.amqp");
+    try std.testing.expect(amqp_rule != null);
+    switch (amqp_rule.?.runner) {
+        .amqp => |a| {
+            try std.testing.expectEqualStrings("amqp://127.0.0.1:5672/", a.dsn);
+            try std.testing.expectEqualStrings("events", a.exchange);
+            try std.testing.expectEqualStrings("deploy", a.routing_key);
+        },
+        else => return error.TestUnexpectedRunnerVariant,
+    }
+
+    const direct_rule = scheduler.rule_storage.get("rule.legacy.direct");
+    try std.testing.expect(direct_rule != null);
+    switch (direct_rule.?.runner) {
+        .direct => |d| {
+            try std.testing.expectEqualStrings("/usr/bin/curl", d.executable);
+            try std.testing.expectEqual(@as(usize, 2), d.args.len);
+            try std.testing.expectEqualStrings("-s", d.args[0]);
+            try std.testing.expectEqualStrings("http://example.com", d.args[1]);
+        },
+        else => return error.TestUnexpectedRunnerVariant,
+    }
+
+    const awf_rule = scheduler.rule_storage.get("rule.legacy.awf");
+    try std.testing.expect(awf_rule != null);
+    switch (awf_rule.?.runner) {
+        .awf => |w| {
+            try std.testing.expectEqualStrings("generate-report", w.workflow);
+            try std.testing.expectEqual(@as(usize, 2), w.inputs.len);
+            try std.testing.expectEqualStrings("format=pdf", w.inputs[0]);
+            try std.testing.expectEqualStrings("target=main", w.inputs[1]);
+        },
+        else => return error.TestUnexpectedRunnerVariant,
+    }
+
+    const http_rule = scheduler.rule_storage.get("rule.legacy.http");
+    try std.testing.expect(http_rule != null);
+    switch (http_rule.?.runner) {
+        .http => |h| {
+            try std.testing.expectEqualStrings("POST", h.method);
+            try std.testing.expectEqualStrings("https://hooks.example.com/webhook", h.url);
+        },
+        else => return error.TestUnexpectedRunnerVariant,
+    }
+}

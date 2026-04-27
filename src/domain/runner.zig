@@ -7,6 +7,11 @@ pub const Runner = union(enum) {
         exchange: []const u8,
         routing_key: []const u8,
     },
+    redis: struct {
+        url: []const u8,
+        command: []const u8,
+        key: []const u8,
+    },
     direct: struct {
         executable: []const u8,
         args: []const []const u8,
@@ -59,6 +64,7 @@ test "direct runner is matched by exhaustive switch" {
     const tag: []const u8 = switch (runner) {
         .shell => "shell",
         .amqp => "amqp",
+        .redis => "redis",
         .direct => "direct",
         .awf => "awf",
         .http => "http",
@@ -83,9 +89,30 @@ test "http runner is matched by exhaustive switch" {
     const tag: []const u8 = switch (runner) {
         .shell => "shell",
         .amqp => "amqp",
+        .redis => "redis",
         .direct => "direct",
         .awf => "awf",
         .http => "http",
     };
     try std.testing.expectEqualStrings("http", tag);
+}
+
+test "redis runner stores url command and key" {
+    const runner = Runner{ .redis = .{ .url = "redis://localhost:6379/0", .command = "PUBLISH", .key = "deploy:events" } };
+    try std.testing.expectEqualStrings("redis://localhost:6379/0", runner.redis.url);
+    try std.testing.expectEqualStrings("PUBLISH", runner.redis.command);
+    try std.testing.expectEqualStrings("deploy:events", runner.redis.key);
+}
+
+test "redis runner is matched by exhaustive switch" {
+    const runner = Runner{ .redis = .{ .url = "redis://localhost:6379/0", .command = "RPUSH", .key = "backup:tasks" } };
+    const tag: []const u8 = switch (runner) {
+        .shell => "shell",
+        .amqp => "amqp",
+        .redis => "redis",
+        .direct => "direct",
+        .awf => "awf",
+        .http => "http",
+    };
+    try std.testing.expectEqualStrings("redis", tag);
 }

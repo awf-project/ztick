@@ -134,6 +134,11 @@ pub const Runner = union(enum) {
         exchange: []const u8,
         routing_key: []const u8,
     },
+    redis: struct {
+        url: []const u8,
+        command: []const u8,
+        key: []const u8,
+    },
 };
 ```
 
@@ -176,6 +181,17 @@ pub const Runner = union(enum) {
   - Plaintext AMQP only; TLS support (`amqps://`) deferred
   - Per-execution connect/handshake/publish/close (no pooling); 30-second socket timeout
   - See [user-guide/writing-rules.md#amqp-runner](../user-guide/writing-rules.md#amqp-runner) for end-to-end usage, broker setup, verification, and troubleshooting
+
+- **redis**: Send a single Redis command (PUBLISH/RPUSH/LPUSH/SET) to a Redis server
+  - Supported via TCP protocol only (not exposed in HTTP API)
+  - Fields: `url` (connection string), `command` (one of `PUBLISH`, `RPUSH`, `LPUSH`, `SET` — case-sensitive), `key` (channel/list/key)
+  - URL format: `redis://[user[:password]@]host[:port][/db]` (plaintext only — `rediss://` is rejected at parse time)
+  - The job identifier is sent as the value/payload of the configured command
+  - TCP syntax: `redis <url> <command> <key>` (e.g. `redis redis://127.0.0.1:6379/0 PUBLISH deploy:events`)
+  - Per-execution connect → optional `AUTH` (single- or two-arg form) → optional `SELECT <db>` → command → close (no pooling); 30-second socket timeout
+  - Credentials present in the URL are redacted from logs
+  - See [ADR-0006](../ADR/0006-redis-runner-design.md) for the persistence discriminant rationale (byte `5`, the next available value after the existing 0–4 mapping)
+  - See [user-guide/writing-rules.md#redis-runner](../user-guide/writing-rules.md#redis-runner) for end-to-end usage and worked examples
 
 ### Instruction
 
@@ -302,6 +318,32 @@ const amqp_rule = Rule{
 };
 ```
 
+### Creating a Redis Rule
+
+```zig
+// PUBLISH to a channel
+const redis_publish_rule = Rule{
+    .identifier = "rule.publish",
+    .pattern = "deploy.",
+    .runner = .{ .redis = .{
+        .url = "redis://127.0.0.1:6379/0",
+        .command = "PUBLISH",
+        .key = "deploy:events",
+    } },
+};
+
+// RPUSH to a list (worker queue)
+const redis_queue_rule = Rule{
+    .identifier = "rule.queue",
+    .pattern = "backup.",
+    .runner = .{ .redis = .{
+        .url = "redis://127.0.0.1:6379/0",
+        .command = "RPUSH",
+        .key = "backup:tasks",
+    } },
+};
+```
+
 ### Creating an AWF Rule
 
 ```zig
@@ -399,7 +441,16 @@ Types are persisted in binary format:
      [N bytes: method string (GET|POST|PUT|DELETE)]
      [2 bytes: url length]
      [N bytes: url string]
+  └─ if redis (5):
+     [2 bytes: url length]
+     [N bytes: url string]
+     [2 bytes: command length]
+     [N bytes: command string (PUBLISH|RPUSH|LPUSH|SET)]
+     [2 bytes: key length]
+     [N bytes: key string]
 ```
+
+> **Discriminant note**: Redis uses byte `5` (the next available value after `0=shell`, `1=amqp`, `2=direct`, `3=awf`, `4=http`). Existing logfiles already encode these five values, so the redis variant appended a new discriminant rather than renumbering. See [ADR-0006](../ADR/0006-redis-runner-design.md) for the rationale.
 
 See [Persistence Format](persistence.md) for complete details.
 

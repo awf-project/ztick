@@ -23,9 +23,25 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    hostname: redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
 configs:
   enabled_plugins:
     content: "[rabbitmq_management]."
 
 volumes:
   rabbitmq-data:
+  redis-data:

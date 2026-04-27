@@ -21,6 +21,7 @@ ztick.log
 *.tmp
 *.bak
 *.db
+dump.rdb
 test_debug_log.db
 test_timing
 

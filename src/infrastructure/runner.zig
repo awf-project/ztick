@@ -6,6 +6,7 @@ const amqp = @import("runner/amqp.zig");
 const awf = @import("runner/awf.zig");
 const direct = @import("runner/direct.zig");
 const http = @import("runner/http.zig");
+const redis = @import("runner/redis.zig");
 const shell = @import("runner/shell.zig");
 
 const execution = domain.execution;
@@ -18,6 +19,7 @@ pub fn execute(allocator: std.mem.Allocator, shell_config: ShellConfig, request:
         .amqp => |a| amqp.execute(allocator, a, request),
         .http => |h| http.execute(allocator, h, request),
         .awf => |a| awf.execute(allocator, a, request),
+        .redis => |r| redis.execute(allocator, r, request),
     };
 }
 

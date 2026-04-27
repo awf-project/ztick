@@ -14,9 +14,10 @@ This is an **explicit push model** — the application drives, ztick executes. T
 
 - **Core scheduler** — Time-based job execution with TCP control protocol
 - **Protocol commands** — `AUTH`, `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, `LISTRULES`, `RULE SET`, `STAT`
-- **Rules** — Match jobs by prefix and assign shell, direct, HTTP webhook, AWF workflow, or AMQP publisher runners
+- **Rules** — Match jobs by prefix and assign shell, direct, HTTP webhook, AWF workflow, AMQP publisher, or Redis command runners
 - **HTTP webhooks** — Trigger external services via GET/POST/PUT/DELETE requests with JSON payloads
 - **AMQP publishing** — Emit messages to an AMQP 0-9-1 broker (e.g. RabbitMQ) on rule match
+- **Redis commands** — Send PUBLISH/RPUSH/LPUSH/SET commands to a Redis server on rule match
 - **Client authentication** — Token-based AUTH handshake with namespace-scoped authorization
 - **Persistence** — Append-only logfile with binary encoding and automatic background compression
 - **In-memory persistence** — Ephemeral mode for CI/testing without disk I/O
@@ -49,14 +50,19 @@ zig build run -- -c /path/to/config  # run with config file
 
 ### Local Development Stack
 
-A `compose.yaml` at the repository root provides a local RabbitMQ broker for testing AMQP runner integration:
+A `compose.yaml` at the repository root provides local broker services for testing:
 
 ```bash
-docker compose up -d              # Boot RabbitMQ 4.3 with management UI
+docker compose up -d              # Boot RabbitMQ 4.3 and Redis 7
 docker compose down               # Stop the stack
 ```
 
-The management UI is available at `http://localhost:15672` (default credentials: `guest` / `guest`).
+**RabbitMQ** (AMQP):
+- Management UI: `http://localhost:15672` (default credentials: `guest` / `guest`)
+
+**Redis**:
+- CLI access: `docker compose exec redis redis-cli`
+- Default database: `0` (no authentication required)
 
 ## Documentation
 
@@ -94,7 +100,7 @@ ztick follows **hexagonal architecture** with 4 strict layers:
 |---------|---------|
 | **Job** | Execution scheduled for a specific timestamp |
 | **Rule** | Pattern matching rule that selects jobs and specifies a runner |
-| **Runner** | Execution target (shell command, direct execve, HTTP webhook, AWF workflow, or AMQP publisher) |
+| **Runner** | Execution target (shell command, direct execve, HTTP webhook, AWF workflow, AMQP publisher, or Redis command) |
 | **Execution** | Result of a triggered job (success/failure with metadata) |
 
 ## CLI
@@ -224,7 +230,7 @@ Four threads communicate via bounded channels:
 
 - **Controller** — TCP server accepting protocol commands
 - **Database** — Scheduler tick loop processing queries and triggering jobs
-- **Processor** — Executes triggered jobs via shell, direct, AWF, HTTP, or AMQP runners
+- **Processor** — Executes triggered jobs via shell, direct, AWF, HTTP, AMQP, or Redis runners
 - **HTTP** — Optional REST API server (enabled via `[http]` config section)
 
 ## Development

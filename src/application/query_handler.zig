@@ -91,6 +91,7 @@ pub const QueryHandler = struct {
                             try body_buf.writer(self.allocator).writeByte('\n');
                         },
                         .http => |h| try body_buf.writer(self.allocator).print("{s} {s} http {s} {s}\n", .{ rule.identifier, rule.pattern, h.method, h.url }),
+                        .redis => |r| try body_buf.writer(self.allocator).print("{s} {s} redis {s} {s} {s}\n", .{ rule.identifier, rule.pattern, r.url, r.command, r.key }),
                     }
                 }
 

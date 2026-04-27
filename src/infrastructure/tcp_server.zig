@@ -574,6 +574,31 @@ fn build_rule_set_instruction(allocator: std.mem.Allocator, args: [][]u8) error{
             .runner = .{ .http = .{ .method = duped_method, .url = duped_url } },
         } };
     }
+    if (runner_type.len >= 4 and std.mem.eql(u8, runner_type[0], "redis")) {
+        const url = runner_type[1];
+        const command = runner_type[2];
+        const key = runner_type[3];
+        if (!std.mem.startsWith(u8, url, "redis://")) return null;
+        const valid_command = std.mem.eql(u8, command, "PUBLISH") or
+            std.mem.eql(u8, command, "RPUSH") or
+            std.mem.eql(u8, command, "LPUSH") or
+            std.mem.eql(u8, command, "SET");
+        if (!valid_command) return null;
+        const id = try allocator.dupe(u8, args[2]);
+        errdefer allocator.free(id);
+        const pattern = try allocator.dupe(u8, args[3]);
+        errdefer allocator.free(pattern);
+        const duped_url = try allocator.dupe(u8, url);
+        errdefer allocator.free(duped_url);
+        const duped_command = try allocator.dupe(u8, command);
+        errdefer allocator.free(duped_command);
+        const duped_key = try allocator.dupe(u8, key);
+        return .{ .rule_set = .{
+            .identifier = id,
+            .pattern = pattern,
+            .runner = .{ .redis = .{ .url = duped_url, .command = duped_command, .key = duped_key } },
+        } };
+    }
     return null;
 }
 
@@ -671,6 +696,11 @@ fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Ins
                 .http => |h| {
                     allocator.free(h.method);
                     allocator.free(h.url);
+                },
+                .redis => |redis| {
+                    allocator.free(redis.url);
+                    allocator.free(redis.command);
+                    allocator.free(redis.key);
                 },
             }
         },
@@ -1116,6 +1146,7 @@ test "build_instruction parses RULE SET command with shell runner" {
                 .direct => return error.WrongRunnerType,
                 .awf => return error.WrongRunnerType,
                 .http => return error.WrongRunnerType,
+                .redis => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -1144,6 +1175,7 @@ test "build_instruction parses RULE SET command with direct runner and no args" 
                 .amqp => return error.WrongRunnerType,
                 .awf => return error.WrongRunnerType,
                 .http => return error.WrongRunnerType,
+                .redis => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -1172,6 +1204,7 @@ test "build_instruction parses RULE SET command with direct runner and multiple 
                 .amqp => return error.WrongRunnerType,
                 .awf => return error.WrongRunnerType,
                 .http => return error.WrongRunnerType,
+                .redis => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -1761,6 +1794,7 @@ test "build_instruction parses RULE SET command with awf runner and no inputs" {
                 .amqp => return error.WrongRunnerType,
                 .direct => return error.WrongRunnerType,
                 .http => return error.WrongRunnerType,
+                .redis => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -1789,6 +1823,7 @@ test "build_instruction parses RULE SET command with awf runner and --input flag
                 .amqp => return error.WrongRunnerType,
                 .direct => return error.WrongRunnerType,
                 .http => return error.WrongRunnerType,
+                .redis => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -1866,6 +1901,7 @@ test "build_instruction parses RULE SET command with http runner GET method" {
                 .amqp => return error.WrongRunnerType,
                 .direct => return error.WrongRunnerType,
                 .awf => return error.WrongRunnerType,
+                .redis => return error.WrongRunnerType,
             }
         },
         else => return error.WrongInstructionType,
@@ -2347,4 +2383,78 @@ test "handle_connection RULE SET with identifier in namespace succeeds regardles
     const n_cmd = try poll_for_response(pair.write_stream.handle, &buf2, 500);
     try std.testing.expect(n_cmd > 0);
     try std.testing.expectEqualStrings("r4 OK\n", buf2[0..n_cmd]);
+}
+
+test "build_instruction parses RULE SET command with redis runner PUBLISH command" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.notify"), @constCast("deploy."), @constCast("redis"), @constCast("redis://localhost:6379/0"), @constCast("PUBLISH"), @constCast("deploy:events") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = (try build_instruction(std.testing.allocator, result)).?;
+    defer free_instruction_strings(std.testing.allocator, instr);
+    switch (instr) {
+        .rule_set => |r| {
+            try std.testing.expectEqualStrings("rule.notify", r.identifier);
+            try std.testing.expectEqualStrings("deploy.", r.pattern);
+            switch (r.runner) {
+                .redis => |redis| {
+                    try std.testing.expectEqualStrings("redis://localhost:6379/0", redis.url);
+                    try std.testing.expectEqualStrings("PUBLISH", redis.command);
+                    try std.testing.expectEqualStrings("deploy:events", redis.key);
+                },
+                else => return error.WrongRunnerType,
+            }
+        },
+        else => return error.WrongInstructionType,
+    }
+}
+
+test "build_instruction returns null for RULE SET with redis runner unsupported command" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.flush"), @constCast("all."), @constCast("redis"), @constCast("redis://localhost:6379/0"), @constCast("FLUSHALL"), @constCast("ignored") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "build_instruction returns null for RULE SET with redis runner invalid url scheme" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.notify"), @constCast("deploy."), @constCast("redis"), @constCast("amqp://localhost:5672"), @constCast("PUBLISH"), @constCast("deploy:events") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "build_instruction returns null for RULE SET with redis runner too few tokens" {
+    var args = [_][]u8{ @constCast("RULE"), @constCast("SET"), @constCast("rule.notify"), @constCast("deploy."), @constCast("redis"), @constCast("redis://localhost:6379/0"), @constCast("PUBLISH") };
+    const result = parser.ParseResult{
+        .command = @constCast("r1"),
+        .args = &args,
+        .remaining = "",
+    };
+    const instr = try build_instruction(std.testing.allocator, result);
+    try std.testing.expect(instr == null);
+}
+
+test "free_instruction_strings frees rule_set redis runner strings without leak" {
+    const allocator = std.testing.allocator;
+    const id = try allocator.dupe(u8, "rule.notify");
+    const pattern = try allocator.dupe(u8, "deploy.");
+    const url = try allocator.dupe(u8, "redis://localhost:6379/0");
+    const command = try allocator.dupe(u8, "PUBLISH");
+    const key = try allocator.dupe(u8, "deploy:events");
+    const instr = instruction.Instruction{ .rule_set = .{
+        .identifier = id,
+        .pattern = pattern,
+        .runner = .{ .redis = .{ .url = url, .command = command, .key = key } },
+    } };
+    free_instruction_strings(allocator, instr);
 }
