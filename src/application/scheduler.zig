@@ -51,11 +51,11 @@ pub const Scheduler = struct {
         };
     }
 
-    pub fn setInstruments(self: *Scheduler, instr: telemetry.Instruments) void {
+    pub fn set_instruments(self: *Scheduler, instr: telemetry.Instruments) void {
         self.instruments = instr;
     }
 
-    pub fn setStatContext(self: *Scheduler, startup_ns: i128, active_connections: *std.atomic.Value(usize), auth_enabled: bool, tls_enabled: bool, framerate: u16) void {
+    pub fn set_stat_context(self: *Scheduler, startup_ns: i128, active_connections: *std.atomic.Value(usize), auth_enabled: bool, tls_enabled: bool, framerate: u16) void {
         self.startup_ns = startup_ns;
         self.active_connections = active_connections;
         self.auth_enabled = auth_enabled;
@@ -83,7 +83,7 @@ pub const Scheduler = struct {
         }
 
         self.job_storage.jobs.clearRetainingCapacity();
-        self.job_storage.to_execute.clearRetainingCapacity();
+        self.job_storage.to_execute.items.len = 0;
         self.rule_storage.rules.clearRetainingCapacity();
 
         const decode_alloc = self.persistence.?.reset_decode_arena(allocator);
@@ -245,10 +245,8 @@ pub const Scheduler = struct {
             }
         }
 
-        const borrowed = self.job_storage.get_to_execute(current_time);
-        const jobs_to_execute = try self.allocator.alloc(Job, borrowed.len);
+        const jobs_to_execute = try self.job_storage.get_to_execute(current_time, self.allocator);
         defer self.allocator.free(jobs_to_execute);
-        @memcpy(jobs_to_execute, borrowed);
 
         for (jobs_to_execute) |job| {
             if (self.rule_storage.pair(job.identifier)) |rule| {
@@ -1332,32 +1330,54 @@ test "tick logs warning and retains .to_compress when compression fails" {
     _ = try tmp.dir.statFile("logfile.to_compress");
 }
 
+const TestOtelContext = struct {
+    scheduler: Scheduler,
+    meter_provider: *@import("opentelemetry").metrics.MeterProvider,
+    tracer_provider: *@import("opentelemetry").trace.TracerProvider,
+
+    fn init(allocator: std.mem.Allocator) !TestOtelContext {
+        const otel = @import("opentelemetry");
+        const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+        errdefer meter_provider.shutdown();
+        const tracer_provider = try otel.trace.TracerProvider.init(
+            allocator,
+            otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+        );
+        errdefer tracer_provider.shutdown();
+
+        var scheduler = Scheduler.init(allocator);
+        scheduler.set_instruments(try telemetry.createInstruments(meter_provider, tracer_provider));
+
+        return .{
+            .scheduler = scheduler,
+            .meter_provider = meter_provider,
+            .tracer_provider = tracer_provider,
+        };
+    }
+
+    fn deinit(self: *TestOtelContext) void {
+        self.scheduler.deinit();
+        self.tracer_provider.shutdown();
+        self.meter_provider.shutdown();
+    }
+};
+
 test "handle_query SET with instruments calls jobs_scheduled counter" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const otel = @import("opentelemetry");
-    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
-    defer meter_provider.shutdown();
-    const tracer_provider = try otel.trace.TracerProvider.init(
-        allocator,
-        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
-    );
-    defer tracer_provider.shutdown();
+    var ctx = try TestOtelContext.init(allocator);
+    defer ctx.deinit();
 
-    var scheduler = Scheduler.init(allocator);
-    defer scheduler.deinit();
-    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
-
-    const response = try scheduler.handle_query(Request{
+    const response = try ctx.scheduler.handle_query(Request{
         .client = 1,
         .identifier = "req-1",
         .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1000 } },
     });
     try std.testing.expect(response.success);
 
-    const job = scheduler.job_storage.get("job.1");
+    const job = ctx.scheduler.job_storage.get("job.1");
     try std.testing.expect(job != null);
 }
 
@@ -1366,28 +1386,18 @@ test "handle_query REMOVE with instruments calls jobs_removed counter" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const otel = @import("opentelemetry");
-    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
-    defer meter_provider.shutdown();
-    const tracer_provider = try otel.trace.TracerProvider.init(
-        allocator,
-        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
-    );
-    defer tracer_provider.shutdown();
+    var ctx = try TestOtelContext.init(allocator);
+    defer ctx.deinit();
 
-    var scheduler = Scheduler.init(allocator);
-    defer scheduler.deinit();
-    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
+    try ctx.scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
 
-    try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
-
-    const response = try scheduler.handle_query(Request{
+    const response = try ctx.scheduler.handle_query(Request{
         .client = 1,
         .identifier = "req-1",
         .instruction = .{ .remove = .{ .identifier = "job.1" } },
     });
     try std.testing.expect(response.success);
-    try std.testing.expectEqual(@as(?Job, null), scheduler.job_storage.get("job.1"));
+    try std.testing.expectEqual(@as(?Job, null), ctx.scheduler.job_storage.get("job.1"));
 }
 
 test "handle_query RULE_SET with instruments updates rules_active gauge" {
@@ -1395,20 +1405,10 @@ test "handle_query RULE_SET with instruments updates rules_active gauge" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const otel = @import("opentelemetry");
-    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
-    defer meter_provider.shutdown();
-    const tracer_provider = try otel.trace.TracerProvider.init(
-        allocator,
-        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
-    );
-    defer tracer_provider.shutdown();
+    var ctx = try TestOtelContext.init(allocator);
+    defer ctx.deinit();
 
-    var scheduler = Scheduler.init(allocator);
-    defer scheduler.deinit();
-    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
-
-    const response = try scheduler.handle_query(Request{
+    const response = try ctx.scheduler.handle_query(Request{
         .client = 1,
         .identifier = "req-1",
         .instruction = .{ .rule_set = .{
@@ -1419,7 +1419,7 @@ test "handle_query RULE_SET with instruments updates rules_active gauge" {
     });
     try std.testing.expect(response.success);
 
-    const rule = scheduler.rule_storage.get("rule.1");
+    const rule = ctx.scheduler.rule_storage.get("rule.1");
     try std.testing.expect(rule != null);
 }
 
@@ -1428,32 +1428,22 @@ test "tick increments jobs_executed counter on successful execution result" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const otel = @import("opentelemetry");
-    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
-    defer meter_provider.shutdown();
-    const tracer_provider = try otel.trace.TracerProvider.init(
-        allocator,
-        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
-    );
-    defer tracer_provider.shutdown();
+    var ctx = try TestOtelContext.init(allocator);
+    defer ctx.deinit();
 
-    var scheduler = Scheduler.init(allocator);
-    defer scheduler.deinit();
-    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
+    try ctx.scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
+    try ctx.scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "job.", .runner = .{ .shell = .{ .command = "echo" } } });
 
-    try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
-    try scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "job.", .runner = .{ .shell = .{ .command = "echo" } } });
+    try ctx.scheduler.tick(1000);
 
-    try scheduler.tick(1000);
-
-    for (scheduler.execution_client.pending.items) |req| {
-        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
+    for (ctx.scheduler.execution_client.pending.items) |req| {
+        ctx.scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
     }
-    scheduler.execution_client.pending.clearRetainingCapacity();
+    ctx.scheduler.execution_client.pending.clearRetainingCapacity();
 
-    try scheduler.tick(2000);
+    try ctx.scheduler.tick(2000);
 
-    const job = scheduler.job_storage.get("job.1");
+    const job = ctx.scheduler.job_storage.get("job.1");
     try std.testing.expect(job != null);
     try std.testing.expectEqual(domain.job.JobStatus.executed, job.?.status);
 }
@@ -1463,32 +1453,22 @@ test "tick records execution duration in histogram for executed job" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const otel = @import("opentelemetry");
-    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
-    defer meter_provider.shutdown();
-    const tracer_provider = try otel.trace.TracerProvider.init(
-        allocator,
-        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
-    );
-    defer tracer_provider.shutdown();
+    var ctx = try TestOtelContext.init(allocator);
+    defer ctx.deinit();
 
-    var scheduler = Scheduler.init(allocator);
-    defer scheduler.deinit();
-    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
+    try ctx.scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
+    try ctx.scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "job.", .runner = .{ .shell = .{ .command = "echo" } } });
 
-    try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
-    try scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "job.", .runner = .{ .shell = .{ .command = "echo" } } });
+    try ctx.scheduler.tick(1000);
 
-    try scheduler.tick(1000);
-
-    for (scheduler.execution_client.pending.items) |req| {
-        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
+    for (ctx.scheduler.execution_client.pending.items) |req| {
+        ctx.scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
     }
-    scheduler.execution_client.pending.clearRetainingCapacity();
+    ctx.scheduler.execution_client.pending.clearRetainingCapacity();
 
-    try scheduler.tick(2000);
+    try ctx.scheduler.tick(2000);
 
-    const job = scheduler.job_storage.get("job.1");
+    const job = ctx.scheduler.job_storage.get("job.1");
     try std.testing.expect(job != null);
     try std.testing.expectEqual(domain.job.JobStatus.executed, job.?.status);
 }
@@ -1532,7 +1512,7 @@ test "handle_query with stat instruction returns success with all metric keys in
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(1);
-    scheduler.setStatContext(1_000_000_000, &connections, false, false, 100);
+    scheduler.set_stat_context(1_000_000_000, &connections, false, false, 100);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -1570,7 +1550,7 @@ test "handle_query with stat instruction reflects pre-populated job counts" {
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.setStatContext(0, &connections, false, false, 1);
+    scheduler.set_stat_context(0, &connections, false, false, 1);
 
     try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
     try scheduler.job_storage.set(Job{ .identifier = "job.2", .execution = 2000, .status = .planned });
@@ -1598,23 +1578,13 @@ test "handle_query with stat instruction with active instruments does not update
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const otel = @import("opentelemetry");
-    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
-    defer meter_provider.shutdown();
-    const tracer_provider = try otel.trace.TracerProvider.init(
-        allocator,
-        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
-    );
-    defer tracer_provider.shutdown();
-
-    var scheduler = Scheduler.init(allocator);
-    defer scheduler.deinit();
-    scheduler.setInstruments(try telemetry.createInstruments(meter_provider, tracer_provider));
+    var ctx = try TestOtelContext.init(allocator);
+    defer ctx.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.setStatContext(0, &connections, false, false, 1);
+    ctx.scheduler.set_stat_context(0, &connections, false, false, 1);
 
-    const response = try scheduler.handle_query(Request{
+    const response = try ctx.scheduler.handle_query(Request{
         .client = 1,
         .identifier = "req-stat-instruments",
         .instruction = .{ .stat = .{} },
@@ -1657,7 +1627,7 @@ test "handle_query with stat instruction does not persist to logfile" {
     try std.testing.expect(size_after_set > 0);
 
     var connections = std.atomic.Value(usize).init(1);
-    scheduler.setStatContext(0, &connections, false, false, 1);
+    scheduler.set_stat_context(0, &connections, false, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 2,
@@ -1678,7 +1648,7 @@ test "handle_query with stat instruction reports active_connections value from a
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(7);
-    scheduler.setStatContext(0, &connections, false, false, 1);
+    scheduler.set_stat_context(0, &connections, false, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -1700,7 +1670,7 @@ test "handle_query with stat instruction reports auth_enabled and tls_enabled as
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(1);
-    scheduler.setStatContext(0, &connections, true, true, 1);
+    scheduler.set_stat_context(0, &connections, true, true, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -1723,7 +1693,7 @@ test "handle_query with stat instruction reports framerate and rules_total value
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.setStatContext(0, &connections, false, false, 512);
+    scheduler.set_stat_context(0, &connections, false, false, 512);
 
     try scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "backup.", .runner = .{ .shell = .{ .command = "echo" } } });
     try scheduler.rule_storage.set(Rule{ .identifier = "rule.2", .pattern = "deploy.", .runner = .{ .shell = .{ .command = "echo" } } });
@@ -1764,7 +1734,7 @@ test "handle_query with stat instruction reports persistence backend type" {
     try scheduler.load(allocator);
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.setStatContext(0, &connections, false, false, 1);
+    scheduler.set_stat_context(0, &connections, false, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,

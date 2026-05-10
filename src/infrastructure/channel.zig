@@ -7,6 +7,7 @@ pub fn Channel(comptime T: type) type {
         mutex: std.Thread.Mutex,
         not_empty: std.Thread.Condition,
         not_full: std.Thread.Condition,
+        notify_condition: ?*std.Thread.Condition,
         buffer: []T,
         head: usize,
         tail: usize,
@@ -21,6 +22,7 @@ pub fn Channel(comptime T: type) type {
                 .mutex = .{},
                 .not_empty = .{},
                 .not_full = .{},
+                .notify_condition = null,
                 .buffer = buffer,
                 .head = 0,
                 .tail = 0,
@@ -48,6 +50,7 @@ pub fn Channel(comptime T: type) type {
             self.tail = (self.tail + 1) % self.capacity;
             self.count += 1;
             self.not_empty.signal();
+            if (self.notify_condition) |nc| nc.signal();
         }
 
         pub fn receive(self: *Self) ?T {
@@ -70,6 +73,7 @@ pub fn Channel(comptime T: type) type {
             self.closed = true;
             self.not_empty.broadcast();
             self.not_full.broadcast();
+            if (self.notify_condition) |nc| nc.signal();
         }
 
         pub const TrySendError = error{ ChannelClosed, ChannelFull };
@@ -83,6 +87,7 @@ pub fn Channel(comptime T: type) type {
             self.tail = (self.tail + 1) % self.capacity;
             self.count += 1;
             self.not_empty.signal();
+            if (self.notify_condition) |nc| nc.signal();
         }
 
         pub fn try_receive(self: *Self) ?T {
@@ -94,6 +99,19 @@ pub fn Channel(comptime T: type) type {
             self.count -= 1;
             self.not_full.signal();
             return item;
+        }
+
+        pub fn drain(self: *Self, out: []T) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const n = @min(self.count, out.len);
+            for (0..n) |i| {
+                out[i] = self.buffer[self.head];
+                self.head = (self.head + 1) % self.capacity;
+            }
+            self.count -= n;
+            if (n > 0) self.not_full.broadcast();
+            return n;
         }
     };
 }
@@ -174,4 +192,117 @@ test "try_receive is non-blocking" {
     try std.testing.expectEqual(@as(?u32, null), ch.try_receive());
     try std.testing.expectEqual(@as(?u32, null), ch.try_receive());
     try std.testing.expectEqual(@as(?u32, null), ch.try_receive());
+}
+
+test "drain copies all pending items in single call" {
+    var ch = try Channel(u32).init(std.testing.allocator, 8);
+    defer ch.deinit();
+
+    try ch.send(10);
+    try ch.send(20);
+    try ch.send(30);
+    try ch.send(40);
+    try ch.send(50);
+
+    var buf: [8]u32 = undefined;
+    const n = ch.drain(&buf);
+
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectEqual(@as(u32, 10), buf[0]);
+    try std.testing.expectEqual(@as(u32, 20), buf[1]);
+    try std.testing.expectEqual(@as(u32, 30), buf[2]);
+    try std.testing.expectEqual(@as(u32, 40), buf[3]);
+    try std.testing.expectEqual(@as(u32, 50), buf[4]);
+}
+
+test "drain returns zero on empty channel" {
+    var ch = try Channel(u32).init(std.testing.allocator, 4);
+    defer ch.deinit();
+
+    var buf: [4]u32 = undefined;
+    const n = ch.drain(&buf);
+
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "drain copies at most out.len items when buffer has more" {
+    var ch = try Channel(u32).init(std.testing.allocator, 8);
+    defer ch.deinit();
+
+    try ch.send(1);
+    try ch.send(2);
+    try ch.send(3);
+    try ch.send(4);
+    try ch.send(5);
+
+    var buf: [3]u32 = undefined;
+    const n = ch.drain(&buf);
+
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(u32, 1), buf[0]);
+    try std.testing.expectEqual(@as(u32, 2), buf[1]);
+    try std.testing.expectEqual(@as(u32, 3), buf[2]);
+    try std.testing.expectEqual(@as(?u32, 4), ch.try_receive());
+    try std.testing.expectEqual(@as(?u32, 5), ch.try_receive());
+}
+
+test "drain signals not_full to unblock senders" {
+    var ch = try Channel(u32).init(std.testing.allocator, 3);
+    defer ch.deinit();
+
+    try ch.send(1);
+    try ch.send(2);
+    try ch.send(3);
+
+    var sender_sent = std.atomic.Value(bool).init(false);
+    const sender = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Channel(u32), flag: *std.atomic.Value(bool)) void {
+            c.send(4) catch return;
+            flag.store(true, .release);
+        }
+    }.run, .{ &ch, &sender_sent });
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    var buf: [3]u32 = undefined;
+    _ = ch.drain(&buf);
+
+    // Safety valve: if drain didn't signal not_full the sender stays blocked forever.
+    // Close the channel after a short window to unblock it; sender gets ChannelClosed,
+    // returns without setting the flag, and the assertion below catches the failure.
+    std.Thread.sleep(30 * std.time.ns_per_ms);
+    if (!sender_sent.load(.acquire)) ch.close();
+
+    sender.join();
+    try std.testing.expect(sender_sent.load(.acquire));
+}
+
+test "send signals notify_condition when set" {
+    var ch = try Channel(u32).init(std.testing.allocator, 4);
+    defer ch.deinit();
+
+    var extra_cond: std.Thread.Condition = .{};
+    var extra_mutex: std.Thread.Mutex = .{};
+    ch.notify_condition = &extra_cond;
+
+    var signaled = std.atomic.Value(bool).init(false);
+
+    const waiter = try std.Thread.spawn(.{}, struct {
+        fn run(
+            cond: *std.Thread.Condition,
+            mtx: *std.Thread.Mutex,
+            flag: *std.atomic.Value(bool),
+        ) void {
+            mtx.lock();
+            defer mtx.unlock();
+            cond.wait(mtx);
+            flag.store(true, .release);
+        }
+    }.run, .{ &extra_cond, &extra_mutex, &signaled });
+
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    try ch.send(42);
+
+    waiter.join();
+    try std.testing.expect(signaled.load(.acquire));
 }

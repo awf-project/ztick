@@ -109,7 +109,7 @@ pub const TcpServer = struct {
         };
     }
 
-    pub fn setInstruments(self: *TcpServer, instr: telemetry.Instruments) void {
+    pub fn set_instruments(self: *TcpServer, instr: telemetry.Instruments) void {
         self.instruments = instr;
     }
 
@@ -1515,7 +1515,7 @@ test "tcp server initializes with null instruments" {
     try std.testing.expectEqual(@as(?telemetry.Instruments, null), server.instruments);
 }
 
-test "tcp server setInstruments makes instruments non-null" {
+test "tcp server set_instruments makes instruments non-null" {
     const sdk = @import("opentelemetry");
     var running = std.atomic.Value(bool).init(true);
     var active = std.atomic.Value(usize).init(0);
@@ -1531,7 +1531,7 @@ test "tcp server setInstruments makes instruments non-null" {
     defer tracer_provider.shutdown();
     const instruments = try telemetry.createInstruments(meter_provider, tracer_provider);
 
-    server.setInstruments(instruments);
+    server.set_instruments(instruments);
     try std.testing.expect(server.instruments != null);
 }
 

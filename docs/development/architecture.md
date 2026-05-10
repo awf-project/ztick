@@ -51,12 +51,14 @@ pub const Job = struct {
 
 **Exports**:
 - `Scheduler` — Main orchestrator
-- `JobStorage` — In-memory HashMap + sorted execution queue
+- `JobStorage` — In-memory HashMap + priority queue for efficient job insertion (O(log n))
 - `RuleStorage` — Rule persistence and pattern matching
 - `QueryHandler` — Instruction → response conversion
 - `ExecutionClient` — Tracks pending job executions
 
 **Key property**: Depends only on Domain. No I/O or side effects.
+
+**Performance note**: `JobStorage` uses `std.PriorityQueue` ordered by execution time for sub-linear insertion and sorted retrieval ([F021](../../.specify/implementation/F021/)). This ensures scheduling throughput scales to thousands of jobs without linear scan overhead.
 
 **Example**: Scheduler tick loop
 ```zig
@@ -79,10 +81,12 @@ pub fn tick(self: *Scheduler, now: i64) !void {
 - `Encoder`/`Logfile` — Binary persistence (read/write jobs and rules)
 - `Parser` — Line protocol parsing
 - `Telemetry` — OpenTelemetry SDK initialization and OTLP export ([ADR-0004](../ADR/0004-opentelemetry-sdk-dependency.md))
-- `Channel` — Thread-safe bounded message passing
-- `Clock` — Framerate timing
+- `Channel` — Thread-safe bounded FIFO with `drain()` for single-lock batch consumption and optional wake notification ([F021](../../.specify/implementation/F021/))
+- `Clock` — Event-driven tick scheduling with condition-variable wakeup and framerate enforcement ([F021](../../.specify/implementation/F021/))
 
 **Key property**: Depends on Domain and Application. Handles all I/O.
+
+**Performance note**: The database thread uses `Channel.drain()` to consume incoming requests in a single lock/unlock cycle, reducing contention at high concurrency. Event-driven `Clock` wakes immediately on incoming requests rather than sleeping for fixed intervals, reducing single-worker latency to sub-millisecond.
 
 **Example**: TCP adapter accepts connections and routes commands
 ```zig
@@ -239,6 +243,35 @@ test "scheduler processes job from query to executed" {
 
 5. **Add functional test** → `src/functional_tests.zig`
    - Verify end-to-end behavior
+
+## Performance Optimizations
+
+### Database Thread Throughput ([F021](../../.specify/implementation/F021/))
+
+The database thread processes incoming job requests and triggers scheduled jobs. Three optimizations ensure it remains the throughput leader at scale:
+
+**1. Priority Queue Storage (O(log n) insertion)**
+- `JobStorage.to_execute` uses `std.PriorityQueue` ordered by execution time instead of sorted array
+- Insertion: O(log n) vs O(n) linear scans + array shifts
+- Supports thousands of scheduled jobs without throughput degradation
+
+**2. Batch Request Drain (single lock/unlock)**
+- `Channel.drain()` copies all buffered requests in one critical section
+- Reduces lock contention from 500+ per second (individual try_receive) to ~1 per tick
+- Multi-worker throughput scales closer to linearly
+
+**3. Event-Driven Tick Scheduling (sub-millisecond latency)**
+- `Clock` uses condition variable `timedWait()` instead of unconditional `Thread.sleep()`
+- Wakes immediately when requests arrive; sleeps only when idle
+- Single-worker p50 latency drops from 2.24ms to <1ms
+- Framerate acts as a tick cap to prevent busy-spinning under sustained load
+
+**Benchmark targets** (8 TCP workers):
+- Throughput: >3000 msg/s (6x improvement)
+- p50 latency: <5ms (68% reduction)
+- p99 latency: <15ms (53% reduction)
+
+See [Building the Project](building.md#performance-profiling) for benchmark instructions.
 
 ## Key Principles
 
