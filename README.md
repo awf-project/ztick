@@ -7,7 +7,7 @@ Periodic schedulers (cron, systemd timers) trigger work at fixed intervals regar
 ## Features
 
 - TCP control protocol (`AUTH`, `SET`, `GET`, `QUERY`, `REMOVE`, `RULE SET`, `LISTRULES`, `STAT`) with optional TLS 1.3
-- Optional REST/JSON HTTP API with embedded OpenAPI 3.1.1 spec
+- Optional REST/JSON HTTP API with embedded OpenAPI 3.1.1 spec, concurrent request handling (thread-per-connection)
 - Rule-based dispatch: shell, direct execve, HTTP webhook, AWF workflow, AMQP publisher, Redis command
 - Token-based AUTH with namespace-scoped authorization
 - Append-only logfile persistence with binary framing and background compression; in-memory mode for ephemeral runs

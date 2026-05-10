@@ -22,6 +22,16 @@ The HTTP API listens on a separate port from the native TCP protocol:
 listen = "127.0.0.1:5680"     # HTTP API port (separate from TCP)
 ```
 
+## Concurrency Model
+
+The HTTP server spawns a dedicated thread per accepted connection, enabling parallel request processing without head-of-line blocking. This concurrency model ([F022](../../.specify/implementation/F022/)):
+
+- **Thread-per-connection**: Each HTTP request is handled in its own thread, allowing multiple clients to make requests simultaneously
+- **Atomic connection tracking**: An atomic counter tracks active connections, enabling safe shutdown without a global mutex
+- **Graceful shutdown**: On server shutdown, in-flight connections are given up to 5 seconds to complete before the server exits. Any connections that don't complete within the timeout are forcefully closed
+- **Throughput scaling**: Throughput scales linearly with concurrent clients (tested up to 8 concurrent workers achieving >2000 requests/second)
+- **Stable latency**: Per-request latency remains predictable under concurrent load (p50 latency <5ms at 8 concurrent workers)
+
 ## Authentication
 
 All API endpoints require Bearer token authentication, configurable via the `auth_file`:

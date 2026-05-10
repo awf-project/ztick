@@ -172,7 +172,9 @@ fn run_http_controller(ctx: HttpControllerContext) void {
     );
     server.start() catch |err| {
         std.log.err("http controller: start failed: {}", .{err});
+        return;
     };
+    server.join_all();
 }
 
 fn run_controller(ctx: ControllerContext) void {
