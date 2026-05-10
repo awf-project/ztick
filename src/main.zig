@@ -177,7 +177,7 @@ fn run_http_controller(ctx: HttpControllerContext) void {
 
 fn run_controller(ctx: ControllerContext) void {
     var server = TcpServer.init(ctx.allocator, ctx.address, ctx.running, ctx.tls_context, ctx.active_connections, ctx.token_store);
-    if (ctx.instruments) |instr| server.setInstruments(instr);
+    if (ctx.instruments) |instr| server.set_instruments(instr);
     defer server.deinit();
     server.start(ctx.request_ch, ctx.response_router) catch |err| {
         std.log.err("controller: start failed: {}", .{err});
@@ -204,8 +204,8 @@ fn run_database(ctx: DatabaseContext) void {
     var scheduler = Scheduler.init(ctx.allocator);
     scheduler.persistence = ctx.persistence;
     scheduler.compression_interval_ns = ctx.compression_interval_ns;
-    if (ctx.instruments) |instr| scheduler.setInstruments(instr);
-    scheduler.setStatContext(ctx.startup_ns, ctx.active_connections, ctx.auth_enabled, ctx.tls_enabled, ctx.framerate);
+    if (ctx.instruments) |instr| scheduler.set_instruments(instr);
+    scheduler.set_stat_context(ctx.startup_ns, ctx.active_connections, ctx.auth_enabled, ctx.tls_enabled, ctx.framerate);
     defer scheduler.deinit();
 
     scheduler.load(ctx.allocator) catch |err| {
@@ -218,6 +218,9 @@ fn run_database(ctx: DatabaseContext) void {
         scheduler.rule_storage.rules.count(),
     });
 
+    var wake_mutex = std.Thread.Mutex{};
+    var wake_condition = std.Thread.Condition{};
+    ctx.request_ch.notify_condition = &wake_condition;
     const clock = Clock.init(ctx.framerate, ctx.running);
     clock.start(TickContext{
         .scheduler = &scheduler,
@@ -225,7 +228,7 @@ fn run_database(ctx: DatabaseContext) void {
         .response_router = ctx.response_router,
         .exec_request_ch = ctx.exec_request_ch,
         .exec_response_ch = ctx.exec_response_ch,
-    }, TickContext.tick);
+    }, TickContext.tick, &wake_mutex, &wake_condition);
 }
 
 const TickContext = struct {
@@ -235,20 +238,24 @@ const TickContext = struct {
     exec_request_ch: *Channel(execution.Request),
     exec_response_ch: *Channel(execution.Response),
 
-    fn tick(self: TickContext) void {
+    fn tick(self: TickContext) ?i64 {
         while (self.exec_response_ch.try_receive()) |resp| {
             self.scheduler.execution_client.resolve(resp);
         }
 
-        while (self.request_ch.try_receive()) |req| {
+        var drain_buf: [1024]query.Request = undefined;
+        const n = self.request_ch.drain(&drain_buf);
+        for (drain_buf[0..n]) |req| {
             const response = self.scheduler.handle_query(req) catch query.Response{ .request = req, .success = false };
             self.response_router.route(response);
         }
 
         const now: i64 = @intCast(std.time.nanoTimestamp());
-        self.scheduler.tick(now) catch return;
+        self.scheduler.tick(now) catch return null;
 
         self.scheduler.execution_client.drain_pending(self.exec_request_ch);
+        if (self.scheduler.job_storage.to_execute.items.len > 0) return self.scheduler.job_storage.to_execute.items[0].execution;
+        return null;
     }
 };
 
@@ -664,7 +671,7 @@ test "tick with instrumented scheduler processes SET query and routes success re
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.setInstruments(try infrastructure_telemetry.createInstruments(meter_provider, tracer_provider));
+    scheduler.set_instruments(try infrastructure_telemetry.createInstruments(meter_provider, tracer_provider));
 
     const req = query.Request{
         .client = 1,
@@ -680,7 +687,7 @@ test "tick with instrumented scheduler processes SET query and routes success re
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
     };
-    ctx.tick();
+    _ = ctx.tick();
 
     const resp = resp_ch.try_receive();
     try std.testing.expect(resp != null);
@@ -892,7 +899,7 @@ test "tick with memory backend persists SET mutation to backend entries" {
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
     };
-    ctx.tick();
+    _ = ctx.tick();
 
     const resp = resp_ch.try_receive();
     try std.testing.expect(resp != null);
@@ -933,11 +940,142 @@ test "tick processes query request and routes response" {
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
     };
-    ctx.tick();
+    _ = ctx.tick();
 
     const resp = resp_ch.try_receive();
     try std.testing.expect(resp != null);
     try std.testing.expect(resp.?.success);
+}
+
+test "tick returns null when no jobs are scheduled" {
+    const allocator = std.testing.allocator;
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    const ctx = TickContext{
+        .scheduler = &scheduler,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+    };
+
+    const result = ctx.tick();
+    try std.testing.expectEqual(@as(?i64, null), result);
+}
+
+test "tick returns earliest job execution time after drain processes SET request" {
+    const allocator = std.testing.allocator;
+    const future_ns: i64 = 9_000_000_000_000_000_000;
+
+    var req_ch = try Channel(query.Request).init(allocator, 4);
+    defer req_ch.deinit();
+    var resp_ch = try Channel(query.Response).init(allocator, 4);
+    defer resp_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    router.register(1, &resp_ch);
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    const req = query.Request{
+        .client = 1,
+        .identifier = "req-1",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = future_ns } },
+    };
+    try req_ch.send(req);
+
+    const ctx = TickContext{
+        .scheduler = &scheduler,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+    };
+
+    const result = ctx.tick();
+    try std.testing.expectEqual(@as(?i64, future_ns), result);
+}
+
+test "tick drains three concurrent SET requests in a single call and routes all responses" {
+    const allocator = std.testing.allocator;
+
+    var req_ch = try Channel(query.Request).init(allocator, 8);
+    defer req_ch.deinit();
+    var resp_ch = try Channel(query.Response).init(allocator, 8);
+    defer resp_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    router.register(1, &resp_ch);
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try req_ch.send(query.Request{ .client = 1, .identifier = "r1", .instruction = .{ .set = .{ .identifier = "job.1", .execution = 1_000_000_000 } } });
+    try req_ch.send(query.Request{ .client = 1, .identifier = "r2", .instruction = .{ .set = .{ .identifier = "job.2", .execution = 2_000_000_000 } } });
+    try req_ch.send(query.Request{ .client = 1, .identifier = "r3", .instruction = .{ .set = .{ .identifier = "job.3", .execution = 3_000_000_000 } } });
+
+    const ctx = TickContext{
+        .scheduler = &scheduler,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+    };
+    _ = ctx.tick();
+
+    try std.testing.expect(resp_ch.try_receive() != null);
+    try std.testing.expect(resp_ch.try_receive() != null);
+    try std.testing.expect(resp_ch.try_receive() != null);
+}
+
+test "tick returns earliest of two jobs when both are future-scheduled" {
+    const allocator = std.testing.allocator;
+    const near_ns: i64 = 2_000_000_000_000_000_000;
+    const far_ns: i64 = 9_000_000_000_000_000_000;
+
+    var req_ch = try Channel(query.Request).init(allocator, 8);
+    defer req_ch.deinit();
+    var resp_ch = try Channel(query.Response).init(allocator, 8);
+    defer resp_ch.deinit();
+    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    defer exec_req_ch.deinit();
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    defer exec_resp_ch.deinit();
+    var router = ResponseRouter.init(allocator);
+    defer router.deinit();
+    router.register(1, &resp_ch);
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try req_ch.send(query.Request{ .client = 1, .identifier = "r1", .instruction = .{ .set = .{ .identifier = "job.far", .execution = far_ns } } });
+    try req_ch.send(query.Request{ .client = 1, .identifier = "r2", .instruction = .{ .set = .{ .identifier = "job.near", .execution = near_ns } } });
+
+    const ctx = TickContext{
+        .scheduler = &scheduler,
+        .request_ch = &req_ch,
+        .response_router = &router,
+        .exec_request_ch = &exec_req_ch,
+        .exec_response_ch = &exec_resp_ch,
+    };
+
+    const result = ctx.tick();
+    try std.testing.expectEqual(@as(?i64, near_ns), result);
 }
 
 pub fn main() !void {
@@ -998,7 +1136,7 @@ pub fn main() !void {
 
     const cwd = std.fs.cwd();
 
-    var query_request_ch = try Channel(query.Request).init(allocator, 64);
+    var query_request_ch = try Channel(query.Request).init(allocator, 1024);
     defer query_request_ch.deinit();
 
     var exec_request_ch = try Channel(execution.Request).init(allocator, 64);

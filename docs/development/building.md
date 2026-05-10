@@ -255,9 +255,45 @@ echo 'SET test.job 1711612800' | socat - TCP:localhost:5555
 
 ## Performance Profiling
 
+### Benchmark Database Throughput
+
+ztick's database thread is optimized for high throughput at scale. The following benchmarks validate performance targets ([F021](../development/architecture.md#performance-optimizations)):
+
+**Single-Worker Latency** (baseline):
+```bash
+# Build release version
+zig build -Doptimize=ReleaseSafe
+
+# Run with optimized framerate
+echo '[database]
+framerate = 1024
+[database.persistence]
+mode = "memory"' > bench.toml
+
+./zig-cache/bin/ztick --config bench.toml &
+
+# In another terminal, run benchmark
+./scripts/bench/bench-write.sh WORKERS_TCP=1 DURATION=30
+```
+
+Expected results: p50 latency <1ms
+
+**Multi-Worker Throughput** (concurrent load):
+```bash
+# Same server setup as above, then:
+./scripts/bench/bench-write.sh WORKERS_TCP=8 DURATION=30
+```
+
+Expected results: >3000 msg/s aggregate, p50 <5ms, p99 <15ms
+
+**Interpretation**:
+- **Throughput**: Messages processed per second (aggregate across all workers)
+- **p50/p99**: Median and 99th percentile request latency (single request, not aggregate)
+- **Memory mode**: Disable persistence (`mode = "memory"`) to isolate database throughput from I/O
+
 ### Benchmark Scheduler
 
-To measure how fast the scheduler evaluates jobs:
+To measure scheduler evaluation without network I/O:
 
 ```bash
 # Build release version

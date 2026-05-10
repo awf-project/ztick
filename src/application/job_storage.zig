@@ -4,62 +4,69 @@ const domain = @import("../domain.zig");
 const Job = domain.job.Job;
 const JobStatus = domain.job.JobStatus;
 
+fn job_compare(_: void, a: Job, b: Job) std.math.Order {
+    return std.math.order(a.execution, b.execution);
+}
+
 pub const JobStorage = struct {
     allocator: std.mem.Allocator,
     jobs: std.StringHashMapUnmanaged(Job),
-    to_execute: std.ArrayListUnmanaged(Job),
+    to_execute: std.PriorityQueue(Job, void, job_compare),
 
     pub fn init(allocator: std.mem.Allocator) JobStorage {
         return .{
             .allocator = allocator,
             .jobs = .{},
-            .to_execute = .{},
+            .to_execute = std.PriorityQueue(Job, void, job_compare).init(allocator, {}),
         };
     }
 
     pub fn deinit(self: *JobStorage) void {
         self.jobs.deinit(self.allocator);
-        self.to_execute.deinit(self.allocator);
+        self.to_execute.deinit();
     }
 
     pub fn get(self: *const JobStorage, identifier: []const u8) ?Job {
         return self.jobs.get(identifier);
     }
 
-    pub fn set(self: *JobStorage, job: Job) !void {
-        try self.jobs.put(self.allocator, job.identifier, job);
-
+    fn remove_from_queue(self: *JobStorage, identifier: []const u8) void {
         var i: usize = 0;
         while (i < self.to_execute.items.len) {
-            if (std.mem.eql(u8, self.to_execute.items[i].identifier, job.identifier)) {
-                _ = self.to_execute.orderedRemove(i);
+            if (std.mem.eql(u8, self.to_execute.items[i].identifier, identifier)) {
+                _ = self.to_execute.removeIndex(i);
                 break;
             }
             i += 1;
         }
+    }
+
+    pub fn set(self: *JobStorage, job: Job) !void {
+        try self.jobs.put(self.allocator, job.identifier, job);
+        self.remove_from_queue(job.identifier);
 
         if (job.status == .planned) {
-            var insert_pos: usize = self.to_execute.items.len;
-            for (self.to_execute.items, 0..) |item, idx| {
-                if (item.execution > job.execution) {
-                    insert_pos = idx;
-                    break;
-                }
-            }
-            try self.to_execute.insert(self.allocator, insert_pos, job);
+            try self.to_execute.add(job);
         }
     }
 
-    pub fn get_to_execute(self: *const JobStorage, current_time: i64) []const Job {
-        var count: usize = 0;
+    pub fn get_to_execute(self: *const JobStorage, current_time: i64, allocator: std.mem.Allocator) ![]Job {
+        var result = std.ArrayListUnmanaged(Job){};
+        errdefer result.deinit(allocator);
+
         for (self.to_execute.items) |job| {
             if (job.execution <= current_time) {
-                count += 1;
-            } else {
-                break;
+                try result.append(allocator, job);
             }
         }
-        return self.to_execute.items[0..count];
+
+        const slice = try result.toOwnedSlice(allocator);
+        std.mem.sort(Job, slice, {}, struct {
+            fn less_than(_: void, a: Job, b: Job) bool {
+                return a.execution < b.execution;
+            }
+        }.less_than);
+        return slice;
     }
 
     pub fn get_by_prefix(self: *const JobStorage, prefix: []const u8, allocator: std.mem.Allocator) ![]Job {
@@ -78,16 +85,7 @@ pub const JobStorage = struct {
 
     pub fn delete(self: *JobStorage, identifier: []const u8) bool {
         if (!self.jobs.remove(identifier)) return false;
-
-        var i: usize = 0;
-        while (i < self.to_execute.items.len) {
-            if (std.mem.eql(u8, self.to_execute.items[i].identifier, identifier)) {
-                _ = self.to_execute.orderedRemove(i);
-                break;
-            }
-            i += 1;
-        }
-
+        self.remove_from_queue(identifier);
         return true;
     }
 
@@ -152,7 +150,8 @@ test "get_to_execute returns planned jobs ordered by execution time" {
     try storage.set(Job{ .identifier = "job.2", .execution = 1595586660_000000000, .status = .executed });
     try storage.set(Job{ .identifier = "job.4", .execution = 1595586780_000000000, .status = .planned });
 
-    const result = storage.get_to_execute(now);
+    const result = try storage.get_to_execute(now, allocator);
+    defer allocator.free(result);
     try std.testing.expectEqual(@as(usize, 2), result.len);
     try std.testing.expectEqualStrings("job.1", result[0].identifier);
     try std.testing.expectEqualStrings("job.3", result[1].identifier);
@@ -251,6 +250,50 @@ test "delete returns false for nonexistent job" {
 
     const deleted = storage.delete("nonexistent");
     try std.testing.expect(!deleted);
+}
+
+test "get_to_execute returns empty slice when storage is empty" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var storage = JobStorage.init(allocator);
+    defer storage.deinit();
+
+    const result = try storage.get_to_execute(1_595_586_720_000_000_000, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "get_to_execute returns empty slice when no jobs are due" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var storage = JobStorage.init(allocator);
+    defer storage.deinit();
+
+    const future: i64 = 9_000_000_000_000_000_000;
+    try storage.set(Job{ .identifier = "job.future", .execution = future, .status = .planned });
+
+    const result = try storage.get_to_execute(1000, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "set does not add job to to_execute when status is not planned" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var storage = JobStorage.init(allocator);
+    defer storage.deinit();
+
+    try storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
+    try std.testing.expectEqual(@as(usize, 1), storage.to_execute.items.len);
+
+    try storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .triggered });
+    try std.testing.expectEqual(@as(usize, 0), storage.to_execute.items.len);
 }
 
 test "get_by_status filters by status" {

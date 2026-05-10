@@ -10,6 +10,6 @@
 # Uncomment and modify the examples below:
 inputs:
   project_number: 3
-  version: v0.1.0
+  version: v0.2.0
   # environment: staging
   # debug: false

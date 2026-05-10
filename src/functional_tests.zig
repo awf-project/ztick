@@ -9,9 +9,14 @@ const persistence_logfile = @import("infrastructure/persistence/logfile.zig");
 const persistence_backend = @import("infrastructure/persistence/backend.zig");
 const infrastructure_telemetry = @import("infrastructure/telemetry.zig");
 const infrastructure_runner = @import("infrastructure/runner.zig");
+const infrastructure_channel = @import("infrastructure/channel.zig");
+const infrastructure_clock = @import("infrastructure/clock.zig");
 const interfaces_config = @import("interfaces/config.zig");
 const main = @import("main.zig");
 const protocol_parser = @import("infrastructure/protocol/parser.zig");
+
+const Channel = infrastructure_channel.Channel;
+const Clock = infrastructure_clock.Clock;
 
 const Scheduler = application_scheduler.Scheduler;
 const Job = domain_job.Job;
@@ -2284,7 +2289,7 @@ test "scheduler SET and tick exports metrics through OTLP to mock collector" {
 
     var scheduler = Scheduler.init(std.testing.allocator);
     defer scheduler.deinit();
-    scheduler.setInstruments(instr);
+    scheduler.set_instruments(instr);
 
     try scheduler.rule_storage.set(domain_rule.Rule{
         .identifier = "rule.test",
@@ -2422,7 +2427,7 @@ test "trace spans exported to collector on job execution" {
     // Now create scheduler and trigger spans — mock server is ready
     var scheduler = Scheduler.init(std.testing.allocator);
     defer scheduler.deinit();
-    scheduler.setInstruments(instr);
+    scheduler.set_instruments(instr);
 
     try scheduler.rule_storage.set(domain_rule.Rule{
         .identifier = "rule.trace",
@@ -2512,7 +2517,7 @@ test "scheduler operates normally when telemetry collector is unreachable" {
 
     var scheduler = Scheduler.init(std.testing.allocator);
     defer scheduler.deinit();
-    scheduler.setInstruments(instr);
+    scheduler.set_instruments(instr);
 
     try scheduler.rule_storage.set(domain_rule.Rule{
         .identifier = "rule.resilience",
@@ -2544,7 +2549,7 @@ test "stat command returns all 15 metric keys in response body" {
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(1);
-    scheduler.setStatContext(std.time.nanoTimestamp() - 1_000_000_000, &connections, false, false, 100);
+    scheduler.set_stat_context(std.time.nanoTimestamp() - 1_000_000_000, &connections, false, false, 100);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -2582,7 +2587,7 @@ test "stat command reports correct job counts after storage mutations" {
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.setStatContext(0, &connections, false, false, 1);
+    scheduler.set_stat_context(0, &connections, false, false, 1);
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -2642,7 +2647,7 @@ test "stat command does not append entries to logfile" {
     const stat_before = try tmp.dir.statFile("stat_nopersist.db");
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.setStatContext(0, &connections, false, false, 1);
+    scheduler.set_stat_context(0, &connections, false, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 2,
@@ -2665,7 +2670,7 @@ test "stat command reports auth_enabled 1 when authentication is configured" {
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.setStatContext(0, &connections, true, false, 1);
+    scheduler.set_stat_context(0, &connections, true, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -2688,7 +2693,7 @@ test "stat command succeeds and reports auth_enabled 0 when auth is not configur
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.setStatContext(0, &connections, false, false, 1);
+    scheduler.set_stat_context(0, &connections, false, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -4572,4 +4577,149 @@ test "logfile containing shell amqp direct awf http rules replays under F020 (di
         },
         else => return error.TestUnexpectedRunnerVariant,
     }
+}
+
+// Feature: F021
+
+test "jobs SET in reverse order trigger in execution-time order via priority queue" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try scheduler.rule_storage.set(Rule{
+        .identifier = "rule.catch-all",
+        .pattern = "pq.",
+        .runner = .{ .shell = .{ .command = "/bin/true" } },
+    });
+
+    _ = try scheduler.handle_query(Request{ .client = 1, .identifier = "r3", .instruction = .{ .set = .{ .identifier = "pq.last", .execution = 3000 } } });
+    _ = try scheduler.handle_query(Request{ .client = 1, .identifier = "r2", .instruction = .{ .set = .{ .identifier = "pq.middle", .execution = 2000 } } });
+    _ = try scheduler.handle_query(Request{ .client = 1, .identifier = "r1", .instruction = .{ .set = .{ .identifier = "pq.first", .execution = 1000 } } });
+
+    try scheduler.tick(1000);
+
+    const first = scheduler.job_storage.get("pq.first");
+    const middle = scheduler.job_storage.get("pq.middle");
+    const last = scheduler.job_storage.get("pq.last");
+    try std.testing.expect(first != null);
+    try std.testing.expect(middle != null);
+    try std.testing.expect(last != null);
+    try std.testing.expectEqual(JobStatus.triggered, first.?.status);
+    try std.testing.expectEqual(JobStatus.planned, middle.?.status);
+    try std.testing.expectEqual(JobStatus.planned, last.?.status);
+
+    try scheduler.tick(2000);
+    const middle_after = scheduler.job_storage.get("pq.middle");
+    try std.testing.expectEqual(JobStatus.triggered, middle_after.?.status);
+
+    try scheduler.tick(3000);
+    const last_after = scheduler.job_storage.get("pq.last");
+    try std.testing.expectEqual(JobStatus.triggered, last_after.?.status);
+}
+
+test "PQ maintains min-heap after interleaved SET and DELETE operations" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    try scheduler.rule_storage.set(Rule{
+        .identifier = "rule.pq",
+        .pattern = "heap.",
+        .runner = .{ .shell = .{ .command = "/bin/true" } },
+    });
+
+    _ = try scheduler.handle_query(Request{ .client = 1, .identifier = "r1", .instruction = .{ .set = .{ .identifier = "heap.early", .execution = 1000 } } });
+    _ = try scheduler.handle_query(Request{ .client = 1, .identifier = "r2", .instruction = .{ .set = .{ .identifier = "heap.mid", .execution = 2000 } } });
+    _ = try scheduler.handle_query(Request{ .client = 1, .identifier = "r3", .instruction = .{ .set = .{ .identifier = "heap.late", .execution = 3000 } } });
+
+    _ = try scheduler.handle_query(Request{ .client = 1, .identifier = "r4", .instruction = .{ .remove = .{ .identifier = "heap.early" } } });
+
+    try std.testing.expectEqual(@as(usize, 2), scheduler.job_storage.to_execute.items.len);
+
+    try scheduler.tick(2000);
+
+    const mid = scheduler.job_storage.get("heap.mid");
+    const late = scheduler.job_storage.get("heap.late");
+    try std.testing.expect(mid != null);
+    try std.testing.expect(late != null);
+    try std.testing.expectEqual(JobStatus.triggered, mid.?.status);
+    try std.testing.expectEqual(JobStatus.planned, late.?.status);
+}
+
+test "clock wakes immediately when channel signals notify_condition" {
+    const allocator = std.testing.allocator;
+    const query = domain_query;
+
+    var req_ch = try Channel(query.Request).init(allocator, 1024);
+    defer req_ch.deinit();
+
+    var wake_mutex = std.Thread.Mutex{};
+    var wake_condition = std.Thread.Condition{};
+    req_ch.notify_condition = &wake_condition;
+
+    var running = std.atomic.Value(bool).init(true);
+    var tick_count = std.atomic.Value(u32).init(0);
+
+    const clock = Clock.init(1, &running);
+
+    const clock_thread = try std.Thread.spawn(.{}, struct {
+        fn run(
+            clk: Clock,
+            count: *std.atomic.Value(u32),
+            wm: *std.Thread.Mutex,
+            wc: *std.Thread.Condition,
+        ) void {
+            clk.start(count, struct {
+                fn tick(c: *std.atomic.Value(u32)) ?i64 {
+                    _ = c.fetchAdd(1, .monotonic);
+                    return null;
+                }
+            }.tick, wm, wc);
+        }
+    }.run, .{ clock, &tick_count, &wake_mutex, &wake_condition });
+
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    const count_before = tick_count.load(.monotonic);
+
+    try req_ch.send(query.Request{
+        .client = 1,
+        .identifier = "wake-test",
+        .instruction = .{ .set = .{ .identifier = "wake.job", .execution = 999 } },
+    });
+
+    std.Thread.sleep(20 * std.time.ns_per_ms);
+    const count_after = tick_count.load(.monotonic);
+
+    running.store(false, .release);
+    wake_condition.signal();
+    clock_thread.join();
+
+    try std.testing.expect(count_after > count_before);
+}
+
+test "last SET for same identifier wins and PQ contains single entry" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+
+    _ = try scheduler.handle_query(Request{ .client = 1, .identifier = "r1", .instruction = .{ .set = .{ .identifier = "dup.job", .execution = 1000 } } });
+    _ = try scheduler.handle_query(Request{ .client = 1, .identifier = "r2", .instruction = .{ .set = .{ .identifier = "dup.job", .execution = 5000 } } });
+    _ = try scheduler.handle_query(Request{ .client = 1, .identifier = "r3", .instruction = .{ .set = .{ .identifier = "dup.job", .execution = 3000 } } });
+
+    try std.testing.expectEqual(@as(usize, 1), scheduler.job_storage.jobs.count());
+    try std.testing.expectEqual(@as(usize, 1), scheduler.job_storage.to_execute.items.len);
+
+    const job = scheduler.job_storage.get("dup.job");
+    try std.testing.expect(job != null);
+    try std.testing.expectEqual(@as(i64, 3000), job.?.execution);
+    try std.testing.expectEqual(JobStatus.planned, job.?.status);
 }

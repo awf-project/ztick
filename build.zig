@@ -74,6 +74,9 @@ pub fn build(b: *std.Build) void {
         .name = "ztick",
         .root_module = root_module,
     });
+    // Workaround: glibc 2.43+r22 ships .sframe with R_X86_64_PC64 relocations
+    // that Zig's self-hosted linker cannot handle (ziglang/zig#31272)
+    exe.use_llvm = true;
     if (tls_enabled) link_openssl(exe);
     b.installArtifact(exe);
 
@@ -103,6 +106,7 @@ pub fn build(b: *std.Build) void {
         });
         deps.install(layer_module);
         const layer_test = b.addTest(.{ .root_module = layer_module });
+        layer_test.use_llvm = true;
         if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(layer_test);
         const run_layer_test = b.addRunArtifact(layer_test);
         test_step.dependOn(&run_layer_test.step);
@@ -117,6 +121,7 @@ pub fn build(b: *std.Build) void {
     });
     deps.install(main_test_module);
     const main_tests = b.addTest(.{ .root_module = main_test_module });
+    main_tests.use_llvm = true;
     if (tls_enabled) link_openssl(main_tests);
     const run_main_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_main_tests.step);
@@ -131,6 +136,7 @@ pub fn build(b: *std.Build) void {
     const functional_test = b.addTest(.{
         .root_module = functional_module,
     });
+    functional_test.use_llvm = true;
     if (tls_enabled) link_openssl(functional_test);
     const run_functional = b.addRunArtifact(functional_test);
     run_functional.step.dependOn(b.getInstallStep());
@@ -164,6 +170,7 @@ pub fn build(b: *std.Build) void {
         deps.install(san_module);
         san_module.addEmbedPath(b.path("."));
         const san_test = b.addTest(.{ .root_module = san_module });
+        san_test.use_llvm = true;
         if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(san_test);
         const run_san_test = b.addRunArtifact(san_test);
         sanitize_step.dependOn(&run_san_test.step);
@@ -178,6 +185,7 @@ pub fn build(b: *std.Build) void {
     });
     deps.install(san_main_module);
     const san_main_tests = b.addTest(.{ .root_module = san_main_module });
+    san_main_tests.use_llvm = true;
     if (tls_enabled) link_openssl(san_main_tests);
     sanitize_step.dependOn(&b.addRunArtifact(san_main_tests).step);
     // functional sanitizer tests
@@ -190,6 +198,7 @@ pub fn build(b: *std.Build) void {
     });
     deps.install(san_func_module);
     const san_func_test = b.addTest(.{ .root_module = san_func_module });
+    san_func_test.use_llvm = true;
     if (tls_enabled) link_openssl(san_func_test);
     const run_san_func = b.addRunArtifact(san_func_test);
     run_san_func.step.dependOn(b.getInstallStep());
