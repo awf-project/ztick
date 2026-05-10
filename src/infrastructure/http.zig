@@ -23,6 +23,7 @@ pub const HttpServer = struct {
     response_router: *ResponseRouter,
     next_client_id: std.atomic.Value(u128),
     bearer_token: ?[]const u8,
+    active_connections: std.atomic.Value(usize),
 
     // Comptime substitution: replace the `__VERSION__` placeholder embedded
     // inside `openapi.json` with the canonical version from `build.zig.zon`,
@@ -59,11 +60,12 @@ pub const HttpServer = struct {
             .response_router = response_router,
             .next_client_id = std.atomic.Value(u128).init(1_000_000),
             .bearer_token = bearer_token,
+            .active_connections = std.atomic.Value(usize).init(0),
         };
     }
 
     pub fn start(self: *HttpServer) !void {
-        const listen_addr = parseAddress(self.address) orelse return;
+        const listen_addr = parse_address(self.address) orelse return;
         var server = listen_addr.listen(.{ .reuse_address = true }) catch return;
         defer server.deinit();
 
@@ -72,7 +74,22 @@ pub const HttpServer = struct {
                 error.SocketNotListening => return,
                 else => continue,
             };
-            self.handle_connection(conn.stream);
+            _ = self.active_connections.fetchAdd(1, .release);
+            const thread = std.Thread.spawn(.{}, http_connection_worker, .{ &self.active_connections, self, conn.stream }) catch {
+                _ = self.active_connections.fetchSub(1, .release);
+                conn.stream.close();
+                continue;
+            };
+            thread.detach();
+        }
+    }
+
+    pub fn join_all(self: *HttpServer) void {
+        var iterations: usize = 0;
+        while (self.active_connections.load(.acquire) > 0) {
+            if (iterations >= 5000) break;
+            std.Thread.sleep(1_000_000);
+            iterations += 1;
         }
     }
 
@@ -90,13 +107,11 @@ pub const HttpServer = struct {
             return;
         };
 
-        // Extract path and query from target
         const target = request.head.target;
         const q_idx = std.mem.indexOfScalar(u8, target, '?');
         const path = if (q_idx) |i| target[0..i] else target;
         const query_str: ?[]const u8 = if (q_idx) |i| target[i + 1 ..] else null;
 
-        // Extract Authorization header
         var authorization: ?[]const u8 = null;
         var header_it = request.iterateHeaders();
         while (header_it.next()) |header| {
@@ -105,9 +120,8 @@ pub const HttpServer = struct {
             }
         }
 
-        // Auth check for protected endpoints
         if (self.bearer_token) |expected_token| {
-            if (!isPublicPath(path)) {
+            if (!is_public_path(path)) {
                 const authorized = if (authorization) |auth|
                     std.mem.startsWith(u8, auth, "Bearer ") and
                         std.mem.eql(u8, auth["Bearer ".len..], expected_token)
@@ -120,7 +134,6 @@ pub const HttpServer = struct {
             }
         }
 
-        // Read body for PUT requests
         var body_buf: [1024 * 1024]u8 = undefined;
         var body: []const u8 = "";
 
@@ -176,12 +189,12 @@ pub const HttpServer = struct {
     fn route_jobs(self: *HttpServer, request: *http.Server.Request, path: []const u8, query_str: ?[]const u8, body: []const u8) void {
         if (std.mem.eql(u8, path, "/jobs")) {
             if (request.head.method != .GET) return self.respond_json(request, .method_not_allowed, "method not allowed");
-            const prefix = if (query_str) |q| extractQueryParam(q, "prefix") orelse "" else "";
+            const prefix = if (query_str) |q| extract_query_param(q, "prefix") orelse "" else "";
             self.handle_list_jobs(request, prefix);
             return;
         }
 
-        const id = extractResourceId(path, "/jobs/") orelse {
+        const id = extract_resource_id(path, "/jobs/") orelse {
             self.respond_json(request, .bad_request, "missing resource id");
             return;
         };
@@ -197,12 +210,12 @@ pub const HttpServer = struct {
     fn route_rules(self: *HttpServer, request: *http.Server.Request, path: []const u8, query_str: ?[]const u8, body: []const u8) void {
         if (std.mem.eql(u8, path, "/rules")) {
             if (request.head.method != .GET) return self.respond_json(request, .method_not_allowed, "method not allowed");
-            const prefix = if (query_str) |q| extractQueryParam(q, "prefix") orelse "" else "";
+            const prefix = if (query_str) |q| extract_query_param(q, "prefix") orelse "" else "";
             self.handle_list_rules(request, prefix);
             return;
         }
 
-        const id = extractResourceId(path, "/rules/") orelse {
+        const id = extract_resource_id(path, "/rules/") orelse {
             self.respond_json(request, .bad_request, "missing resource id");
             return;
         };
@@ -210,7 +223,7 @@ pub const HttpServer = struct {
         switch (request.head.method) {
             .PUT => self.handle_put_rule(request, id, body),
             .DELETE => self.handle_delete_rule(request, id),
-            else => self.respond_json(request, .not_found, "not found"),
+            else => self.respond_json(request, .method_not_allowed, "method not allowed"),
         }
     }
 
@@ -365,23 +378,15 @@ pub const HttpServer = struct {
         };
         _ = response;
 
-        // Free args not consumed by the runner (method/url for http, workflow/inputs for awf)
         if (is_awf) {
-            const awf = runner_type.awf;
-            for (input.args) |arg| {
-                var consumed = arg.ptr == awf.workflow.ptr;
-                if (!consumed) {
-                    for (awf.inputs) |inp| {
-                        if (arg.ptr == inp.ptr) {
-                            consumed = true;
-                            break;
-                        }
-                    }
-                }
-                if (!consumed) self.allocator.free(arg);
+            // args layout: [workflow, "--input", val, "--input", val, ...]
+            // args[0] (workflow) and even indices > 0 (values) consumed by runner
+            // odd indices ("--input" flags) must be freed
+            var i: usize = 1;
+            while (i < input.args.len) : (i += 2) {
+                self.allocator.free(input.args[i]);
             }
         } else if (is_http) {
-            // args[0] = method (consumed), args[1] = url (consumed), rest freed
             for (input.args, 0..) |arg, i| {
                 if (i >= 2) self.allocator.free(arg);
             }
@@ -470,14 +475,19 @@ pub const HttpServer = struct {
     }
 };
 
-fn extractResourceId(path: []const u8, prefix: []const u8) ?[]const u8 {
+fn http_connection_worker(active_connections: *std.atomic.Value(usize), self: *HttpServer, stream: std.net.Stream) void {
+    defer _ = active_connections.fetchSub(1, .release);
+    self.handle_connection(stream);
+}
+
+fn extract_resource_id(path: []const u8, prefix: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, path, prefix)) return null;
     const id = path[prefix.len..];
     if (id.len == 0) return null;
     return id;
 }
 
-fn extractQueryParam(query_str: []const u8, key: []const u8) ?[]const u8 {
+fn extract_query_param(query_str: []const u8, key: []const u8) ?[]const u8 {
     var pairs = std.mem.splitScalar(u8, query_str, '&');
     while (pairs.next()) |pair| {
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
@@ -488,11 +498,11 @@ fn extractQueryParam(query_str: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-fn isPublicPath(path: []const u8) bool {
+fn is_public_path(path: []const u8) bool {
     return std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/openapi.json");
 }
 
-fn parseAddress(address: []const u8) ?std.net.Address {
+fn parse_address(address: []const u8) ?std.net.Address {
     const colon = std.mem.lastIndexOfScalar(u8, address, ':') orelse return null;
     const host = address[0..colon];
     const port = std.fmt.parseUnsigned(u16, address[colon + 1 ..], 10) catch return null;
@@ -540,8 +550,6 @@ fn build_http_runner(args: []const []const u8) ?runner_mod.Runner {
     return .{ .http = .{ .method = method, .url = url } };
 }
 
-// Tests
-
 test "json namespace exposes serialize_health returning correct response" {
     const allocator = std.testing.allocator;
     const result = try json.serialize_health(allocator);
@@ -556,46 +564,46 @@ test "json namespace exposes serialize_error returning correct response" {
     try std.testing.expectEqualStrings("{\"error\":\"not found\"}", result);
 }
 
-test "extractResourceId returns id after prefix" {
-    try std.testing.expectEqualStrings("deploy.v1", extractResourceId("/jobs/deploy.v1", "/jobs/").?);
+test "extract_resource_id returns id after prefix" {
+    try std.testing.expectEqualStrings("deploy.v1", extract_resource_id("/jobs/deploy.v1", "/jobs/").?);
 }
 
-test "extractResourceId returns null for path without id" {
-    try std.testing.expectEqual(@as(?[]const u8, null), extractResourceId("/jobs/", "/jobs/"));
+test "extract_resource_id returns null for path without id" {
+    try std.testing.expectEqual(@as(?[]const u8, null), extract_resource_id("/jobs/", "/jobs/"));
 }
 
-test "extractResourceId returns null for non-matching prefix" {
-    try std.testing.expectEqual(@as(?[]const u8, null), extractResourceId("/rules/foo", "/jobs/"));
+test "extract_resource_id returns null for non-matching prefix" {
+    try std.testing.expectEqual(@as(?[]const u8, null), extract_resource_id("/rules/foo", "/jobs/"));
 }
 
-test "extractQueryParam returns value for matching key" {
-    try std.testing.expectEqualStrings("deploy.", extractQueryParam("prefix=deploy.", "prefix").?);
+test "extract_query_param returns value for matching key" {
+    try std.testing.expectEqualStrings("deploy.", extract_query_param("prefix=deploy.", "prefix").?);
 }
 
-test "extractQueryParam returns null for missing key" {
-    try std.testing.expectEqual(@as(?[]const u8, null), extractQueryParam("other=value", "prefix"));
+test "extract_query_param returns null for missing key" {
+    try std.testing.expectEqual(@as(?[]const u8, null), extract_query_param("other=value", "prefix"));
 }
 
-test "isPublicPath returns true for health" {
-    try std.testing.expect(isPublicPath("/health"));
+test "is_public_path returns true for health" {
+    try std.testing.expect(is_public_path("/health"));
 }
 
-test "isPublicPath returns true for openapi" {
-    try std.testing.expect(isPublicPath("/openapi.json"));
+test "is_public_path returns true for openapi" {
+    try std.testing.expect(is_public_path("/openapi.json"));
 }
 
-test "isPublicPath returns false for jobs" {
-    try std.testing.expect(!isPublicPath("/jobs"));
+test "is_public_path returns false for jobs" {
+    try std.testing.expect(!is_public_path("/jobs"));
 }
 
-test "parseAddress parses ip and port" {
-    const addr = parseAddress("127.0.0.1:5680");
+test "parse_address parses ip and port" {
+    const addr = parse_address("127.0.0.1:5680");
     try std.testing.expect(addr != null);
     try std.testing.expectEqual(@as(u16, 5680), addr.?.getPort());
 }
 
-test "parseAddress returns null for invalid input" {
-    try std.testing.expect(parseAddress("invalid") == null);
+test "parse_address returns null for invalid input" {
+    try std.testing.expect(parse_address("invalid") == null);
 }
 
 test "build_awf_runner returns runner with workflow and no inputs from single arg" {
@@ -656,4 +664,100 @@ test "build_http_runner returns null for invalid url scheme" {
     const args = [_][]const u8{ "POST", "ftp://hooks.example.com/webhook" };
     const runner = build_http_runner(&args);
     try std.testing.expectEqual(@as(?runner_mod.Runner, null), runner);
+}
+
+test "join_all returns immediately when no active connections" {
+    const allocator = std.testing.allocator;
+    var running = std.atomic.Value(bool).init(false);
+    var request_ch = try Channel(query.Request).init(allocator, 1);
+    defer request_ch.deinit();
+    var response_router = ResponseRouter.init(allocator);
+    defer response_router.deinit();
+
+    var server = HttpServer.init(allocator, "127.0.0.1:0", &running, &request_ch, &response_router, null);
+    server.join_all();
+    try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
+}
+
+const SocketPair = struct {
+    read_fd: std.posix.socket_t,
+    write_stream: std.net.Stream,
+};
+
+fn make_socket_pair() !SocketPair {
+    var fds: [2]i32 = undefined;
+    const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds);
+    try std.testing.expectEqual(@as(usize, 0), rc);
+    const read_fd: std.posix.socket_t = @intCast(fds[0]);
+    const write_fd: std.posix.socket_t = @intCast(fds[1]);
+    return .{
+        .read_fd = read_fd,
+        .write_stream = std.net.Stream{ .handle = write_fd },
+    };
+}
+
+fn decrement_after_delay(counter: *std.atomic.Value(usize)) void {
+    std.Thread.sleep(10_000_000);
+    _ = counter.fetchSub(1, .release);
+}
+
+test "join_all waits for active connections to drain" {
+    const allocator = std.testing.allocator;
+    var running = std.atomic.Value(bool).init(false);
+    var request_ch = try Channel(query.Request).init(allocator, 1);
+    defer request_ch.deinit();
+    var response_router = ResponseRouter.init(allocator);
+    defer response_router.deinit();
+
+    var server = HttpServer.init(allocator, "127.0.0.1:0", &running, &request_ch, &response_router, null);
+    _ = server.active_connections.fetchAdd(1, .release);
+
+    const t = try std.Thread.spawn(.{}, decrement_after_delay, .{&server.active_connections});
+    defer t.join();
+
+    server.join_all();
+    try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
+}
+
+test "http_connection_worker decrements active_connections on exit" {
+    const allocator = std.testing.allocator;
+    var running = std.atomic.Value(bool).init(false);
+    var request_ch = try Channel(query.Request).init(allocator, 1);
+    defer request_ch.deinit();
+    var response_router = ResponseRouter.init(allocator);
+    defer response_router.deinit();
+
+    var server = HttpServer.init(allocator, "127.0.0.1:0", &running, &request_ch, &response_router, null);
+    _ = server.active_connections.store(1, .release);
+
+    const pair = try make_socket_pair();
+    pair.write_stream.close();
+
+    const read_stream = std.net.Stream{ .handle = pair.read_fd };
+    http_connection_worker(&server.active_connections, &server, read_stream);
+
+    try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
+}
+
+test "http server tracks active connections across worker lifecycle" {
+    const allocator = std.testing.allocator;
+    var running = std.atomic.Value(bool).init(false);
+    var request_ch = try Channel(query.Request).init(allocator, 1);
+    defer request_ch.deinit();
+    var response_router = ResponseRouter.init(allocator);
+    defer response_router.deinit();
+
+    var server = HttpServer.init(allocator, "127.0.0.1:0", &running, &request_ch, &response_router, null);
+    try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
+
+    _ = server.active_connections.fetchAdd(1, .release);
+    try std.testing.expectEqual(@as(usize, 1), server.active_connections.load(.acquire));
+
+    const pair = try make_socket_pair();
+    pair.write_stream.close();
+
+    const read_stream = std.net.Stream{ .handle = pair.read_fd };
+    http_connection_worker(&server.active_connections, &server, read_stream);
+
+    try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
 }

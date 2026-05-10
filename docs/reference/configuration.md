@@ -61,6 +61,45 @@ TCP server configuration.
 - Requires `libssl-dev` (Debian/Ubuntu) or equivalent on the build machine
 - See [README TLS section](../../README.md#tls) for certificate generation instructions
 
+### `[http]`
+
+HTTP REST API server configuration. This section is optional; omit it to disable the HTTP API.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `listen` | string | `null` | HTTP address and port. When set, enables the HTTP server on the specified address. When omitted or `null`, the HTTP API is disabled. |
+
+**Address Format**: Same as `[controller]` — `<host>:<port>` where host is IPv4 or IPv6
+- `127.0.0.1:5680` — Localhost only
+- `0.0.0.0:5680` — All interfaces (IPv4)
+- `[::1]:5680` — Localhost only (IPv6)
+
+**HTTP Server Notes:**
+- The HTTP API is optional and disabled by default. To enable it, add an `[http]` section with a `listen` address.
+- The HTTP server handles multiple concurrent requests by spawning a dedicated thread per connection (thread-per-connection model, [F022](../../.specify/implementation/F022/))
+- All HTTP endpoints require Bearer token authentication (same tokens as TCP protocol via `auth_file`)
+- Public endpoints `/health` and `/openapi.json` do not require authentication
+- The HTTP server shares the same scheduler and storage as the TCP server—both protocols interact with the same data
+- Connection handling includes a 5-second graceful shutdown timeout; in-flight requests have up to 5 seconds to complete before server exit
+- By convention, use port `5680` for HTTP and port `5681` for HTTPS (if TLS support is added in the future)
+
+**Concurrency**: The HTTP server is designed for concurrent request handling. Multiple clients can send requests simultaneously without blocking each other. This enables higher throughput under concurrent load compared to a sequential accept loop.
+
+**Configuration Examples:**
+
+```toml
+# Disable HTTP API (default)
+# [http] section omitted
+
+# Enable HTTP API on localhost only
+[http]
+listen = "127.0.0.1:5680"
+
+# Enable HTTP API on all interfaces
+[http]
+listen = "0.0.0.0:5680"
+```
+
 ### `[shell]`
 
 Shell execution configuration. Controls which shell binary and arguments are used when executing shell runner jobs.

@@ -7,13 +7,9 @@
 - All tagged union variants must declare payloads with `struct {}` syntax, even when empty, for consistent pattern matching and destructuring across the codebase
 - Logfile dump must never load entire file into memory; implement sequential frame reads to comply with NFR-001 scaling constraint
 - Use Process.execute() for all background operations; never manually construct Process structs in application layer to maintain API consistency
-
 - Send ERROR response for all protocol validation failures before disconnecting; never silently close connections on parse errors like RULE SET with missing executable
-
 - Authenticated HTTP endpoints must explicitly include 401 Unauthorized response schemas in OpenAPI specs; inherited security definitions don't auto-document client error handling paths
-
 - Maintain CRUD endpoint parity in OpenAPI specs; if GET /jobs/{id} exists, corresponding GET /rules/{id} must exist or be explicitly documented as omitted in spec comments
-
 - Implement configuration parsing for new subsystems before wiring them as application threads; verify [http], [controller], [database] sections exist in config.zig before feature completion
 - Expose file descriptors from TLS stream wrappers via accessor methods when low-level socket operations are required
 - Implement connection-level authentication as TCP middleware; never add AUTH as Instruction variant to maintain connection-scoped isolation
@@ -100,6 +96,7 @@
 - Verbose test names describe behavior (e.g., `test "tick processes query request and routes response"`)
 - Always use std.testing.tmpDir for test files; never hardcode /tmp paths which create race conditions across parallel test execution
 - Always verify unit tests execute through `zig build test-<layer>` targets, not just direct `zig test`; barrel export chains may prevent test discovery by the build system
+- Error-handling functions and memory-cleanup helpers require isolated unit tests; integration test coverage alone is insufficient for internal functions with side effects
 
 ## Review Standards
 
@@ -111,3 +108,4 @@
 - Use std.http.Server for HTTP request/response handling; never parse HTTP manually. Use request.respond() for responses, iterateHeaders() for custom headers
 - Dupe all instruction string identifiers before sending to scheduler via Channel; scheduler stores pointers without copying (same ownership pattern as TCP server's build_instruction)
 - Always verify scope alignment before merge; reject PRs that include logic from non-target features (e.g., F011 auth session management should not appear in F018 branch)
+- Documentation file changes (docs/reference/*, docs/development/*, README) must be explicitly planned in task scope; reject PRs that add unplanned documentation changes

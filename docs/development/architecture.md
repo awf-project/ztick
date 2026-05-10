@@ -76,7 +76,8 @@ pub fn tick(self: *Scheduler, now: i64) !void {
 **Purpose**: Adapters that connect the application to external systems.
 
 **Exports**:
-- `TcpServer` — Listens for TCP protocol connections
+- `TcpServer` — Listens for TCP protocol connections (thread per connection)
+- `HttpServer` — RESTful JSON API server (thread per connection, mirrors TCP pattern)
 - `ShellRunner` — Executes shell commands via `std.process`
 - `Encoder`/`Logfile` — Binary persistence (read/write jobs and rules)
 - `Parser` — Line protocol parsing
@@ -86,7 +87,7 @@ pub fn tick(self: *Scheduler, now: i64) !void {
 
 **Key property**: Depends on Domain and Application. Handles all I/O.
 
-**Performance note**: The database thread uses `Channel.drain()` to consume incoming requests in a single lock/unlock cycle, reducing contention at high concurrency. Event-driven `Clock` wakes immediately on incoming requests rather than sleeping for fixed intervals, reducing single-worker latency to sub-millisecond.
+**Performance note**: The database thread uses `Channel.drain()` to consume incoming requests in a single lock/unlock cycle, reducing contention at high concurrency. Event-driven `Clock` wakes immediately on incoming requests rather than sleeping for fixed intervals, reducing single-worker latency to sub-millisecond. Both TCP and HTTP servers spawn a detached thread per connection with atomic counter tracking, enabling concurrent request handling without blocking.
 
 **Example**: TCP adapter accepts connections and routes commands
 ```zig
@@ -104,6 +105,20 @@ pub const TcpServer = struct {
     }
 };
 ```
+
+**Concurrency Pattern** ([F022](../../.specify/implementation/F022/)): Both TcpServer and HttpServer use an identical detached-thread pattern for handling concurrent connections:
+
+1. **Accept loop** increments an atomic counter and spawns a detached thread per accepted connection
+2. **Worker thread** processes the request and decrements the counter on exit (via `defer`)
+3. **Graceful shutdown** via `join_all()` polls the counter until it reaches zero or 5-second timeout elapses
+
+This lock-free pattern enables linear throughput scaling: each client gets its own thread without mutex contention, and the atomic counter enables safe shutdown coordination across threads.
+
+Key benefits:
+- **No head-of-line blocking** — slow clients don't block fast clients
+- **Simple reasoning** — one thread per connection makes debugging straightforward
+- **Proven pattern** — TCP server established this pattern; HTTP replicates it exactly
+- **Graceful shutdown** — `join_all()` ensures all in-flight requests drain before exit
 
 ### Layer 4: Interfaces (`src/interfaces/`)
 
@@ -272,6 +287,19 @@ The database thread processes incoming job requests and triggers scheduled jobs.
 - p99 latency: <15ms (53% reduction)
 
 See [Building the Project](building.md#performance-profiling) for benchmark instructions.
+
+### HTTP Server Concurrency ([F022](../../.specify/implementation/F022/))
+
+The HTTP server spawns a dedicated thread per accepted connection, mirroring the TCP server's detached-thread pattern:
+
+- **Thread per connection** — Each HTTP request is handled in its own thread, eliminating head-of-line blocking in the accept loop
+- **Atomic counter tracking** — An `active_connections` atomic counter tracks live worker threads for graceful shutdown
+- **Graceful shutdown** — `join_all()` polls the counter with a 5-second timeout, ensuring in-flight requests complete before process exit
+- **Shared state safety** — `ResponseRouter` and `Channel` are mutex-guarded; `next_client_id` uses atomic `fetchAdd`
+
+**Benchmark targets** (8 HTTP workers):
+- Throughput: >2000 msg/s (4x improvement over sequential baseline)
+- p50 latency: <5ms (vs ~56ms under 16 concurrent workers previously)
 
 ## Key Principles
 

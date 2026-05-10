@@ -108,21 +108,21 @@ pub fn parse_iso8601_to_ns(timestamp: []const u8) JsonError!i64 {
     if (timestamp[16] != ':') return JsonError.InvalidTimestamp;
     const second = std.fmt.parseInt(u8, timestamp[17..19], 10) catch return JsonError.InvalidTimestamp;
 
-    const epoch_seconds = toEpochSeconds(year, month, day, hour, minute, second) catch return JsonError.InvalidTimestamp;
+    const epoch_seconds = to_epoch_seconds(year, month, day, hour, minute, second) catch return JsonError.InvalidTimestamp;
     return epoch_seconds * std.time.ns_per_s;
 }
 
-fn toEpochSeconds(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) error{InvalidDate}!i64 {
+fn to_epoch_seconds(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) error{InvalidDate}!i64 {
     if (month < 1 or month > 12) return error.InvalidDate;
     if (day < 1 or day > 31) return error.InvalidDate;
 
     const days_per_month = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-    const leap = isLeapYear(year);
+    const leap = is_leap_year(year);
 
     var days: i64 = 0;
     var y: u16 = 1970;
     while (y < year) : (y += 1) {
-        days += if (isLeapYear(y)) 366 else 365;
+        days += if (is_leap_year(y)) 366 else 365;
     }
     for (0..month - 1) |m| {
         const month_days: u8 = if (m == 1 and leap) 29 else days_per_month[m];
@@ -133,11 +133,9 @@ fn toEpochSeconds(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u
     return days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
 }
 
-fn isLeapYear(year: u16) bool {
+fn is_leap_year(year: u16) bool {
     return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
 }
-
-// --- Tests ---
 
 test "parse_job_body parses ISO 8601 execution timestamp" {
     const body = "{\"execution\":\"2026-04-10T12:00:00Z\"}";

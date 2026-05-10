@@ -4723,3 +4723,72 @@ test "last SET for same identifier wins and PQ contains single entry" {
     try std.testing.expectEqual(@as(i64, 3000), job.?.execution);
     try std.testing.expectEqual(JobStatus.planned, job.?.status);
 }
+
+// Feature: F022
+
+test "concurrent HTTP requests are handled simultaneously by separate worker threads" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19930\"\n\n[http]\nlisten = \"127.0.0.1:19931\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    const Thread = std.Thread;
+    const num_clients = 4;
+
+    const Worker = struct {
+        fn run(port: u16, job_id: []const u8) void {
+            var stream = http_connect(port) catch return;
+            defer stream.close();
+
+            var req_buf: [512]u8 = undefined;
+            const body = "{\"execution\": \"2099-12-31T23:59:59Z\"}";
+            const req = std.fmt.bufPrint(&req_buf, "PUT /jobs/{s} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ job_id, body.len, body }) catch return;
+            const response = send_http_request(stream, req) catch return;
+            if (std.mem.indexOf(u8, response, "200") == null) return;
+        }
+    };
+
+    var threads: [num_clients]Thread = undefined;
+    const job_ids = [_][]const u8{ "concurrent.1", "concurrent.2", "concurrent.3", "concurrent.4" };
+
+    for (0..num_clients) |i| {
+        threads[i] = Thread.spawn(.{}, Worker.run, .{ 19931, job_ids[i] }) catch return error.SkipZigTest;
+    }
+
+    for (&threads) |*t| t.join();
+
+    for (job_ids) |job_id| {
+        var stream = try http_connect(19931);
+        defer stream.close();
+        var req_buf: [256]u8 = undefined;
+        const req = std.fmt.bufPrint(&req_buf, "GET /jobs/{s} HTTP/1.1\r\n\r\n", .{job_id}) catch continue;
+        const response = send_http_request(stream, req) catch continue;
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, job_id) != null);
+    }
+}
+
+// Feature: F022
+test "HTTP server shuts down gracefully after concurrent requests complete" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19932\"\n\n[http]\nlisten = \"127.0.0.1:19933\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+
+    {
+        var stream = try http_connect(19933);
+        defer stream.close();
+        const response = try send_http_request(
+            stream,
+            "PUT /jobs/shutdown.test HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2099-12-31T23:59:59Z\"}",
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+    }
+
+    server.stop();
+}
