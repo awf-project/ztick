@@ -1,5 +1,5 @@
 title = "ztick — Push-Driven Job Scheduler in Zig"
-baseurl = "https://awf-project.github.io/ztick/"
+baseurl = "https://awf-project.ai/ztick/"
 disableAliases = true
 disableHugoGeneratorInject = true
 # disableKinds = ["taxonomy", "term"]
