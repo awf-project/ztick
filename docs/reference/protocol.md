@@ -41,7 +41,7 @@ All documentation examples use `socat` as the default tool.
 When TLS is enabled, plaintext clients that connect will have their connection closed after a failed handshake. The server remains available to new connections.
 
 **Authentication and Namespace Enforcement:**
-When `auth_file` is configured, every new connection must authenticate with the `AUTH` command before any other commands are accepted. After successful authentication, all subsequent commands are subject to **namespace restrictions** — commands targeting job or rule identifiers outside the authenticated token's namespace are rejected with `ERROR`. This applies to `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, and `RULE SET` commands.
+When `auth_file` is configured, every new connection must authenticate with the `AUTH` command before any other commands are accepted. After successful authentication, all subsequent commands are subject to **namespace restrictions** — commands targeting job or rule identifiers outside the authenticated token's namespace are rejected with `ERROR auth_denied`. This applies to `SET`, `GET`, `QUERY`, `REMOVE`, `REMOVERULE`, and `RULE SET` commands.
 
 ## Command Format
 
@@ -65,13 +65,54 @@ Every command follows this structure:
 | Status | Meaning |
 |--------|---------|
 | `OK` | Command succeeded |
-| `ERROR` | Command failed (e.g., storage error) |
+| `ERROR` | Command failed; optionally followed by error code and message |
 
 The `request_id` matches the one sent in the command, allowing clients to correlate responses.
+
+**Error responses** can include a machine-readable error code and human-readable message:
+
+```
+<request_id> ERROR <code> <message>\n
+```
+
+For example:
+```
+req-1 ERROR not_found job "backup.daily" does not exist
+req-2 ERROR invalid_args missing required argument: timestamp
+req-3 ERROR auth_denied insufficient namespace scope
+```
+
+Pre-authentication errors (when auth is enabled) omit the request ID and message to prevent token enumeration:
+```
+ERROR <code>\n
+```
+
+For example:
+```
+ERROR auth_required
+ERROR auth_failed
+```
+
+**Backward compatibility**: Clients that match the `ERROR` prefix (with or without parsing the code and message) continue to work without modification.
 
 Write commands (`SET`, `RULE SET`) and delete commands (`REMOVE`, `REMOVERULE`) return a status-only response. Read commands (`GET`) return a response with additional data in the body after the status. List commands (`QUERY`, `LISTRULES`, `STAT`) return multiple lines followed by a terminal `OK` line.
 
 ## Error Handling
+
+### Error Codes
+
+The server returns one of six error codes in ERROR responses:
+
+| Code | Triggered By | Example | Notes |
+|------|--------------|---------|-------|
+| `not_found` | GET/REMOVE/REMOVERULE for non-existent ID | `req-1 ERROR not_found job "backup.daily" does not exist` | Single-entity lookups only; QUERY with no matches returns OK with empty body |
+| `invalid_args` | Missing or malformed required arguments | `req-2 ERROR invalid_args missing required argument: timestamp` | Applies to SET, GET, RULE SET, QUERY, etc. when args are incomplete |
+| `auth_required` | Non-AUTH command sent before authentication (when auth enabled) | `ERROR auth_required` | Connection closed after response; no request ID, no message |
+| `auth_failed` | AUTH sent with unrecognized token | `ERROR auth_failed` | Connection closed after response; no request ID, no message to prevent token enumeration |
+| `auth_denied` | Command targets identifier outside token's namespace scope | `req-3 ERROR auth_denied insufficient namespace scope` | Returned for commands after successful auth when targeting out-of-scope namespace |
+| `internal` | Unexpected server failure (rare) | `req-4 ERROR internal` | No implementation details, file paths, or stack traces in message |
+
+### Connection and Protocol Errors
 
 | Condition | Behavior |
 |-----------|----------|
@@ -80,7 +121,7 @@ Write commands (`SET`, `RULE SET`) and delete commands (`REMOVE`, `REMOVERULE`) 
 | Unrecognized command | Silently ignored, no response sent (see below) |
 | Out of memory | Connection closed |
 | AUTH timeout (5s) | Connection closed when auth is enabled |
-| Non-AUTH command before authentication | `ERROR` response and connection closed |
+| Non-AUTH command before authentication | `ERROR auth_required` response and connection closed |
 
 **Important**: Only `AUTH`, `SET`, `GET`, `QUERY`, `LISTRULES`, `STAT`, `REMOVE`, `REMOVERULE`, and `RULE SET` produce responses. If you send an unrecognized command, the server will not send any response — the client must not block waiting for one.
 
@@ -100,11 +141,15 @@ AUTH <secret>\n
 
 **Response**:
 - Success: `OK\n`
-- Failure: `ERROR\n` (connection is immediately closed)
+- Failure: `ERROR <code>\n` (connection is immediately closed, no request ID)
+
+**Error Codes**:
+- `auth_required`: AUTH command sent without a token argument, or server missing required configuration
+- `auth_failed`: Token not recognized in the auth file
 
 **Behavior**:
 - When `auth_file` is configured, AUTH **must** be the first command sent after connecting
-- Sending any other command before AUTH returns `ERROR` and closes the connection
+- Sending any other command before AUTH returns `ERROR auth_required` and closes the connection
 - Connections that do not complete AUTH within 5 seconds are automatically closed
 - After successful authentication, all subsequent commands are restricted to the token's assigned namespace
 
@@ -116,7 +161,12 @@ echo 'AUTH sk_deploy_a1b2c3d4e5f6' | socat - TCP:localhost:5678
 
 # Attempt to authenticate with an invalid token
 echo 'AUTH invalid_secret' | socat - TCP:localhost:5678
-# Response: ERROR
+# Response: ERROR auth_failed
+# Connection is closed
+
+# Send a command before authenticating
+echo 'r1 SET job.1 12345' | socat - TCP:localhost:5678
+# Response: ERROR auth_required
 # Connection is closed
 ```
 
@@ -139,6 +189,10 @@ Create or update a job.
 - `job_identifier` (string): Unique job identifier (e.g., `backup.daily`)
 - `timestamp`: Either an integer in nanoseconds or a datetime string `YYYY-MM-DD HH:MM:SS`
 
+**Response**:
+- Success: `<request_id> OK\n`
+- Invalid arguments: `<request_id> ERROR invalid_args <missing_field>\n`
+
 **Examples**:
 ```bash
 # With nanosecond timestamp
@@ -148,6 +202,10 @@ echo 'req-1 SET backup.daily 1711612800000000000' | socat - TCP:localhost:5678
 # With datetime string
 echo 'req-2 SET app.task.1 2026-03-30 14:00:00' | socat - TCP:localhost:5678
 # Response: req-2 OK
+
+# Missing timestamp
+echo 'req-3 SET backup.daily' | socat - TCP:localhost:5678
+# Response: req-3 ERROR invalid_args missing required argument: timestamp
 ```
 
 ### GET
@@ -164,7 +222,8 @@ Retrieve a job's current state.
 
 **Response**:
 - Success: `<request_id> OK <status> <execution_ns>\n`
-- Not found: `<request_id> ERROR\n`
+- Not found: `<request_id> ERROR not_found job "<job_id>" does not exist\n`
+- Invalid arguments: `<request_id> ERROR invalid_args missing required argument: job_identifier\n`
 
 | Field | Description |
 |-------|-------------|
@@ -179,7 +238,11 @@ echo 'req-5 GET backup.daily' | socat - TCP:localhost:5678
 
 # Get a nonexistent job
 echo 'req-6 GET no.such.job' | socat - TCP:localhost:5678
-# Response: req-6 ERROR
+# Response: req-6 ERROR not_found job "no.such.job" does not exist
+
+# Get without job identifier
+echo 'req-7 GET' | socat - TCP:localhost:5678
+# Response: req-7 ERROR invalid_args missing required argument: job_identifier
 ```
 
 **Notes**: GET is a read-only command — it does not generate any persistence log entry.
@@ -354,7 +417,7 @@ Delete a scheduled job.
 
 **Response**:
 - Success: `<request_id> OK\n`
-- Not found: `<request_id> ERROR\n`
+- Not found: `<request_id> ERROR not_found job "<job_id>" does not exist\n`
 
 **Examples**:
 ```bash
@@ -364,7 +427,7 @@ echo 'req-7 REMOVE backup.daily' | socat - TCP:localhost:5678
 
 # Remove a nonexistent job
 echo 'req-8 REMOVE no.such.job' | socat - TCP:localhost:5678
-# Response: req-8 ERROR
+# Response: req-8 ERROR not_found job "no.such.job" does not exist
 ```
 
 **Notes**: REMOVE persists the deletion to the append-only logfile. The removal survives server restarts and background log compression.
@@ -383,7 +446,7 @@ Delete an execution rule.
 
 **Response**:
 - Success: `<request_id> OK\n`
-- Not found: `<request_id> ERROR\n`
+- Not found: `<request_id> ERROR not_found rule "<rule_id>" does not exist\n`
 
 **Examples**:
 ```bash
@@ -393,7 +456,7 @@ echo 'req-9 REMOVERULE rule.backup' | socat - TCP:localhost:5678
 
 # Remove a nonexistent rule
 echo 'req-10 REMOVERULE no.such.rule' | socat - TCP:localhost:5678
-# Response: req-10 ERROR
+# Response: req-10 ERROR not_found rule "no.such.rule" does not exist
 ```
 
 **Notes**: REMOVERULE persists the deletion to the append-only logfile. The removal survives server restarts and background log compression. Removing a rule does not cancel pending jobs that were previously matched by the rule.
@@ -440,7 +503,11 @@ Create or update a rule that matches jobs by prefix and assigns a runner.
 - `http <method> <url>`: Trigger an external webhook via HTTP/HTTPS request. Methods: `GET`, `POST`, `PUT`, `DELETE`. The URL must include a scheme (`http://` or `https://`). POST and PUT requests include a JSON body `{"job_id":"<identifier>","execution":<timestamp_ns>}`; GET and DELETE send no body. HTTP 2xx status codes indicate success; all others indicate failure. Connection and read timeouts are 30 seconds.
 - `awf <workflow> [--input <key=value> ...]`: Execute an AWF workflow. The workflow name is required. The optional `--input` flag can be repeated to pass key=value parameters to the workflow (e.g., `awf generate-report --input format=pdf --input target=main`)
 - `amqp <dsn> <exchange> <routing_key>`: Publish a message to an AMQP 0-9-1 broker. The DSN follows the `amqp://[user[:password]@]host[:port][/vhost]` format (plaintext only — TLS is not yet supported). The message body is the job identifier. Each execution opens a fresh connection, publishes one `basic.publish` frame, and closes the connection. Connect/send/receive timeout: 30 seconds. Connection refused, auth rejection, or DSN parse errors return failure without crashing the processor.
-- `redis <url> <command> <key>`: Send a single Redis command per matching job. Requires exactly four runner tokens (`redis` + url + command + key). The URL follows the `redis://[user[:password]@]host[:port][/db]` format (plaintext only — `rediss://` is rejected at parse time). The `<command>` token must be one of `PUBLISH`, `RPUSH`, `LPUSH`, `SET` (case-sensitive); any other value rejects the rule with `ERROR` before persistence. The job identifier is sent as the value/payload. Each execution opens a fresh TCP connection, optionally sends `AUTH` then `SELECT <db>` when applicable, sends the configured command, then closes. Connect/send/receive timeout: 30 seconds. Credentials in the URL are redacted from logs.
+- `redis <url> <command> <key>`: Send a single Redis command per matching job. Requires exactly four runner tokens (`redis` + url + command + key). The URL follows the `redis://[user[:password]@]host[:port][/db]` format (plaintext only — `rediss://` is rejected at parse time). The `<command>` token must be one of `PUBLISH`, `RPUSH`, `LPUSH`, `SET` (case-sensitive); any other value rejects the rule with `ERROR invalid_args` before persistence. The job identifier is sent as the value/payload. Each execution opens a fresh TCP connection, optionally sends `AUTH` then `SELECT <db>` when applicable, sends the configured command, then closes. Connect/send/receive timeout: 30 seconds. Credentials in the URL are redacted from logs.
+
+**Response**:
+- Success: `<request_id> OK\n`
+- Invalid arguments: `<request_id> ERROR invalid_args <details>\n`
 
 **Examples**:
 ```bash

@@ -115,15 +115,29 @@ states:
       ' CHANGELOG.md > CHANGELOG.md.tmp
       mv CHANGELOG.md.tmp CHANGELOG.md
       grep -nE '^## \[' CHANGELOG.md | head -3
-    on_success: commit
+    transitions:
+      - when: "states.update_changelog.ExitCode == 0 and inputs.bump != 'patch'"
+        goto: update_awf_config
+      - when: "states.update_changelog.ExitCode == 0"
+        goto: commit
     on_failure: {message: "Failed to update CHANGELOG.md"}
+
+  update_awf_config:
+    type: step
+    command: |
+      set -eu
+      next="{{.states.compute_version.Output}}"
+      sed -i.bak -E "s/(version: v)[0-9]+\.[0-9]+\.[0-9]+/\1${next}/" .awf/config.yaml
+      rm -f .awf/config.yaml.bak
+    on_success: commit
+    on_failure: {message: "Failed to update .awf/config.yaml version to v{{.states.compute_version.Output}}"}
 
   commit:
     type: step
     command: |
       set -eu
       next="{{.states.compute_version.Output}}"
-      git add build.zig.zon CHANGELOG.md
+      git add build.zig.zon CHANGELOG.md .awf/config.yaml
       git commit -m "chore(release): v${next}"
     on_success: tag
     on_failure: {message: "Failed to commit release bump"}

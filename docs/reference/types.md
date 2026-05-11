@@ -240,10 +240,37 @@ Query response to client.
 
 ```zig
 pub const Response = struct {
-    request: Request,   // Original request
-    success: bool,      // Whether the operation succeeded
+    request: Request,           // Original request
+    success: bool,              // Whether the operation succeeded
+    body: ?[]const u8 = null,   // Optional response body (for GET commands)
+    error_code: ?ErrorCode = null,    // Optional error code (for failed requests)
+    error_message: ?[]const u8 = null, // Optional error message (for failed requests)
 };
 ```
+
+### Error Code
+
+Machine-readable error classification for failed requests.
+
+```zig
+pub const ErrorCode = enum {
+    not_found,      // Resource does not exist
+    invalid_args,   // Missing or malformed arguments
+    auth_required,  // Authentication required before command
+    auth_failed,    // Invalid authentication token
+    auth_denied,    // Authorized but insufficient namespace scope
+    internal,       // Unexpected server error
+};
+```
+
+| Code | When Used | Example |
+|------|-----------|---------|
+| `not_found` | GET/REMOVE for non-existent job or rule | `req-1 ERROR not_found job "missing.job" does not exist` |
+| `invalid_args` | Recognized command with missing/invalid arguments | `req-2 ERROR invalid_args missing required argument: timestamp` |
+| `auth_required` | Non-AUTH command sent before authentication (when auth enabled) | `ERROR auth_required` |
+| `auth_failed` | AUTH sent with unrecognized token | `ERROR auth_failed` |
+| `auth_denied` | Post-auth command targets identifier outside token's namespace | `req-3 ERROR auth_denied insufficient namespace scope` |
+| `internal` | Unexpected server failure | `req-4 ERROR internal` |
 
 ### Execution Request
 

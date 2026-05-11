@@ -30,7 +30,9 @@ pub const QueryHandler = struct {
                     .execution = args.execution,
                     .status = .planned,
                 };
-                self.job_storage.set(job) catch break :blk false;
+                self.job_storage.set(job) catch {
+                    return Response{ .request = request, .success = false, .error_code = .internal };
+                };
                 break :blk true;
             },
             .rule_set => |args| blk: {
@@ -39,11 +41,16 @@ pub const QueryHandler = struct {
                     .pattern = args.pattern,
                     .runner = args.runner,
                 };
-                self.rule_storage.set(rule) catch break :blk false;
+                self.rule_storage.set(rule) catch {
+                    return Response{ .request = request, .success = false, .error_code = .internal };
+                };
                 break :blk true;
             },
-            .get => |args| blk: {
-                const job = self.job_storage.get(args.identifier) orelse break :blk false;
+            .get => |args| {
+                const job = self.job_storage.get(args.identifier) orelse {
+                    const msg = try std.fmt.allocPrint(self.allocator, "job \"{s}\" does not exist", .{args.identifier});
+                    return Response{ .request = request, .success = false, .error_code = .not_found, .error_message = msg };
+                };
                 const body = try std.fmt.allocPrint(self.allocator, "{s} {d}", .{ @tagName(job.status), job.execution });
                 return Response{ .request = request, .success = true, .body = body };
             },
@@ -65,8 +72,20 @@ pub const QueryHandler = struct {
                 const body = try body_buf.toOwnedSlice(self.allocator);
                 return Response{ .request = request, .success = true, .body = body };
             },
-            .remove => |args| self.job_storage.delete(args.identifier),
-            .remove_rule => |args| self.rule_storage.delete(args.identifier),
+            .remove => |args| blk: {
+                if (!self.job_storage.delete(args.identifier)) {
+                    const msg = try std.fmt.allocPrint(self.allocator, "job \"{s}\" does not exist", .{args.identifier});
+                    return Response{ .request = request, .success = false, .error_code = .not_found, .error_message = msg };
+                }
+                break :blk true;
+            },
+            .remove_rule => |args| blk: {
+                if (!self.rule_storage.delete(args.identifier)) {
+                    const msg = try std.fmt.allocPrint(self.allocator, "rule \"{s}\" does not exist", .{args.identifier});
+                    return Response{ .request = request, .success = false, .error_code = .not_found, .error_message = msg };
+                }
+                break :blk true;
+            },
             .list_rules => {
                 if (self.rule_storage.rules.count() == 0) {
                     return Response{ .request = request, .success = true };
@@ -126,6 +145,8 @@ test "handle set instruction stores job and returns success" {
     const response = try handler.handle(request);
     try std.testing.expect(response.success);
     try std.testing.expectEqual(request.client, response.request.client);
+    try std.testing.expectEqual(@as(?domain.query.ErrorCode, null), response.error_code);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
 
     const job = job_storage.get("job.1");
     try std.testing.expect(job != null);
@@ -156,6 +177,8 @@ test "handle rule_set instruction stores rule and returns success" {
 
     const response = try handler.handle(request);
     try std.testing.expect(response.success);
+    try std.testing.expectEqual(@as(?domain.query.ErrorCode, null), response.error_code);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
 
     const rule = rule_storage.get("rule.1");
     try std.testing.expect(rule != null);
@@ -188,6 +211,8 @@ test "handle get instruction returns success with status and execution timestamp
     try std.testing.expect(response.success);
     try std.testing.expect(response.body != null);
     try std.testing.expectEqualStrings("planned 1595586600000000000", response.body.?);
+    try std.testing.expectEqual(@as(?domain.query.ErrorCode, null), response.error_code);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
 }
 
 test "handle get instruction returns failure for missing job" {
@@ -209,8 +234,11 @@ test "handle get instruction returns failure for missing job" {
     };
 
     const response = try handler.handle(request);
+    defer if (response.error_message) |m| allocator.free(m);
     try std.testing.expect(!response.success);
     try std.testing.expectEqual(@as(?[]const u8, null), response.body);
+    try std.testing.expectEqual(domain.query.ErrorCode.not_found, response.error_code.?);
+    try std.testing.expectEqualStrings("job \"job.missing\" does not exist", response.error_message.?);
 }
 
 test "handle query instruction returns success with matching jobs in body" {
@@ -322,6 +350,8 @@ test "handle remove instruction removes existing job and returns success" {
 
     const response = try handler.handle(request);
     try std.testing.expect(response.success);
+    try std.testing.expectEqual(@as(?domain.query.ErrorCode, null), response.error_code);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
     try std.testing.expect(job_storage.get("backup-daily") == null);
 }
 
@@ -344,7 +374,10 @@ test "handle remove instruction returns failure for missing job" {
     };
 
     const response = try handler.handle(request);
+    defer if (response.error_message) |m| allocator.free(m);
     try std.testing.expect(!response.success);
+    try std.testing.expectEqual(domain.query.ErrorCode.not_found, response.error_code.?);
+    try std.testing.expectEqualStrings("job \"nonexistent\" does not exist", response.error_message.?);
 }
 
 test "handle remove_rule instruction removes existing rule and returns success" {
@@ -391,7 +424,10 @@ test "handle remove_rule instruction returns failure for missing rule" {
     };
 
     const response = try handler.handle(request);
+    defer if (response.error_message) |m| allocator.free(m);
     try std.testing.expect(!response.success);
+    try std.testing.expectEqual(domain.query.ErrorCode.not_found, response.error_code.?);
+    try std.testing.expectEqualStrings("rule \"ghost-rule\" does not exist", response.error_message.?);
 }
 
 test "handle list_rules instruction returns success with null body when no rules loaded" {
@@ -698,4 +734,62 @@ test "handle list_rules instruction returns success with http POST rule in body"
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "http") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "POST") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "https://hooks.example.com/webhook") != null);
+}
+
+test "handle set instruction returns internal error code when storage fails" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var buf: [16]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    var job_storage = JobStorage.init(fba.allocator());
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(fba.allocator());
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    const request = Request{
+        .client = 100,
+        .identifier = "req-oom-set",
+        .instruction = .{ .set = .{ .identifier = "job.oom", .execution = 1595586600_000000000 } },
+    };
+
+    const response = try handler.handle(request);
+    try std.testing.expect(!response.success);
+    try std.testing.expectEqual(domain.query.ErrorCode.internal, response.error_code.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
+}
+
+test "handle rule_set instruction returns internal error code when storage fails" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var buf: [16]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    var job_storage = JobStorage.init(fba.allocator());
+    defer job_storage.deinit();
+    var rule_storage = RuleStorage.init(fba.allocator());
+    defer rule_storage.deinit();
+
+    var handler = QueryHandler.init(allocator, &job_storage, &rule_storage);
+
+    const request = Request{
+        .client = 101,
+        .identifier = "req-oom-rule-set",
+        .instruction = .{ .rule_set = .{
+            .identifier = "rule.oom",
+            .pattern = "oom.",
+            .runner = .{ .shell = .{ .command = "echo" } },
+        } },
+    };
+
+    const response = try handler.handle(request);
+    try std.testing.expect(!response.success);
+    try std.testing.expectEqual(domain.query.ErrorCode.internal, response.error_code.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
 }

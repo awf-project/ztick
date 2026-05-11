@@ -67,8 +67,6 @@
 
 ## Common Pitfalls
 
-- Propagate allocation errors immediately; never catch OOM and convert to false success
-- Copy storage results into owned allocation before mutation; never iterate and mutate simultaneously
 - Close channels before joining threads to prevent deadlocks; document shutdown sequence explicitly
 - Try openFile(.write_only) first, fall back to createFile for new logfiles; handles both append and initialization
 - Pre-allocate capacity in thread tracking list before spawning; ensure append cannot fail due to OOM and orphan spawned threads
@@ -89,6 +87,8 @@
 - Enforce 5-second auth timeout using poll-based socket reads; close connection if AUTH not received within timeout
 - Initialize TLS contexts identically in test and production code; apply identical guard conditions (config presence checks) to prevent environment-specific bugs
 - Never reimplement logic from merged features; if F011 auth was completed, F018 should only reference it via config wiring without adding session management code
+- Never rely on final-diff analysis for feature verification; ensure all planned files are modified and build/test complete, since implementation may span multiple earlier commits
+- Always keep feature branches scoped to plan; never commit unplanned configuration changes (.awf/, build system, deployment files) as scope-creep risks team workflows
 
 ## Test Conventions
 
