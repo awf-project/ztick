@@ -270,7 +270,7 @@ fn handle_connection(
             if (!auth_done) {
                 if (!std.mem.eql(u8, result.command, "AUTH") or result.args.len < 1) {
                     result.deinit(allocator);
-                    _ = conn.write("ERROR\n") catch {};
+                    _ = conn.write("ERROR auth_required\n") catch {};
                     return;
                 }
                 const secret = result.args[0];
@@ -282,7 +282,7 @@ fn handle_connection(
                     continue;
                 } else {
                     result.deinit(allocator);
-                    _ = conn.write("ERROR\n") catch {};
+                    _ = conn.write("ERROR auth_failed\n") catch {};
                     return;
                 }
             }
@@ -307,7 +307,7 @@ fn handle_connection(
                     };
                     if (!allowed) {
                         free_instruction_strings(allocator, instr);
-                        const msg = std.fmt.allocPrint(allocator, "{s} ERROR\n", .{result.command}) catch {
+                        const msg = std.fmt.allocPrint(allocator, "{s} ERROR auth_denied insufficient namespace scope\n", .{result.command}) catch {
                             allocator.free(result.command);
                             return;
                         };
@@ -323,7 +323,7 @@ fn handle_connection(
                     else => true,
                 };
                 if (requires_namespace_scope and !is_namespace_authorized(client_id, instr)) {
-                    const msg = std.fmt.allocPrint(allocator, "{s} ERROR\n", .{result.command}) catch {
+                    const msg = std.fmt.allocPrint(allocator, "{s} ERROR auth_denied insufficient namespace scope\n", .{result.command}) catch {
                         allocator.free(result.command);
                         free_instruction_strings(allocator, instr);
                         return;
@@ -379,18 +379,29 @@ fn handle_connection(
                         // by the scheduler's storage and must not be freed here.
                         allocator.free(resp.request.identifier);
                         if (resp.body) |body| allocator.free(body);
+                        if (resp.error_message) |m| allocator.free(m);
                     } else {
                         return; // channel closed
                     }
                 }
             } else {
-                // Send ERROR for recognized commands missing required arguments
-                if (result.args.len >= 1 and (std.mem.eql(u8, result.args[0], "QUERY") or
-                    std.mem.eql(u8, result.args[0], "REMOVE") or
-                    std.mem.eql(u8, result.args[0], "REMOVERULE") or
-                    (std.mem.eql(u8, result.args[0], "RULE") and result.args.len >= 2 and std.mem.eql(u8, result.args[1], "SET"))))
-                {
-                    const msg = std.fmt.allocPrint(allocator, "{s} ERROR\n", .{result.command}) catch {
+                const invalid_args_reason: ?[]const u8 = blk: {
+                    if (result.args.len >= 1) {
+                        if (std.mem.eql(u8, result.args[0], "GET") and result.args.len < 2)
+                            break :blk "missing required argument: identifier";
+                        if (std.mem.eql(u8, result.args[0], "SET") and result.args.len < 3)
+                            break :blk "missing required argument: timestamp";
+                        if (std.mem.eql(u8, result.args[0], "REMOVE") and result.args.len < 2)
+                            break :blk "missing required argument: identifier";
+                        if (std.mem.eql(u8, result.args[0], "REMOVERULE") and result.args.len < 2)
+                            break :blk "missing required argument: identifier";
+                        if (std.mem.eql(u8, result.args[0], "RULE") and result.args.len >= 2 and std.mem.eql(u8, result.args[1], "SET"))
+                            break :blk "missing required argument: pattern";
+                    }
+                    break :blk null;
+                };
+                if (invalid_args_reason) |reason| {
+                    const msg = std.fmt.allocPrint(allocator, "{s} ERROR invalid_args {s}\n", .{ result.command, reason }) catch {
                         result.deinit(allocator);
                         return;
                     };
@@ -519,7 +530,6 @@ fn build_rule_set_instruction(allocator: std.mem.Allocator, args: [][]u8) error{
     if (runner_type.len >= 1 and std.mem.eql(u8, runner_type[0], "awf")) {
         if (runner_type.len < 2) return null;
         const remaining = runner_type[2..];
-        // Validate: remaining args must be pairs of "--input" + value
         if (remaining.len % 2 != 0) return null;
         var k: usize = 0;
         while (k < remaining.len) : (k += 2) {
@@ -533,15 +543,13 @@ fn build_rule_set_instruction(allocator: std.mem.Allocator, args: [][]u8) error{
         errdefer allocator.free(workflow);
         const input_count = remaining.len / 2;
         const inputs = try allocator.alloc([]const u8, input_count);
-        var filled: usize = 0;
+        var j: usize = 0;
         errdefer {
-            for (inputs[0..filled]) |input| allocator.free(input);
+            for (inputs[0..j]) |input| allocator.free(input);
             allocator.free(inputs);
         }
-        var j: usize = 0;
         while (j < input_count) : (j += 1) {
             inputs[j] = try allocator.dupe(u8, remaining[j * 2 + 1]);
-            filled += 1;
         }
         return .{ .rule_set = .{
             .identifier = id,
@@ -722,14 +730,18 @@ fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Ins
 }
 
 fn write_response(allocator: std.mem.Allocator, conn: Connection, resp: query.Response) !void {
+    if (!resp.success) {
+        const code = resp.error_code orelse .internal;
+        const msg = if (resp.error_message) |m|
+            try std.fmt.allocPrint(allocator, "{s} ERROR {s} {s}\n", .{ resp.request.identifier, @tagName(code), m })
+        else
+            try std.fmt.allocPrint(allocator, "{s} ERROR {s}\n", .{ resp.request.identifier, @tagName(code) });
+        defer allocator.free(msg);
+        _ = try conn.write(msg);
+        return;
+    }
     switch (resp.request.instruction) {
         .query, .list_rules, .stat => {
-            if (!resp.success) {
-                const msg = try std.fmt.allocPrint(allocator, "{s} ERROR\n", .{resp.request.identifier});
-                defer allocator.free(msg);
-                _ = try conn.write(msg);
-                return;
-            }
             if (resp.body) |body| {
                 var iter = std.mem.splitScalar(u8, body, '\n');
                 while (iter.next()) |line| {
@@ -744,11 +756,10 @@ fn write_response(allocator: std.mem.Allocator, conn: Connection, resp: query.Re
             _ = try conn.write(ok_line);
         },
         else => {
-            const status = if (resp.success) "OK" else "ERROR";
             const msg = if (resp.body) |body|
-                try std.fmt.allocPrint(allocator, "{s} {s} {s}\n", .{ resp.request.identifier, status, body })
+                try std.fmt.allocPrint(allocator, "{s} OK {s}\n", .{ resp.request.identifier, body })
             else
-                try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ resp.request.identifier, status });
+                try std.fmt.allocPrint(allocator, "{s} OK\n", .{resp.request.identifier});
             defer allocator.free(msg);
             _ = try conn.write(msg);
         },
@@ -1647,6 +1658,7 @@ test "write_response formats stat error response as ERROR line" {
         .request = req,
         .success = false,
         .body = null,
+        .error_code = .internal,
     };
 
     try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
@@ -1654,7 +1666,55 @@ test "write_response formats stat error response as ERROR line" {
 
     var buf: [64]u8 = undefined;
     const n = try std.posix.read(pair.read_fd, &buf);
-    try std.testing.expectEqualStrings("req-1 ERROR\n", buf[0..n]);
+    try std.testing.expectEqualStrings("req-1 ERROR internal\n", buf[0..n]);
+}
+
+test "write_response formats error with code and message for single-entity instruction" {
+    const pair = try make_socket_pair();
+    defer std.posix.close(pair.read_fd);
+
+    const req = query.Request{
+        .client = 0,
+        .identifier = "req-1",
+        .instruction = .{ .get = .{ .identifier = "job.x" } },
+    };
+    const resp = query.Response{
+        .request = req,
+        .success = false,
+        .error_code = .not_found,
+        .error_message = "job \"x\" does not exist",
+    };
+
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
+    pair.write_stream.close();
+
+    var buf: [128]u8 = undefined;
+    const n = try std.posix.read(pair.read_fd, &buf);
+    try std.testing.expectEqualStrings("req-1 ERROR not_found job \"x\" does not exist\n", buf[0..n]);
+}
+
+test "write_response formats error with code only when message is null" {
+    const pair = try make_socket_pair();
+    defer std.posix.close(pair.read_fd);
+
+    const req = query.Request{
+        .client = 0,
+        .identifier = "req-2",
+        .instruction = .{ .set = .{ .identifier = "job.1", .execution = 0 } },
+    };
+    const resp = query.Response{
+        .request = req,
+        .success = false,
+        .error_code = .internal,
+        .error_message = null,
+    };
+
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
+    pair.write_stream.close();
+
+    var buf: [64]u8 = undefined;
+    const n = try std.posix.read(pair.read_fd, &buf);
+    try std.testing.expectEqualStrings("req-2 ERROR internal\n", buf[0..n]);
 }
 
 test "handle_connection forwards STAT instruction to request channel" {
@@ -2130,7 +2190,7 @@ test "handle_connection AUTH with invalid token responds ERROR and closes connec
     var buf: [64]u8 = undefined;
     const n = try poll_for_response(pair.write_stream.handle, &buf, 500);
     try std.testing.expect(n > 0);
-    try std.testing.expectEqualStrings("ERROR\n", buf[0..n]);
+    try std.testing.expectEqualStrings("ERROR auth_failed\n", buf[0..n]);
 }
 
 test "handle_connection non-AUTH first command responds ERROR and closes connection" {
@@ -2170,7 +2230,7 @@ test "handle_connection non-AUTH first command responds ERROR and closes connect
     var buf: [64]u8 = undefined;
     const n = try poll_for_response(pair.write_stream.handle, &buf, 500);
     try std.testing.expect(n > 0);
-    try std.testing.expectEqualStrings("ERROR\n", buf[0..n]);
+    try std.testing.expectEqualStrings("ERROR auth_required\n", buf[0..n]);
 }
 
 test "handle_connection command within namespace is accepted after AUTH" {
@@ -2264,7 +2324,7 @@ test "handle_connection command outside namespace responds ERROR after AUTH" {
     var buf2: [64]u8 = undefined;
     const n_cmd = try poll_for_response(pair.write_stream.handle, &buf2, 500);
     try std.testing.expect(n_cmd > 0);
-    try std.testing.expectEqualStrings("r2 ERROR\n", buf2[0..n_cmd]);
+    try std.testing.expectEqualStrings("r2 ERROR auth_denied insufficient namespace scope\n", buf2[0..n_cmd]);
 }
 
 test "handle_connection QUERY results filtered to client namespace after AUTH" {

@@ -9,7 +9,7 @@ Token-based client authentication restricts access to the ztick scheduler by req
 When authentication is enabled:
 1. Every TCP connection must send an `AUTH <token>` command first
 2. All subsequent commands are restricted to the token's assigned **namespace**
-3. Identifiers (jobs, rules) outside the namespace are rejected with `ERROR`
+3. Identifiers (jobs, rules) outside the namespace are rejected with `ERROR auth_denied`
 4. Connections that don't authenticate within 5 seconds are automatically closed
 
 When authentication is disabled (default), connections are accepted immediately and can issue any command — this maintains backward compatibility with existing deployments.
@@ -135,9 +135,9 @@ GET deploy.weekly                        # OK
 QUERY deploy.                            # OK (filters results)
 
 # Rejected (doesn't match "deploy.")
-SET backup.daily 2026-04-01 12:00:00    # ERROR
-GET app.task                             # ERROR
-REMOVE monitoring.alert                  # ERROR
+SET backup.daily 2026-04-01 12:00:00    # ERROR auth_denied insufficient namespace scope
+GET app.task                             # ERROR auth_denied insufficient namespace scope
+REMOVE monitoring.alert                  # ERROR auth_denied insufficient namespace scope
 ```
 
 ### Wildcard Access
@@ -179,8 +179,8 @@ RULE SET deploy.rule1 deploy. shell ...   # Both ID and pattern in namespace
 RULE SET rule.deploy. deploy. shell ...   # OK: pattern matches namespace
 
 # These are rejected:
-RULE SET backup.rule backup. shell ...    # ERROR: ID outside namespace
-RULE SET deploy.rule backup. shell ...    # ERROR: pattern outside namespace
+RULE SET backup.rule backup. shell ...    # ERROR auth_denied insufficient namespace scope
+RULE SET deploy.rule backup. shell ...    # ERROR auth_denied insufficient namespace scope
 ```
 
 ## Client Authentication
@@ -273,31 +273,44 @@ Note: There is no hot-reload of the auth file — a server restart is required f
 
 ## Troubleshooting
 
-### "Connection closed" on AUTH
+### `ERROR auth_required` — connection closed
 
-**Symptom**: Connection closes after AUTH command
+**Symptom**: Server responds with `ERROR auth_required` and closes the connection.
 
 **Causes:**
-- Incorrect secret — The provided secret doesn't match any token in the auth file
-- Auth file not configured — Check that `auth_file` is set in the config
-- Auth timeout — 5 seconds passed before AUTH was sent
+- A non-AUTH command was sent before authenticating
+- AUTH was sent without a token argument
 
-**Fix**: Verify the secret matches the auth file and try again:
+**Fix**: Send `AUTH <secret>` as the first command after connecting:
 
 ```bash
-# Check auth.toml for the correct secret
+(echo "AUTH sk_correct_secret"; echo "r1 SET deploy.daily 2026-04-01 12:00:00") | \
+socat - TCP:localhost:5678
+```
+
+### `ERROR auth_failed` — connection closed
+
+**Symptom**: Server responds with `ERROR auth_failed` and closes the connection.
+
+**Causes:**
+- The secret doesn't match any token in the auth file
+- Auth file path is misconfigured
+
+**Fix**: Verify the secret matches the auth file:
+
+```bash
 grep "secret" auth.toml
 
-# Test the token
+# Test with the correct secret
 (echo "AUTH sk_correct_secret"; sleep 1) | socat - TCP:localhost:5678
 ```
 
-### "ERROR" response on a command
+### `ERROR auth_denied` — namespace mismatch
 
-**Symptom**: Command is rejected with `ERROR` after successful AUTH
+**Symptom**: Command is rejected with `ERROR auth_denied insufficient namespace scope` after successful AUTH.
 
 **Causes:**
-- Identifier outside namespace — The job/rule identifier doesn't match the token's namespace prefix
+- The job/rule identifier doesn't start with the token's namespace prefix
 
 **Fix**: Check that the identifier starts with the namespace:
 
@@ -305,9 +318,18 @@ grep "secret" auth.toml
 # Token namespace is "deploy.", so these work:
 echo "r1 SET deploy.daily 2026-04-01 12:00:00" | socat - TCP:localhost:5678
 
-# This fails:
+# This fails (identifier outside namespace):
 echo "r1 SET backup.daily 2026-04-01 12:00:00" | socat - TCP:localhost:5678
+# Response: r1 ERROR auth_denied insufficient namespace scope
 ```
+
+### Connection closed with no response
+
+**Symptom**: Connection closes without any ERROR response.
+
+**Causes:**
+- AUTH timeout — 5 seconds passed before AUTH was sent
+- TLS handshake failure on a TLS-enabled server
 
 ## Disabling Authentication
 

@@ -10,6 +10,8 @@
 # Uncomment and modify the examples below:
 inputs:
   project_number: 3
-  version: v0.2.0
+  version: v0.3.0
+  agents: zig:zig-engineer,web:test-automator
+  skills: zig:zig-language,zig:zig-testing,zig:zig-memory,zig:zig-errors,zig:zig-build,zig:zig-comptime,zig:zig-cli,zig:zig-interop-c,zig:zig-otel,zig:zig-yaml
   # environment: staging
   # debug: false

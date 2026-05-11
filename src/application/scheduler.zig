@@ -504,6 +504,7 @@ test "handle_query with get instruction returns failure for missing job" {
     };
 
     const response = try scheduler.handle_query(request);
+    defer if (response.error_message) |m| allocator.free(m);
     try std.testing.expect(!response.success);
     try std.testing.expectEqual(@as(?[]const u8, null), response.body);
 }
