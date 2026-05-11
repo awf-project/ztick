@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-11
+
+### Added
+
+- **Thread-per-connection HTTP concurrency (F022)** — HTTP server now spawns a detached thread per accepted connection so multiple clients can issue requests simultaneously without blocking the accept loop. An `active_connections` atomic counter and `join_all()` with 5-second polling timeout enable graceful shutdown that drains in-flight requests before process exit.
+- **Channel batch drain** — `Channel.drain()` batch-consumes all pending requests in a single lock/unlock cycle, reducing lock contention from per-message to per-tick under concurrent TCP workers.
+- **Event-driven database tick** — `Clock` now uses condition-variable `timedWait()` instead of unconditional `Thread.sleep()`, waking the database thread immediately when a request arrives. Cuts single-worker p50 latency from ~2 ms to sub-millisecond.
+
+### Changed
+
+- **Priority queue for job storage (F021)** — `JobStorage` replaced sorted `ArrayList` with `std.PriorityQueue` for O(log n) job insertion, eliminating linear scan overhead as the scheduled job count grows.
+- Normalized public API naming to `snake_case` (`setInstruments` → `set_instruments`, `setStatContext` → `set_stat_context`) and private HTTP helpers (`toEpochSeconds` → `to_epoch_seconds`, `isLeapYear` → `is_leap_year`).
+- Query channel capacity expanded from 64 to 1024.
+- Forced LLVM backend for all build targets to work around a glibc 2.43+ `.sframe` relocation incompatibility with Zig's self-hosted linker (ziglang/zig#31272).
+
+### Fixed
+
+- HTTP server returned `405 Method Not Allowed` instead of `404 Not Found` for unmatched rule routes.
+- AWF runner arg-freeing logic now uses index-based iteration to avoid use-after-free.
+
 ## [0.1.0] - 2026-04-27
 
 Initial release of ztick, a time-based job scheduler written in Zig with
