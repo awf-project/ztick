@@ -17,6 +17,8 @@ ztick.log
 .env.local
 *.env
 
+!.awf
+
 # Temporary files
 *.tmp
 *.bak
