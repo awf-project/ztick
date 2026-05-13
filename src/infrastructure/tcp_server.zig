@@ -62,10 +62,10 @@ pub const ResponseRouter = struct {
         self.channels.deinit();
     }
 
-    pub fn register(self: *ResponseRouter, client_id: query.Client, channel: *Channel(query.Response)) void {
+    pub fn register(self: *ResponseRouter, client_id: query.Client, channel: *Channel(query.Response)) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.channels.put(client_id, channel) catch return;
+        try self.channels.put(client_id, channel);
     }
 
     pub fn deregister(self: *ResponseRouter, client_id: query.Client) void {
@@ -76,9 +76,8 @@ pub const ResponseRouter = struct {
 
     pub fn route(self: *ResponseRouter, response: query.Response) void {
         self.mutex.lock();
-        const channel = self.channels.get(response.request.client);
-        self.mutex.unlock();
-        if (channel) |ch| {
+        defer self.mutex.unlock();
+        if (self.channels.get(response.request.client)) |ch| {
             ch.try_send(response) catch {};
         }
     }
@@ -96,6 +95,15 @@ pub const TcpServer = struct {
     tls_context: ?*TlsContext,
     token_store: ?*TokenStore,
     instruments: ?telemetry.Instruments,
+    /// Listen socket fd, set by start() and cleared after the accept loop exits.
+    /// Used by deinit() only when start() never ran (early error path).
+    listen_fd: ?std.posix.socket_t,
+    /// Optional pointer to a caller-owned atomic that receives the listen fd
+    /// immediately after binding. A signal handler can close that fd (setting
+    /// the atomic back to -1) to unblock a blocked accept() call.  Ownership
+    /// of the fd is transferred via an atomic swap so exactly one party closes
+    /// it: whichever one wins the swap first.
+    signal_listen_fd: ?*std.atomic.Value(std.posix.socket_t),
 
     pub fn init(allocator: std.mem.Allocator, address: []const u8, running: *std.atomic.Value(bool), tls_context: ?*TlsContext, active_connections: *std.atomic.Value(usize), token_store: ?*TokenStore) TcpServer {
         return .{
@@ -106,15 +114,20 @@ pub const TcpServer = struct {
             .tls_context = tls_context,
             .token_store = token_store,
             .instruments = null,
+            .listen_fd = null,
+            .signal_listen_fd = null,
         };
+    }
+
+    pub fn deinit(self: *TcpServer) void {
+        if (self.listen_fd) |fd| {
+            std.posix.close(fd);
+            self.listen_fd = null;
+        }
     }
 
     pub fn set_instruments(self: *TcpServer, instr: telemetry.Instruments) void {
         self.instruments = instr;
-    }
-
-    pub fn deinit(self: *TcpServer) void {
-        _ = self;
     }
 
     pub fn start(
@@ -127,6 +140,12 @@ pub const TcpServer = struct {
         const port = try std.fmt.parseInt(u16, self.address[colon + 1 ..], 10);
         const addr = try std.net.Address.parseIp(host, port);
         var server = try addr.listen(.{});
+        const raw_fd = server.stream.handle;
+        self.listen_fd = raw_fd;
+
+        // Publish the fd to the signal handler's atomic so it can close the
+        // socket to unblock accept() on SIGINT/SIGTERM.
+        if (self.signal_listen_fd) |sig_fd| sig_fd.store(raw_fd, .release);
 
         var next_client_id: u128 = 0;
 
@@ -162,7 +181,17 @@ pub const TcpServer = struct {
             thread.detach();
         }
 
-        server.deinit();
+        // Clear listen_fd so deinit() does not attempt a second close.
+        self.listen_fd = null;
+
+        // Reset the signal atomic to -1 so the signal handler will not attempt
+        // a redundant shutdown() after the socket is closed below.
+        if (self.signal_listen_fd) |sig_fd| sig_fd.store(-1, .release);
+
+        // Close the listen socket.  The signal handler uses shutdown() (not
+        // close()) to unblock accept(), so the fd is still open at this point
+        // and exactly one close happens here.
+        std.posix.close(raw_fd);
     }
 
     pub fn join_all(self: *TcpServer) void {
@@ -215,7 +244,7 @@ fn handle_connection(
     var response_channel = Channel(query.Response).init(allocator, 1) catch return;
     defer response_channel.deinit();
 
-    response_router.register(client_id, &response_channel);
+    response_router.register(client_id, &response_channel) catch return;
     defer response_router.deregister(client_id);
 
     var buf: [4096]u8 = undefined;
@@ -225,16 +254,15 @@ fn handle_connection(
     var identity: ?domain.auth.ClientIdentity = null;
 
     // FR-010: connections that don't complete AUTH within 5 seconds are closed.
-    const auth_deadline_ns: i128 = if (token_store != null)
-        std.time.nanoTimestamp() + 5_000_000_000
-    else
-        0;
+    // Use a monotonic timer to avoid NTP stepback causing the deadline to extend or wrap.
+    const auth_timeout_ns: u64 = 5_000_000_000;
+    var auth_timer = if (token_store != null) std.time.Timer.start() catch return else null;
 
     while (true) {
         if (!auth_done) {
-            const now = std.time.nanoTimestamp();
-            if (now >= auth_deadline_ns) return;
-            const remaining_ms = @min(@divFloor(auth_deadline_ns - now, 1_000_000), std.math.maxInt(i32));
+            const elapsed_ns = auth_timer.?.read();
+            if (elapsed_ns >= auth_timeout_ns) return;
+            const remaining_ms = @min((auth_timeout_ns - elapsed_ns) / 1_000_000, std.math.maxInt(u31));
             var pfd = [1]std.posix.pollfd{.{
                 .fd = conn.fd(),
                 .events = std.posix.POLL.IN,
@@ -255,6 +283,8 @@ fn handle_connection(
             const result = parser.parse(allocator, data) catch |err| switch (err) {
                 error.Incomplete => break,
                 error.Invalid => {
+                    // Send error response before skipping the invalid line
+                    _ = conn.write("ERROR invalid_command\n") catch {};
                     // Skip the invalid line (find next newline)
                     if (std.mem.indexOfScalar(u8, data, '\n')) |nl| {
                         consumed += nl + 1;
@@ -318,21 +348,7 @@ fn handle_connection(
                     }
                 }
 
-                const requires_namespace_scope = switch (instr) {
-                    .stat => false,
-                    else => true,
-                };
-                if (requires_namespace_scope and !is_namespace_authorized(client_id, instr)) {
-                    const msg = std.fmt.allocPrint(allocator, "{s} ERROR auth_denied insufficient namespace scope\n", .{result.command}) catch {
-                        allocator.free(result.command);
-                        free_instruction_strings(allocator, instr);
-                        return;
-                    };
-                    defer allocator.free(msg);
-                    _ = conn.write(msg) catch {};
-                    allocator.free(result.command);
-                    free_instruction_strings(allocator, instr);
-                } else {
+                {
                     const request = query.Request{
                         .client = client_id,
                         .identifier = result.command,
@@ -340,7 +356,6 @@ fn handle_connection(
                     };
 
                     request_channel.send(request) catch {
-                        // Send failed — we still own the strings, free them
                         allocator.free(result.command);
                         free_instruction_strings(allocator, instr);
                         return;
@@ -434,10 +449,11 @@ fn build_instruction(allocator: std.mem.Allocator, result: parser.ParseResult) e
     }
 
     if (result.args.len >= 3 and std.mem.eql(u8, result.args[0], "SET")) {
+        const ts = parse_timestamp(result.args[2..]) orelse return null;
         const id = try allocator.dupe(u8, result.args[1]);
         return .{ .set = .{
             .identifier = id,
-            .execution = parse_timestamp(result.args[2..]),
+            .execution = ts,
         } };
     }
 
@@ -610,8 +626,8 @@ fn build_rule_set_instruction(allocator: std.mem.Allocator, args: [][]u8) error{
     return null;
 }
 
-fn parse_timestamp(args: [][]u8) i64 {
-    if (args.len == 0) return 0;
+fn parse_timestamp(args: [][]u8) ?i64 {
+    if (args.len == 0) return null;
 
     // Try datetime format "YYYY-MM-DD HH:MM:SS" (may span 2 args: date and time)
     if (args.len >= 2) {
@@ -619,7 +635,7 @@ fn parse_timestamp(args: [][]u8) i64 {
     }
 
     // Fallback: integer nanoseconds
-    return std.fmt.parseInt(i64, args[0], 10) catch 0;
+    return std.fmt.parseInt(i64, args[0], 10) catch null;
 }
 
 fn parse_datetime(date_str: []const u8, time_str: []const u8) ?i64 {
@@ -639,41 +655,12 @@ fn parse_datetime(date_str: []const u8, time_str: []const u8) ?i64 {
     if (month < 1 or month > 12 or day < 1 or day > 31) return null;
     if (hour > 23 or minute > 59 or second > 59) return null;
 
-    // Days from epoch (1970-01-01) to date
-    const epoch_seconds = datetime_to_epoch(year, month, day, hour, minute, second);
-    return epoch_seconds * 1_000_000_000; // Convert to nanoseconds
+    const epoch_seconds = datetime_to_epoch(year, month, day, hour, minute, second) orelse return null;
+    return epoch_seconds * 1_000_000_000;
 }
 
-fn datetime_to_epoch(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) i64 {
-    // Days in each month (non-leap)
-    const days_in_month = [_]u16{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-
-    var days: i64 = 0;
-    // Years since 1970
-    var y: u16 = 1970;
-    while (y < year) : (y += 1) {
-        days += if (is_leap_year(y)) @as(i64, 366) else @as(i64, 365);
-    }
-    // Months
-    var m: u8 = 1;
-    while (m < month) : (m += 1) {
-        days += days_in_month[m - 1];
-        if (m == 2 and is_leap_year(year)) days += 1;
-    }
-    // Days (1-indexed)
-    days += day - 1;
-
-    return days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
-}
-
-fn is_leap_year(year: u16) bool {
-    return (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0);
-}
-
-fn is_namespace_authorized(client_id: u128, instr: instruction.Instruction) bool {
-    _ = client_id;
-    _ = instr;
-    return true;
+fn datetime_to_epoch(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) ?i64 {
+    return domain.timestamp.to_epoch_seconds(year, month, day, hour, minute, second) catch null;
 }
 
 fn free_instruction_strings(allocator: std.mem.Allocator, instr: instruction.Instruction) void {
@@ -774,7 +761,7 @@ test "response router registers and deregisters clients" {
     defer response_ch.deinit();
 
     const client_id = @as(query.Client, 42);
-    router.register(client_id, &response_ch);
+    try router.register(client_id, &response_ch);
 
     const req = query.Request{
         .client = client_id,
@@ -791,41 +778,34 @@ test "response router registers and deregisters clients" {
 }
 
 test "parse_timestamp parses integer nanoseconds" {
-    const allocator = std.testing.allocator;
-    var args_list = std.ArrayListUnmanaged([]u8){};
-    defer args_list.deinit(allocator);
-    try args_list.append(allocator, @constCast("1234567890"));
+    var buf = [_]u8{ '1', '2', '3', '4', '5', '6', '7', '8', '9', '0' };
+    var args = [_][]u8{&buf};
 
-    const ts = parse_timestamp(args_list.items);
-    try std.testing.expectEqual(@as(i64, 1234567890), ts);
+    const ts = parse_timestamp(&args);
+    try std.testing.expectEqual(@as(i64, 1234567890), ts.?);
 }
 
 test "parse_timestamp parses datetime format" {
-    const allocator = std.testing.allocator;
-    var args_list = std.ArrayListUnmanaged([]u8){};
-    defer args_list.deinit(allocator);
-    try args_list.append(allocator, @constCast("1970-01-01"));
-    try args_list.append(allocator, @constCast("00:00:00"));
+    var date_buf: [10]u8 = "1970-01-01".*;
+    var time_buf: [8]u8 = "00:00:00".*;
+    var args = [_][]u8{ &date_buf, &time_buf };
 
-    const ts = parse_timestamp(args_list.items);
-    try std.testing.expectEqual(@as(i64, 0), ts);
+    const ts = parse_timestamp(&args);
+    try std.testing.expectEqual(@as(i64, 0), ts.?);
 }
 
-test "parse_timestamp returns zero on invalid input" {
-    const allocator = std.testing.allocator;
-    var args_list = std.ArrayListUnmanaged([]u8){};
-    defer args_list.deinit(allocator);
-    try args_list.append(allocator, @constCast("invalid"));
+test "parse_timestamp returns null on invalid input" {
+    var buf: [7]u8 = "invalid".*;
+    var args = [_][]u8{&buf};
 
-    const ts = parse_timestamp(args_list.items);
-    try std.testing.expectEqual(@as(i64, 0), ts);
+    const ts = parse_timestamp(&args);
+    try std.testing.expectEqual(@as(?i64, null), ts);
 }
 
 test "tcp server init stores address" {
     var running = std.atomic.Value(bool).init(true);
     var active = std.atomic.Value(usize).init(0);
-    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active, null);
-    defer server.deinit();
+    const server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active, null);
     try std.testing.expectEqualStrings("127.0.0.1:5678", server.address);
 }
 
@@ -1295,7 +1275,7 @@ test "response router drops response on full channel without crash" {
     defer ch.deinit();
 
     const client_id = @as(query.Client, 5);
-    router.register(client_id, &ch);
+    try router.register(client_id, &ch);
 
     const req = query.Request{
         .client = client_id,
@@ -1521,8 +1501,7 @@ test "handle_connection accepts plain Connection and exits cleanly" {
 test "tcp server initializes with null instruments" {
     var running = std.atomic.Value(bool).init(true);
     var active = std.atomic.Value(usize).init(0);
-    var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active, null);
-    defer server.deinit();
+    const server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active, null);
     try std.testing.expectEqual(@as(?telemetry.Instruments, null), server.instruments);
 }
 
@@ -1531,7 +1510,6 @@ test "tcp server set_instruments makes instruments non-null" {
     var running = std.atomic.Value(bool).init(true);
     var active = std.atomic.Value(usize).init(0);
     var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active, null);
-    defer server.deinit();
 
     const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator);
     defer meter_provider.shutdown();

@@ -27,8 +27,16 @@ pub const RuleStorage = struct {
         try self.rules.put(self.allocator, rule.identifier, rule);
     }
 
+    pub fn count(self: *const RuleStorage) usize {
+        return self.rules.count();
+    }
+
     pub fn delete(self: *RuleStorage, identifier: []const u8) bool {
         return self.rules.remove(identifier);
+    }
+
+    pub fn valueIterator(self: *const RuleStorage) std.StringHashMapUnmanaged(Rule).ValueIterator {
+        return self.rules.valueIterator();
     }
 
     pub fn pair(self: *const RuleStorage, job: []const u8) ?Rule {
@@ -50,9 +58,7 @@ pub const RuleStorage = struct {
 };
 
 test "set and get" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = RuleStorage.init(allocator);
     defer storage.deinit();
@@ -66,9 +72,7 @@ test "set and get" {
 }
 
 test "set overwrites existing rule" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = RuleStorage.init(allocator);
     defer storage.deinit();
@@ -82,9 +86,7 @@ test "set overwrites existing rule" {
 }
 
 test "delete removes rule" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = RuleStorage.init(allocator);
     defer storage.deinit();
@@ -98,9 +100,7 @@ test "delete removes rule" {
 }
 
 test "pair returns highest-weight matching rule" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = RuleStorage.init(allocator);
     defer storage.deinit();
@@ -114,9 +114,7 @@ test "pair returns highest-weight matching rule" {
 }
 
 test "pair returns null when no rule matches" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = RuleStorage.init(allocator);
     defer storage.deinit();

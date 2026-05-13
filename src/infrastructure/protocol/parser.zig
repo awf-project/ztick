@@ -29,7 +29,15 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) (ParseError || std
 
     if (pos == input.len) return ParseError.Incomplete;
     if (input[pos] == '\n') {
-        return ParseError.Invalid;
+        // Command with no arguments (e.g. "QUERY\n") is valid; return empty args.
+        pos += 1; // skip '\n'
+        var empty = std.ArrayListUnmanaged([]u8){};
+        const args = try empty.toOwnedSlice(allocator);
+        return ParseResult{
+            .command = command,
+            .args = args,
+            .remaining = input[pos..],
+        };
     }
 
     var args_list = std.ArrayListUnmanaged([]u8){};

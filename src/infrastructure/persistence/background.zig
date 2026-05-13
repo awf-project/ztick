@@ -6,20 +6,21 @@ pub const TaskError = error{Failure};
 pub const TaskResult = TaskError!void;
 
 pub const Status = union(enum) {
-    success,
+    success: struct {},
     failure: TaskError,
-    running,
+    running: struct {},
 };
 
 pub const Process = struct {
     allocator: std.mem.Allocator,
-    thread: std.Thread,
+    thread: ?std.Thread,
     result: ?TaskResult,
     mutex: std.Thread.Mutex,
+    joined: bool,
 
     pub fn execute(allocator: std.mem.Allocator, task: anytype) !*Process {
         const proc = try allocator.create(Process);
-        proc.* = .{ .allocator = allocator, .thread = undefined, .result = null, .mutex = .{} };
+        proc.* = .{ .allocator = allocator, .thread = null, .result = null, .mutex = .{}, .joined = false };
         proc.thread = try std.Thread.spawn(.{}, struct {
             fn run(p: *Process, t: @TypeOf(task)) void {
                 const r = t();
@@ -32,14 +33,17 @@ pub const Process = struct {
     }
 
     pub fn deinit(self: *Process) void {
+        if (!self.joined) {
+            if (self.thread) |t| t.join();
+        }
         self.allocator.destroy(self);
     }
 
     pub fn status(self: *Process) Status {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const r = self.result orelse return .running;
-        if (r) |_| return .success else |err| return .{ .failure = err };
+        const r = self.result orelse return .{ .running = .{} };
+        if (r) |_| return .{ .success = .{} } else |err| return .{ .failure = err };
     }
 };
 
@@ -50,20 +54,61 @@ pub const Filenames = struct {
 };
 
 pub fn compress(allocator: std.mem.Allocator, dir: std.fs.Dir, filenames: Filenames) TaskResult {
-    const content = dir.readFileAlloc(
-        allocator,
-        filenames.source,
-        std.math.maxInt(usize),
-    ) catch return error.Failure;
-    defer allocator.free(content);
+    // Read source file incrementally to avoid loading entire file into memory (NFR-001).
+    const source_file = dir.openFile(filenames.source, .{}) catch |err| {
+        std.log.err("compression: failed to open source '{s}': {}", .{ filenames.source, err });
+        return error.Failure;
+    };
+    defer source_file.close();
 
-    const parsed = logfile.parse(allocator, content) catch return error.Failure;
+    var all_entries = std.ArrayListUnmanaged([]u8){};
     defer {
-        for (parsed.entries) |e| allocator.free(e);
-        allocator.free(parsed.entries);
+        for (all_entries.items) |e| allocator.free(e);
+        all_entries.deinit(allocator);
     }
 
-    const entry_ids = allocator.alloc(?[]const u8, parsed.entries.len) catch return error.Failure;
+    {
+        var carry = std.ArrayListUnmanaged(u8){};
+        defer carry.deinit(allocator);
+
+        var read_buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = source_file.read(&read_buf) catch |err| {
+                std.log.err("compression: read failed on '{s}': {}", .{ filenames.source, err });
+                return error.Failure;
+            };
+            if (n == 0) break;
+            carry.appendSlice(allocator, read_buf[0..n]) catch |err| {
+                std.log.err("compression: out of memory reading '{s}': {}", .{ filenames.source, err });
+                return error.Failure;
+            };
+
+            const parsed = logfile.parse(allocator, carry.items) catch |err| {
+                std.log.err("compression: parse failed on '{s}': {}", .{ filenames.source, err });
+                return error.Failure;
+            };
+            for (parsed.entries) |e| {
+                all_entries.append(allocator, e) catch |err| {
+                    allocator.free(e);
+                    allocator.free(parsed.entries);
+                    std.log.err("compression: out of memory accumulating entries: {}", .{err});
+                    return error.Failure;
+                };
+            }
+            allocator.free(parsed.entries);
+
+            const rem = parsed.remaining;
+            if (rem.len > 0) {
+                std.mem.copyForwards(u8, carry.items[0..rem.len], rem);
+            }
+            carry.shrinkRetainingCapacity(rem.len);
+        }
+    }
+
+    const entry_ids = allocator.alloc(?[]const u8, all_entries.items.len) catch |err| {
+        std.log.err("compression: out of memory allocating entry_ids: {}", .{err});
+        return error.Failure;
+    };
     defer {
         for (entry_ids) |maybe_id| if (maybe_id) |id| allocator.free(id);
         allocator.free(entry_ids);
@@ -78,22 +123,30 @@ pub fn compress(allocator: std.mem.Allocator, dir: std.fs.Dir, filenames: Filena
     var removed_ids = std.StringHashMap(void).init(allocator);
     defer removed_ids.deinit();
 
-    for (parsed.entries, 0..) |entry, i| {
-        const decoded = encoder.decode(allocator, entry) catch {
+    for (all_entries.items, 0..) |entry, i| {
+        const decoded = encoder.decode(allocator, entry) catch |err| {
+            std.log.warn("compression: failed to decode frame {d}: {}", .{ i, err });
             entry_ids[i] = null;
             continue;
         };
-        encoder.free_entry_fields(decoded, allocator);
         const id = switch (decoded) {
             .job => |j| j.identifier,
             .rule => |r| r.identifier,
             .job_removal => |r| r.identifier,
             .rule_removal => |r| r.identifier,
         };
+        // free_entry_fields frees all fields except identifier (caller-owned)
+        encoder.free_entry_fields(decoded, allocator);
         entry_ids[i] = id;
-        last_index.put(id, i) catch return error.Failure;
+        last_index.put(id, i) catch |err| {
+            std.log.err("compression: out of memory updating last_index: {}", .{err});
+            return error.Failure;
+        };
         switch (decoded) {
-            .job_removal, .rule_removal => removed_ids.put(id, {}) catch return error.Failure,
+            .job_removal, .rule_removal => removed_ids.put(id, {}) catch |err| {
+                std.log.err("compression: out of memory updating removed_ids: {}", .{err});
+                return error.Failure;
+            },
             else => _ = removed_ids.remove(id),
         }
     }
@@ -102,25 +155,46 @@ pub fn compress(allocator: std.mem.Allocator, dir: std.fs.Dir, filenames: Filena
     var out = std.ArrayListUnmanaged(u8){};
     defer out.deinit(allocator);
 
-    for (parsed.entries, 0..) |entry, i| {
+    for (all_entries.items, 0..) |entry, i| {
         const maybe_id = entry_ids[i];
         if (maybe_id) |id| {
             const last = last_index.get(id) orelse continue;
             if (last != i) continue;
             if (removed_ids.contains(id)) continue;
         }
-        const framed = logfile.encode(allocator, entry) catch return error.Failure;
+        const framed = logfile.encode(allocator, entry) catch |err| {
+            std.log.err("compression: failed to encode frame {d}: {}", .{ i, err });
+            return error.Failure;
+        };
         defer allocator.free(framed);
-        out.appendSlice(allocator, framed) catch return error.Failure;
+        out.appendSlice(allocator, framed) catch |err| {
+            std.log.err("compression: out of memory writing output: {}", .{err});
+            return error.Failure;
+        };
     }
 
     {
-        const f = dir.createFile(filenames.tmp, .{}) catch return error.Failure;
+        const f = dir.createFile(filenames.tmp, .{}) catch |err| {
+            std.log.err("compression: failed to create tmp file '{s}': {}", .{ filenames.tmp, err });
+            return error.Failure;
+        };
         defer f.close();
-        f.writeAll(out.items) catch return error.Failure;
+        f.writeAll(out.items) catch |err| {
+            std.log.err("compression: failed to write tmp file '{s}': {}", .{ filenames.tmp, err });
+            return error.Failure;
+        };
     }
-    dir.rename(filenames.tmp, filenames.dest) catch return error.Failure;
-    dir.deleteFile(filenames.source) catch return error.Failure;
+    if (dir.statFile(filenames.dest)) |_| {
+        std.log.warn("compression: overwriting existing '{s}'", .{filenames.dest});
+    } else |_| {}
+    dir.rename(filenames.tmp, filenames.dest) catch |err| {
+        std.log.err("compression: failed to rename '{s}' to '{s}': {}", .{ filenames.tmp, filenames.dest, err });
+        return error.Failure;
+    };
+    dir.deleteFile(filenames.source) catch |err| {
+        std.log.err("compression: failed to delete source '{s}': {}", .{ filenames.source, err });
+        return error.Failure;
+    };
 }
 
 test "execute successful task reports success" {
@@ -129,8 +203,9 @@ test "execute successful task reports success" {
             return {};
         }
     }.run);
-    proc.thread.join();
-    try std.testing.expectEqual(Status.success, proc.status());
+    proc.thread.?.join();
+    proc.joined = true;
+    try std.testing.expectEqual(Status{ .success = .{} }, proc.status());
     proc.deinit();
 }
 
@@ -140,7 +215,8 @@ test "execute failing task reports failure" {
             return error.Failure;
         }
     }.run);
-    proc.thread.join();
+    proc.thread.?.join();
+    proc.joined = true;
     try std.testing.expect(proc.status() == .failure);
     proc.deinit();
 }
@@ -159,8 +235,9 @@ test "status returns running before task completes" {
     var proc = try Process.execute(std.testing.allocator, Gate.task);
     const s = proc.status();
     Gate.gate.store(true, .release);
-    proc.thread.join();
-    try std.testing.expectEqual(Status.running, s);
+    proc.thread.?.join();
+    proc.joined = true;
+    try std.testing.expectEqual(Status{ .running = .{} }, s);
     proc.deinit();
 }
 

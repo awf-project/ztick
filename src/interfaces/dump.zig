@@ -164,11 +164,11 @@ fn entry_identifier(entry: Entry) []const u8 {
     };
 }
 
-var follow_running_ptr: ?*std.atomic.Value(bool) = null;
+var follow_running_ptr: std.atomic.Value(?*std.atomic.Value(bool)) = std.atomic.Value(?*std.atomic.Value(bool)).init(null);
 
 fn follow_signal_handler(sig: c_int) callconv(.c) void {
     _ = sig;
-    if (follow_running_ptr) |ptr| {
+    if (follow_running_ptr.load(.acquire)) |ptr| {
         ptr.store(false, .release);
     }
 }
@@ -192,6 +192,11 @@ fn follow_loop(allocator: std.mem.Allocator, options: cli.DumpOptions, initial_o
     while (running.load(.acquire)) {
         const stat = try file.stat();
 
+        if (stat.size < offset) {
+            // File was truncated or rotated — reset to beginning
+            offset = 0;
+        }
+
         if (stat.size > offset) {
             try file.seekTo(offset);
             const new_data = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
@@ -204,12 +209,15 @@ fn follow_loop(allocator: std.mem.Allocator, options: cli.DumpOptions, initial_o
 
             for (parse_result.entries, 0..) |frame, i| {
                 const entry = infrastructure.persistence.encoder.decode(arena.allocator(), frame) catch |err| {
-                    const stderr = std.fs.File.stderr().deprecatedWriter();
-                    stderr.print("warning: failed to decode frame {d}: {}\n", .{ i, err }) catch {};
+                    var ebuf: [256]u8 = undefined;
+                    var ew = std.fs.File.stderr().writer(&ebuf);
+                    ew.interface.print("warning: failed to decode frame {d}: {}\n", .{ i, err }) catch {};
+                    ew.interface.flush() catch {};
                     continue;
                 };
                 try write_entry(writer, entry, options.format);
             }
+            writer.flush() catch {};
 
             offset += new_data.len - parse_result.remaining.len;
         }
@@ -222,8 +230,10 @@ fn write_compact_entries(writer: anytype, frames: []const []u8, format: cli.Form
     var entries = std.ArrayListUnmanaged(Entry){};
     for (frames, 0..) |frame, i| {
         const entry = infrastructure.persistence.encoder.decode(arena_allocator, frame) catch |err| {
-            const stderr = std.fs.File.stderr().deprecatedWriter();
-            stderr.print("warning: failed to decode frame {d}: {}\n", .{ i, err }) catch {};
+            var ebuf: [256]u8 = undefined;
+            var ew = std.fs.File.stderr().writer(&ebuf);
+            ew.interface.print("warning: failed to decode frame {d}: {}\n", .{ i, err }) catch {};
+            ew.interface.flush() catch {};
             continue;
         };
         try entries.append(arena_allocator, entry);
@@ -262,29 +272,35 @@ pub fn run_dump(allocator: std.mem.Allocator, options: cli.DumpOptions) !void {
     const parse_result = try infrastructure.persistence.logfile.parse(arena.allocator(), data);
 
     if (parse_result.remaining.len > 0) {
-        const stderr = std.fs.File.stderr().deprecatedWriter();
-        stderr.print("warning: partial trailing frame ({d} bytes) ignored\n", .{parse_result.remaining.len}) catch {};
+        var ebuf: [128]u8 = undefined;
+        var ew = std.fs.File.stderr().writer(&ebuf);
+        ew.interface.print("warning: partial trailing frame ({d} bytes) ignored\n", .{parse_result.remaining.len}) catch {};
+        ew.interface.flush() catch {};
     }
 
-    const stdout = std.fs.File.stdout().deprecatedWriter();
+    var outbuf: [4096]u8 = undefined;
+    var out = std.fs.File.stdout().writer(&outbuf);
 
     if (options.compact) {
-        try write_compact_entries(stdout, parse_result.entries, options.format, arena.allocator());
+        try write_compact_entries(&out.interface, parse_result.entries, options.format, arena.allocator());
     } else {
         for (parse_result.entries, 0..) |frame, i| {
             const entry = infrastructure.persistence.encoder.decode(arena.allocator(), frame) catch |err| {
-                const stderr = std.fs.File.stderr().deprecatedWriter();
-                stderr.print("warning: failed to decode frame {d}: {}\n", .{ i, err }) catch {};
+                var ebuf: [256]u8 = undefined;
+                var ew = std.fs.File.stderr().writer(&ebuf);
+                ew.interface.print("warning: failed to decode frame {d}: {}\n", .{ i, err }) catch {};
+                ew.interface.flush() catch {};
                 continue;
             };
-            try write_entry(stdout, entry, options.format);
+            try write_entry(&out.interface, entry, options.format);
         }
     }
+    out.interface.flush() catch {};
 
     if (options.follow) {
         var follow_running = std.atomic.Value(bool).init(true);
-        follow_running_ptr = &follow_running;
-        try follow_loop(allocator, options, data.len - parse_result.remaining.len, stdout, &follow_running);
+        follow_running_ptr.store(&follow_running, .release);
+        try follow_loop(allocator, options, data.len - parse_result.remaining.len, &out.interface, &follow_running);
     }
 }
 

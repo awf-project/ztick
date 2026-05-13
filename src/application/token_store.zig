@@ -21,23 +21,68 @@ pub const TokenStore = struct {
     }
 
     pub fn deinit(self: *TokenStore) void {
+        var it = self.tokens.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.name);
+            self.allocator.free(entry.value_ptr.namespace);
+        }
         self.tokens.deinit(self.allocator);
     }
 
     pub fn load(self: *TokenStore, tokens: []const Token) !void {
+        // Validate entire slice before inserting anything to prevent partial state on error.
         for (tokens) |token| {
             if (token.namespace.len == 0) return TokenStoreError.EmptyNamespace;
-            const gop = try self.tokens.getOrPut(self.allocator, token.secret);
-            if (gop.found_existing) return TokenStoreError.DuplicateSecret;
+        }
+        for (tokens, 0..) |a, i| {
+            for (tokens[0..i]) |b| {
+                if (std.mem.eql(u8, a.secret, b.secret)) return TokenStoreError.DuplicateSecret;
+            }
+        }
+
+        for (tokens) |token| {
+            const secret_key = try self.allocator.dupe(u8, token.secret);
+
+            const gop = self.tokens.getOrPut(self.allocator, secret_key) catch |err| {
+                self.allocator.free(secret_key);
+                return err;
+            };
+
+            const name_copy = self.allocator.dupe(u8, token.name) catch |err| {
+                if (!gop.found_existing) self.tokens.removeByPtr(gop.key_ptr);
+                self.allocator.free(secret_key);
+                return err;
+            };
+
+            const ns_copy = self.allocator.dupe(u8, token.namespace) catch |err| {
+                if (!gop.found_existing) self.tokens.removeByPtr(gop.key_ptr);
+                self.allocator.free(secret_key);
+                self.allocator.free(name_copy);
+                return err;
+            };
+
+            if (gop.found_existing) {
+                // Secret already present (e.g. calling load() again); free the duplicate key.
+                self.allocator.free(secret_key);
+            }
+
             gop.value_ptr.* = ClientIdentity{
-                .name = token.name,
-                .namespace = token.namespace,
+                .name = name_copy,
+                .namespace = ns_copy,
             };
         }
     }
 
     pub fn authenticate(self: *const TokenStore, secret: []const u8) ?ClientIdentity {
-        return self.tokens.get(secret);
+        var it = self.tokens.iterator();
+        var result: ?ClientIdentity = null;
+        while (it.next()) |entry| {
+            if (domain.auth.constant_time_eql(entry.key_ptr.*, secret)) {
+                result = entry.value_ptr.*;
+            }
+        }
+        return result;
     }
 
     pub fn is_authorized(identity: ClientIdentity, identifier: []const u8) bool {

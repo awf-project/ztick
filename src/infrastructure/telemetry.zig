@@ -1,9 +1,13 @@
 const std = @import("std");
 const sdk = @import("opentelemetry");
-const config = @import("../interfaces/config.zig");
+const domain = @import("../domain.zig");
 const version_info = @import("../version.zig");
+const app_instruments = @import("../application/instruments.zig");
 
-pub const Span = sdk.api.trace.Span;
+/// Re-exported from application/instruments.zig to avoid application → infrastructure imports.
+pub const Span = app_instruments.Span;
+/// Re-exported from application/instruments.zig to avoid application → infrastructure imports.
+pub const Instruments = app_instruments.Instruments;
 
 pub const TelemetryError = error{
     SetupFailed,
@@ -19,13 +23,13 @@ const Pb = struct {
         for (@typeInfo(U).@"union".fields) |f| {
             if (std.mem.eql(u8, f.name, name)) return f.type;
         }
-        unreachable;
+        @compileError("union field not found: " ++ name);
     }
     fn field(comptime S: type, comptime name: []const u8) type {
         for (@typeInfo(S).@"struct".fields) |f| {
             if (std.mem.eql(u8, f.name, name)) return f.type;
         }
-        unreachable;
+        @compileError("struct field not found: " ++ name);
     }
     fn child(comptime L: type) type {
         return @typeInfo(field(L, "items")).pointer.child;
@@ -246,7 +250,7 @@ pub const Providers = struct {
     }
 };
 
-pub fn setup(allocator: std.mem.Allocator, cfg: config.TelemetryConfig) !?*Providers {
+pub fn setup(allocator: std.mem.Allocator, cfg: domain.telemetry_config.TelemetryConfig) !?*Providers {
     if (!cfg.enabled) return null;
 
     const endpoint_url = cfg.endpoint orelse return error.SetupFailed;
@@ -326,17 +330,6 @@ pub fn setup(allocator: std.mem.Allocator, cfg: config.TelemetryConfig) !?*Provi
     return providers;
 }
 
-pub const Instruments = struct {
-    jobs_scheduled: *sdk.metrics.Counter(u64),
-    jobs_executed: *sdk.metrics.Counter(u64),
-    jobs_removed: *sdk.metrics.Counter(u64),
-    persistence_compactions: *sdk.metrics.Counter(u64),
-    execution_duration_ms: *sdk.metrics.Histogram(f64),
-    rules_active: *sdk.metrics.UpDownCounter(i64),
-    connections_active: *sdk.metrics.UpDownCounter(i64),
-    tracer: *sdk.api.trace.TracerImpl,
-};
-
 pub fn createInstruments(meter_provider: *sdk.metrics.MeterProvider, tracer_provider: *sdk.trace.TracerProvider) !Instruments {
     const meter = try meter_provider.getMeter(.{ .name = "ztick" });
     const tracer = try tracer_provider.getTracer(.{ .name = "ztick" });
@@ -396,7 +389,7 @@ test "createInstruments returns callable up-down counter instruments" {
 }
 
 test "setup returns null when telemetry is disabled" {
-    const cfg = config.TelemetryConfig{
+    const cfg = domain.telemetry_config.TelemetryConfig{
         .enabled = false,
         .endpoint = null,
         .service_name = "ztick",
@@ -408,7 +401,7 @@ test "setup returns null when telemetry is disabled" {
 
 test "setup returns initialized providers when telemetry is enabled" {
     const endpoint = "http://localhost:4318";
-    const cfg = config.TelemetryConfig{
+    const cfg = domain.telemetry_config.TelemetryConfig{
         .enabled = true,
         .endpoint = endpoint,
         .service_name = "ztick",
@@ -421,7 +414,7 @@ test "setup returns initialized providers when telemetry is enabled" {
 
 test "setup with custom flush interval initializes without error" {
     const endpoint = "http://collector:4318";
-    const cfg = config.TelemetryConfig{
+    const cfg = domain.telemetry_config.TelemetryConfig{
         .enabled = true,
         .endpoint = endpoint,
         .service_name = "my-service",

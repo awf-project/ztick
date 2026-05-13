@@ -9,7 +9,7 @@ pub const Request = struct {
     instruction: instruction.Instruction,
 };
 
-pub const ErrorCode = enum {
+pub const ResponseError = enum {
     not_found,
     auth_required,
     auth_failed,
@@ -22,7 +22,7 @@ pub const Response = struct {
     request: Request,
     success: bool,
     body: ?[]const u8 = null,
-    error_code: ?ErrorCode = null,
+    error_code: ?ResponseError = null,
     error_message: ?[]const u8 = null,
 };
 
@@ -59,12 +59,12 @@ test "query response body defaults to null" {
 }
 
 test "error code tag names match wire protocol" {
-    try std.testing.expectEqualStrings("not_found", @tagName(ErrorCode.not_found));
-    try std.testing.expectEqualStrings("auth_required", @tagName(ErrorCode.auth_required));
-    try std.testing.expectEqualStrings("auth_failed", @tagName(ErrorCode.auth_failed));
-    try std.testing.expectEqualStrings("auth_denied", @tagName(ErrorCode.auth_denied));
-    try std.testing.expectEqualStrings("invalid_args", @tagName(ErrorCode.invalid_args));
-    try std.testing.expectEqualStrings("internal", @tagName(ErrorCode.internal));
+    try std.testing.expectEqualStrings("not_found", @tagName(ResponseError.not_found));
+    try std.testing.expectEqualStrings("auth_required", @tagName(ResponseError.auth_required));
+    try std.testing.expectEqualStrings("auth_failed", @tagName(ResponseError.auth_failed));
+    try std.testing.expectEqualStrings("auth_denied", @tagName(ResponseError.auth_denied));
+    try std.testing.expectEqualStrings("invalid_args", @tagName(ResponseError.invalid_args));
+    try std.testing.expectEqualStrings("internal", @tagName(ResponseError.internal));
 }
 
 test "response error fields default to null" {
@@ -74,7 +74,7 @@ test "response error fields default to null" {
         .instruction = .{ .set = .{ .identifier = "job.10", .execution = 0 } },
     };
     const resp = Response{ .request = req, .success = false };
-    try std.testing.expectEqual(@as(?ErrorCode, null), resp.error_code);
+    try std.testing.expectEqual(@as(?ResponseError, null), resp.error_code);
     try std.testing.expectEqual(@as(?[]const u8, null), resp.error_message);
 }
 
@@ -90,7 +90,7 @@ test "response carries error code and message" {
         .error_code = .not_found,
         .error_message = "job \"x\" does not exist",
     };
-    try std.testing.expectEqual(ErrorCode.not_found, resp.error_code.?);
+    try std.testing.expectEqual(ResponseError.not_found, resp.error_code.?);
     try std.testing.expectEqualStrings("job \"x\" does not exist", resp.error_message.?);
 }
 

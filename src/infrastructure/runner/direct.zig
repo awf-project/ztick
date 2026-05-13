@@ -1,5 +1,6 @@
 const std = @import("std");
 const domain = @import("../../domain.zig");
+const subprocess = @import("subprocess.zig");
 
 const execution = domain.execution;
 
@@ -10,24 +11,7 @@ pub fn execute(allocator: std.mem.Allocator, payload: anytype, request: executio
     defer allocator.free(args);
     args[0] = payload.executable;
     @memcpy(args[1..], payload.args);
-
-    var child = std.process.Child.init(args, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch {
-        return .{ .identifier = request.identifier, .success = false };
-    };
-
-    const term = child.wait() catch {
-        return .{ .identifier = request.identifier, .success = false };
-    };
-    const success = switch (term) {
-        .Exited => |code| code == 0,
-        else => false,
-    };
-
-    return .{ .identifier = request.identifier, .success = success };
+    return subprocess.run(allocator, args, request.identifier);
 }
 
 test "direct runner executes binary without shell wrapper" {

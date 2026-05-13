@@ -50,23 +50,17 @@ pub const JobStorage = struct {
         }
     }
 
-    pub fn get_to_execute(self: *const JobStorage, current_time: i64, allocator: std.mem.Allocator) ![]Job {
+    pub fn get_to_execute(self: *JobStorage, current_time: i64, allocator: std.mem.Allocator) ![]Job {
         var result = std.ArrayListUnmanaged(Job){};
         errdefer result.deinit(allocator);
 
-        for (self.to_execute.items) |job| {
-            if (job.execution <= current_time) {
-                try result.append(allocator, job);
-            }
+        while (self.to_execute.count() > 0) {
+            const top = self.to_execute.peek().?;
+            if (top.execution > current_time) break;
+            try result.append(allocator, self.to_execute.remove());
         }
 
-        const slice = try result.toOwnedSlice(allocator);
-        std.mem.sort(Job, slice, {}, struct {
-            fn less_than(_: void, a: Job, b: Job) bool {
-                return a.execution < b.execution;
-            }
-        }.less_than);
-        return slice;
+        return result.toOwnedSlice(allocator);
     }
 
     pub fn get_by_prefix(self: *const JobStorage, prefix: []const u8, allocator: std.mem.Allocator) ![]Job {
@@ -89,6 +83,29 @@ pub const JobStorage = struct {
         return true;
     }
 
+    pub fn count(self: *const JobStorage) usize {
+        return self.jobs.count();
+    }
+
+    pub fn count_by_status(self: *const JobStorage) struct { planned: usize, triggered: usize, executed: usize, failed: usize } {
+        var planned: usize = 0;
+        var triggered: usize = 0;
+        var executed: usize = 0;
+        var failed: usize = 0;
+
+        var it = self.jobs.valueIterator();
+        while (it.next()) |job| {
+            switch (job.status) {
+                .planned => planned += 1,
+                .triggered => triggered += 1,
+                .executed => executed += 1,
+                .failed => failed += 1,
+            }
+        }
+
+        return .{ .planned = planned, .triggered = triggered, .executed = executed, .failed = failed };
+    }
+
     pub fn get_by_status(self: *const JobStorage, status: JobStatus, allocator: std.mem.Allocator) ![]Job {
         var result = std.ArrayListUnmanaged(Job){};
         errdefer result.deinit(allocator);
@@ -105,9 +122,7 @@ pub const JobStorage = struct {
 };
 
 test "set and get" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -121,9 +136,7 @@ test "set and get" {
 }
 
 test "set overwrites existing job" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -137,9 +150,7 @@ test "set overwrites existing job" {
 }
 
 test "get_to_execute returns planned jobs ordered by execution time" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -158,9 +169,7 @@ test "get_to_execute returns planned jobs ordered by execution time" {
 }
 
 test "get_by_prefix returns jobs matching prefix" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -176,9 +185,7 @@ test "get_by_prefix returns jobs matching prefix" {
 }
 
 test "get_by_prefix returns empty slice for no match" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -192,9 +199,7 @@ test "get_by_prefix returns empty slice for no match" {
 }
 
 test "get_by_prefix with empty prefix returns all jobs" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -210,9 +215,7 @@ test "get_by_prefix with empty prefix returns all jobs" {
 }
 
 test "delete returns true and removes existing job" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -225,9 +228,7 @@ test "delete returns true and removes existing job" {
 }
 
 test "delete removes job from to_execute list" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -241,9 +242,7 @@ test "delete removes job from to_execute list" {
 }
 
 test "delete returns false for nonexistent job" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -253,9 +252,7 @@ test "delete returns false for nonexistent job" {
 }
 
 test "get_to_execute returns empty slice when storage is empty" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -266,9 +263,7 @@ test "get_to_execute returns empty slice when storage is empty" {
 }
 
 test "get_to_execute returns empty slice when no jobs are due" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -282,9 +277,7 @@ test "get_to_execute returns empty slice when no jobs are due" {
 }
 
 test "set does not add job to to_execute when status is not planned" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();
@@ -297,9 +290,7 @@ test "set does not add job to to_execute when status is not planned" {
 }
 
 test "get_by_status filters by status" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var storage = JobStorage.init(allocator);
     defer storage.deinit();

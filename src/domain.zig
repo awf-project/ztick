@@ -6,3 +6,6 @@ pub const instruction = @import("domain/instruction.zig");
 pub const query = @import("domain/query.zig");
 pub const execution = @import("domain/execution.zig");
 pub const server_stats = @import("domain/server_stats.zig");
+pub const timestamp = @import("domain/timestamp.zig");
+pub const shell_config = @import("domain/shell_config.zig");
+pub const telemetry_config = @import("domain/telemetry_config.zig");

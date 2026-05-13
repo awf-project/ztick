@@ -18,7 +18,8 @@ const protocol_parser = @import("infrastructure/protocol/parser.zig");
 const Channel = infrastructure_channel.Channel;
 const Clock = infrastructure_clock.Clock;
 
-const Scheduler = application_scheduler.Scheduler;
+const BackendState = persistence_backend.BackendState;
+const Scheduler = application_scheduler.SchedulerWith(BackendState);
 const Job = domain_job.Job;
 const JobStatus = domain_job.JobStatus;
 const Rule = domain_rule.Rule;
@@ -54,7 +55,7 @@ test "scheduler processes job from query to executed" {
     try std.testing.expectEqual(JobStatus.triggered, triggered.?.status);
 
     for (scheduler.execution_client.pending.items) |req| {
-        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
+        try scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
     }
     scheduler.execution_client.pending.clearRetainingCapacity();
 
@@ -159,7 +160,7 @@ test "rule set via query enables subsequent job execution" {
     try std.testing.expectEqual(JobStatus.triggered, scheduler.job_storage.get("deploy.release.1").?.status);
 
     for (scheduler.execution_client.pending.items) |req| {
-        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
+        try scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
     }
     scheduler.execution_client.pending.clearRetainingCapacity();
 
@@ -233,7 +234,7 @@ test "persisted state restores into scheduler and resumes execution" {
     try std.testing.expectEqual(JobStatus.triggered, scheduler.job_storage.get("app.restore.1").?.status);
 
     for (scheduler.execution_client.pending.items) |req| {
-        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
+        try scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
     }
     scheduler.execution_client.pending.clearRetainingCapacity();
 
@@ -729,7 +730,7 @@ const TestServer = struct {
     }
 
     fn stop(self: *TestServer) void {
-        _ = self.child.kill() catch {};
+        std.posix.kill(self.child.id, std.posix.SIG.KILL) catch {};
         _ = self.child.wait() catch {};
         self.allocator.free(self.config_path);
         self.tmp_dir.cleanup();
@@ -1062,7 +1063,7 @@ test "execution failure marks triggered job as failed" {
     try std.testing.expectEqual(JobStatus.triggered, scheduler.job_storage.get("deploy.release.1").?.status);
 
     for (scheduler.execution_client.pending.items) |req| {
-        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = false });
+        try scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = false });
     }
     scheduler.execution_client.pending.clearRetainingCapacity();
 
@@ -1853,7 +1854,7 @@ test "memory backend SET and GET round-trip returns planned job" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -1876,7 +1877,7 @@ test "memory backend data does not survive scheduler reload" {
     const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
-    scheduler.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -1892,7 +1893,7 @@ test "memory backend data does not survive scheduler reload" {
     // New scheduler with fresh memory backend — no data carried over
     var scheduler2 = Scheduler.init(allocator);
     defer scheduler2.deinit();
-    scheduler2.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    scheduler2.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
     try scheduler2.load(allocator);
 
     try std.testing.expectEqual(@as(?Job, null), scheduler2.job_storage.get("ephemeral.job"));
@@ -1903,7 +1904,7 @@ test "memory backend REMOVE command removes job from storage" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -1927,7 +1928,7 @@ test "memory backend REMOVERULE command removes rule from storage" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -1959,12 +1960,12 @@ test "default persistence uses logfile when no persistence key configured" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.persistence = .{ .logfile = .{
+    scheduler.persistence = BackendState.init(.{ .logfile = .{
         .logfile_path = "default.log",
         .logfile_dir = tmp_dir.dir,
         .load_arena = null,
         .fsync_on_persist = false,
-    } };
+    } });
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -1978,12 +1979,12 @@ test "default persistence uses logfile when no persistence key configured" {
     // New scheduler loads persisted data from same logfile
     var scheduler2 = Scheduler.init(allocator);
     defer scheduler2.deinit();
-    scheduler2.persistence = .{ .logfile = .{
+    scheduler2.persistence = BackendState.init(.{ .logfile = .{
         .logfile_path = "default.log",
         .logfile_dir = tmp_dir.dir,
         .load_arena = null,
         .fsync_on_persist = false,
-    } };
+    } });
     try scheduler2.load(allocator);
 
     const restored = scheduler2.job_storage.get("compat.job");
@@ -2003,12 +2004,12 @@ test "compression produces deduplicated logfile after interval" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.persistence = .{ .logfile = .{
+    scheduler.persistence = BackendState.init(.{ .logfile = .{
         .logfile_path = "logfile",
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
-    } };
+    } });
     scheduler.compression_interval_ns = 1;
 
     // Write 5 mutations for the same job ID — compression should deduplicate to exactly 1 entry
@@ -2034,12 +2035,11 @@ test "compression produces deduplicated logfile after interval" {
     });
 
     try scheduler.tick(1);
-    try std.testing.expect(scheduler.active_process != null);
+    try std.testing.expect(scheduler.persistence.?.active_process != null);
 
-    const proc = scheduler.active_process.?;
-    proc.thread.join();
+    const proc = scheduler.persistence.?.active_process.?;
     proc.deinit();
-    scheduler.active_process = null;
+    scheduler.persistence.?.active_process = null;
 
     const compressed_data = try tmp.dir.readFileAlloc(allocator, "logfile.compressed", std.math.maxInt(usize));
     defer allocator.free(compressed_data);
@@ -2084,12 +2084,12 @@ test "memory backend skips compression and produces no file artifacts" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.persistence = .{ .memory = .{ .entries = .{}, .allocator = allocator } };
+    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
     scheduler.compression_interval_ns = 1;
 
     try scheduler.tick(1);
 
-    try std.testing.expectEqual(@as(?*@import("infrastructure/persistence/background.zig").Process, null), scheduler.active_process);
+    try std.testing.expectEqual(@as(?*@import("infrastructure/persistence/background.zig").Process, null), scheduler.persistence.?.active_process);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("logfile.to_compress", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("logfile.compressed", .{}));
 }
@@ -2447,7 +2447,7 @@ test "trace spans exported to collector on job execution" {
     try scheduler.tick(100);
 
     for (scheduler.execution_client.pending.items) |req| {
-        scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
+        try scheduler.execution_client.resolve(.{ .identifier = req.identifier, .success = true });
     }
     scheduler.execution_client.pending.clearRetainingCapacity();
     try scheduler.tick(200);
@@ -2632,12 +2632,12 @@ test "stat command does not append entries to logfile" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.persistence = @import("infrastructure/persistence/backend.zig").PersistenceBackend{ .logfile = .{
+    scheduler.persistence = BackendState.init(.{ .logfile = .{
         .logfile_path = "stat_nopersist.db",
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
-    } };
+    } });
     try scheduler.load(allocator);
 
     _ = try scheduler.handle_query(Request{
@@ -3475,20 +3475,25 @@ test "server with invalid shell path fails to start" {
 
 // Feature: F015
 
-fn send_http_request(stream: std.net.Stream, request: []const u8) ![]const u8 {
-    _ = stream.write(request) catch return error.SkipZigTest;
-    std.Thread.sleep(500_000_000);
+fn send_http_request(stream: std.net.Stream, request: []const u8, buf: []u8) ![]const u8 {
+    var sent: usize = 0;
+    while (sent < request.len) {
+        sent += std.posix.write(stream.handle, request[sent..]) catch return error.SkipZigTest;
+    }
 
-    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch return error.SkipZigTest;
-
-    var buf: [8192]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
-        const n = stream.read(buf[total..]) catch break;
+        var pfd = [1]std.posix.pollfd{.{
+            .fd = stream.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&pfd, 3000) catch return error.SkipZigTest;
+        if (ready == 0) break;
+        const n = std.posix.read(stream.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
+        if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
     }
     if (total == 0) return error.SkipZigTest;
     return buf[0..total];
@@ -3500,57 +3505,140 @@ fn http_connect(port: u16) !std.net.Stream {
 }
 
 // Feature: F015
-test "job lifecycle via HTTP creates retrieves and deletes a job" {
+test "HTTP PUT creates a job" {
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
         allocator,
-        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19892\"\n\n[http]\nlisten = \"127.0.0.1:19893\"\n\n[database]\npersistence = \"memory\"\n",
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19940\"\n\n[http]\nlisten = \"127.0.0.1:19941\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    var stream = try http_connect(19941);
+    defer stream.close();
+    // Far-future execution keeps the job in .planned status; a past date would let the
+    // scheduler tick transition it to .failed (no matching rule) before any GET.
+    var resp_buf: [8192]u8 = undefined;
+    const response = try send_http_request(
+        stream,
+        "PUT /jobs/deploy.v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2099-12-31T23:59:59Z\"}",
+        &resp_buf,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "deploy.v1") != null);
+}
+
+// Feature: F015
+test "HTTP GET retrieves a created job" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19942\"\n\n[http]\nlisten = \"127.0.0.1:19943\"\n\n[database]\npersistence = \"memory\"\n",
     );
     defer server.stop();
 
     {
-        var stream = try http_connect(19893);
+        var stream = try http_connect(19943);
         defer stream.close();
-        // Far-future execution keeps the job in .planned status; a past date would let the
-        // scheduler tick transition it to .failed (no matching rule) before the GET below.
-        const response = try send_http_request(
+        var resp_buf: [8192]u8 = undefined;
+        _ = try send_http_request(
             stream,
             "PUT /jobs/deploy.v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2099-12-31T23:59:59Z\"}",
+            &resp_buf,
         );
-        try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
-        try std.testing.expect(std.mem.indexOf(u8, response, "\"id\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, response, "deploy.v1") != null);
     }
 
     {
-        var stream = try http_connect(19893);
+        var stream = try http_connect(19943);
         defer stream.close();
+        var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
             "GET /jobs/deploy.v1 HTTP/1.1\r\n\r\n",
+            &resp_buf,
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "deploy.v1") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "planned") != null);
     }
+}
+
+// Feature: F015
+test "HTTP DELETE removes a job" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19944\"\n\n[http]\nlisten = \"127.0.0.1:19945\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
 
     {
-        var stream = try http_connect(19893);
+        var stream = try http_connect(19945);
         defer stream.close();
-        const response = try send_http_request(
+        var resp_buf: [8192]u8 = undefined;
+        _ = try send_http_request(
             stream,
-            "DELETE /jobs/deploy.v1 HTTP/1.1\r\n\r\n",
+            "PUT /jobs/deploy.v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2099-12-31T23:59:59Z\"}",
+            &resp_buf,
         );
-        try std.testing.expect(std.mem.indexOf(u8, response, "204") != null);
     }
 
     {
-        var stream = try http_connect(19893);
+        var stream = try http_connect(19945);
         defer stream.close();
+        var resp_buf: [8192]u8 = undefined;
+        const response = try send_http_request(
+            stream,
+            "DELETE /jobs/deploy.v1 HTTP/1.1\r\n\r\n",
+            &resp_buf,
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response, "204") != null);
+    }
+}
+
+// Feature: F015
+test "HTTP GET returns 404 for deleted job" {
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(
+        allocator,
+        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19946\"\n\n[http]\nlisten = \"127.0.0.1:19947\"\n\n[database]\npersistence = \"memory\"\n",
+    );
+    defer server.stop();
+
+    {
+        var stream = try http_connect(19947);
+        defer stream.close();
+        var resp_buf: [8192]u8 = undefined;
+        _ = try send_http_request(
+            stream,
+            "PUT /jobs/deploy.v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2099-12-31T23:59:59Z\"}",
+            &resp_buf,
+        );
+    }
+
+    {
+        var stream = try http_connect(19947);
+        defer stream.close();
+        var resp_buf: [8192]u8 = undefined;
+        _ = try send_http_request(
+            stream,
+            "DELETE /jobs/deploy.v1 HTTP/1.1\r\n\r\n",
+            &resp_buf,
+        );
+    }
+
+    {
+        var stream = try http_connect(19947);
+        defer stream.close();
+        var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
             "GET /jobs/deploy.v1 HTTP/1.1\r\n\r\n",
+            &resp_buf,
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "404") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "\"error\"") != null);
@@ -3569,9 +3657,11 @@ test "health check returns 200 with status ok" {
 
     var stream = try http_connect(19895);
     defer stream.close();
+    var resp_buf: [8192]u8 = undefined;
     const response = try send_http_request(
         stream,
         "GET /health HTTP/1.1\r\n\r\n",
+        &resp_buf,
     );
     try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "application/json") != null);
@@ -3590,9 +3680,11 @@ test "unknown path returns 404 not found" {
 
     var stream = try http_connect(19897);
     defer stream.close();
+    var resp_buf: [8192]u8 = undefined;
     const response = try send_http_request(
         stream,
         "GET /unknown HTTP/1.1\r\n\r\n",
+        &resp_buf,
     );
     try std.testing.expect(std.mem.indexOf(u8, response, "404") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"error\"") != null);
@@ -3631,9 +3723,11 @@ test "job created via HTTP is retrievable via TCP" {
         defer stream.close();
         // Far-future execution keeps the job in .planned status; the TCP GET below asserts
         // on "planned", which would not appear if the scheduler transitioned the job to .failed.
+        var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
             "PUT /jobs/cross.1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2099-12-31T23:59:59Z\"}",
+            &resp_buf,
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
     }
@@ -3644,18 +3738,21 @@ test "job created via HTTP is retrievable via TCP" {
         defer stream.close();
 
         _ = stream.write("req-tcp-1 GET cross.1\n") catch return error.SkipZigTest;
-        std.Thread.sleep(500_000_000);
-
-        const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
-        const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-        _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch return error.SkipZigTest;
 
         var buf: [4096]u8 = undefined;
         var total: usize = 0;
         while (total < buf.len) {
+            var pfd = [1]std.posix.pollfd{.{
+                .fd = stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const ready = std.posix.poll(&pfd, 2000) catch break;
+            if (ready == 0) break;
             const n = stream.read(buf[total..]) catch break;
             if (n == 0) break;
             total += n;
+            if (std.mem.indexOf(u8, buf[0..total], "req-tcp-1") != null) break;
         }
         const response = buf[0..total];
 
@@ -3682,7 +3779,8 @@ test "rule lifecycle via HTTP creates and deletes a rule" {
 
         var request_buf: [512]u8 = undefined;
         const request = std.fmt.bufPrint(&request_buf, "PUT /rules/notify HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {s}\r\n\r\n{s}", .{ content_length_str, body }) catch unreachable;
-        const response = try send_http_request(stream, request);
+        var resp_buf: [8192]u8 = undefined;
+        const response = try send_http_request(stream, request, &resp_buf);
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "notify") != null);
     }
@@ -3690,9 +3788,11 @@ test "rule lifecycle via HTTP creates and deletes a rule" {
     {
         var stream = try http_connect(19903);
         defer stream.close();
+        var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
             "DELETE /rules/notify HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+            &resp_buf,
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "204") != null);
     }
@@ -3700,9 +3800,11 @@ test "rule lifecycle via HTTP creates and deletes a rule" {
     {
         var stream = try http_connect(19903);
         defer stream.close();
+        var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
             "DELETE /rules/missing HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+            &resp_buf,
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "404") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "\"error\"") != null);
@@ -3723,9 +3825,10 @@ test "job listing with prefix filter returns matching jobs" {
         var stream = try http_connect(19905);
         defer stream.close();
         const body = "{\"execution\": \"2026-04-10T12:00:00Z\"}";
-        var buf: [256]u8 = undefined;
-        const request = std.fmt.bufPrint(&buf, "PUT /jobs/deploy.v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
-        const response = try send_http_request(stream, request);
+        var req_buf: [256]u8 = undefined;
+        const request = std.fmt.bufPrint(&req_buf, "PUT /jobs/deploy.v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+        var resp_buf: [8192]u8 = undefined;
+        const response = try send_http_request(stream, request, &resp_buf);
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
     }
 
@@ -3733,18 +3836,21 @@ test "job listing with prefix filter returns matching jobs" {
         var stream = try http_connect(19905);
         defer stream.close();
         const body = "{\"execution\": \"2026-04-11T12:00:00Z\"}";
-        var buf: [256]u8 = undefined;
-        const request = std.fmt.bufPrint(&buf, "PUT /jobs/deploy.v2 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
-        const response = try send_http_request(stream, request);
+        var req_buf: [256]u8 = undefined;
+        const request = std.fmt.bufPrint(&req_buf, "PUT /jobs/deploy.v2 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+        var resp_buf: [8192]u8 = undefined;
+        const response = try send_http_request(stream, request, &resp_buf);
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
     }
 
     {
         var stream = try http_connect(19905);
         defer stream.close();
+        var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
             "GET /jobs?prefix=deploy. HTTP/1.1\r\n\r\n",
+            &resp_buf,
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "deploy.v1") != null);
@@ -3801,9 +3907,10 @@ test "malformed JSON on PUT returns 400 bad request" {
     var stream = try http_connect(19907);
     defer stream.close();
     const body = "{not valid json}";
-    var buf: [256]u8 = undefined;
-    const request = std.fmt.bufPrint(&buf, "PUT /jobs/bad.json HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
-    const response = try send_http_request(stream, request);
+    var req_buf: [256]u8 = undefined;
+    const request = std.fmt.bufPrint(&req_buf, "PUT /jobs/bad.json HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    var resp_buf: [8192]u8 = undefined;
+    const response = try send_http_request(stream, request, &resp_buf);
     try std.testing.expect(std.mem.indexOf(u8, response, "400") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"error\"") != null);
 }
@@ -3919,9 +4026,10 @@ test "HTTP PUT creates AWF rule and GET returns it in listing" {
         var stream = try http_connect(19913);
         defer stream.close();
         const body = "{\"pattern\": \"app.\", \"runner\": \"awf\", \"args\": [\"code-review\"]}";
-        var buf: [512]u8 = undefined;
-        const request = std.fmt.bufPrint(&buf, "PUT /rules/rule.awf HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
-        const response = try send_http_request(stream, request);
+        var req_buf: [512]u8 = undefined;
+        const request = std.fmt.bufPrint(&req_buf, "PUT /rules/rule.awf HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+        var resp_buf: [8192]u8 = undefined;
+        const response = try send_http_request(stream, request, &resp_buf);
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "rule.awf") != null);
     }
@@ -3929,9 +4037,11 @@ test "HTTP PUT creates AWF rule and GET returns it in listing" {
     {
         var stream = try http_connect(19913);
         defer stream.close();
+        var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
             "GET /rules?prefix=rule. HTTP/1.1\r\n\r\n",
+            &resp_buf,
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "rule.awf") != null);
@@ -4018,9 +4128,10 @@ test "HTTP PUT creates HTTP rule and GET returns it in listing" {
         var stream = try http_connect(19917);
         defer stream.close();
         const body = "{\"pattern\": \"deploy.\", \"runner\": \"http\", \"args\": [\"POST\", \"https://hooks.example.com/webhook\"]}";
-        var buf: [512]u8 = undefined;
-        const request = std.fmt.bufPrint(&buf, "PUT /rules/rule.http HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
-        const response = try send_http_request(stream, request);
+        var req_buf: [512]u8 = undefined;
+        const request = std.fmt.bufPrint(&req_buf, "PUT /rules/rule.http HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+        var resp_buf: [8192]u8 = undefined;
+        const response = try send_http_request(stream, request, &resp_buf);
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "rule.http") != null);
     }
@@ -4028,9 +4139,11 @@ test "HTTP PUT creates HTTP rule and GET returns it in listing" {
     {
         var stream = try http_connect(19917);
         defer stream.close();
+        var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
             "GET /rules?prefix=rule. HTTP/1.1\r\n\r\n",
+            &resp_buf,
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "rule.http") != null);
@@ -4050,9 +4163,10 @@ test "HTTP PUT with HTTP runner missing url returns 400 bad request" {
     var stream = try http_connect(19919);
     defer stream.close();
     const body = "{\"pattern\": \"x\", \"runner\": \"http\", \"args\": [\"GET\"]}";
-    var buf: [512]u8 = undefined;
-    const request = std.fmt.bufPrint(&buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
-    const response = try send_http_request(stream, request);
+    var req_buf: [512]u8 = undefined;
+    const request = std.fmt.bufPrint(&req_buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    var resp_buf: [8192]u8 = undefined;
+    const response = try send_http_request(stream, request, &resp_buf);
     try std.testing.expect(std.mem.indexOf(u8, response, "400") != null);
 }
 
@@ -4068,9 +4182,10 @@ test "HTTP PUT with HTTP runner unsupported method returns 400 bad request" {
     var stream = try http_connect(19921);
     defer stream.close();
     const body = "{\"pattern\": \"x\", \"runner\": \"http\", \"args\": [\"PATCH\", \"https://hooks.example.com/webhook\"]}";
-    var buf: [512]u8 = undefined;
-    const request = std.fmt.bufPrint(&buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
-    const response = try send_http_request(stream, request);
+    var req_buf: [512]u8 = undefined;
+    const request = std.fmt.bufPrint(&req_buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    var resp_buf: [8192]u8 = undefined;
+    const response = try send_http_request(stream, request, &resp_buf);
     try std.testing.expect(std.mem.indexOf(u8, response, "400") != null);
 }
 
@@ -4086,9 +4201,10 @@ test "HTTP PUT with HTTP runner invalid url scheme returns 400 bad request" {
     var stream = try http_connect(19923);
     defer stream.close();
     const body = "{\"pattern\": \"x\", \"runner\": \"http\", \"args\": [\"POST\", \"ftp://hooks.example.com/webhook\"]}";
-    var buf: [512]u8 = undefined;
-    const request = std.fmt.bufPrint(&buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
-    const response = try send_http_request(stream, request);
+    var req_buf: [512]u8 = undefined;
+    const request = std.fmt.bufPrint(&req_buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    var resp_buf: [8192]u8 = undefined;
+    const response = try send_http_request(stream, request, &resp_buf);
     try std.testing.expect(std.mem.indexOf(u8, response, "400") != null);
 }
 
@@ -4748,7 +4864,8 @@ test "concurrent HTTP requests are handled simultaneously by separate worker thr
             var req_buf: [512]u8 = undefined;
             const body = "{\"execution\": \"2099-12-31T23:59:59Z\"}";
             const req = std.fmt.bufPrint(&req_buf, "PUT /jobs/{s} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ job_id, body.len, body }) catch return;
-            const response = send_http_request(stream, req) catch return;
+            var resp_buf: [8192]u8 = undefined;
+            const response = send_http_request(stream, req, &resp_buf) catch return;
             if (std.mem.indexOf(u8, response, "200") == null) return;
         }
     };
@@ -4767,7 +4884,8 @@ test "concurrent HTTP requests are handled simultaneously by separate worker thr
         defer stream.close();
         var req_buf: [256]u8 = undefined;
         const req = std.fmt.bufPrint(&req_buf, "GET /jobs/{s} HTTP/1.1\r\n\r\n", .{job_id}) catch continue;
-        const response = send_http_request(stream, req) catch continue;
+        var resp_buf: [8192]u8 = undefined;
+        const response = send_http_request(stream, req, &resp_buf) catch continue;
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, job_id) != null);
     }
@@ -4785,9 +4903,11 @@ test "HTTP server shuts down gracefully after concurrent requests complete" {
     {
         var stream = try http_connect(19933);
         defer stream.close();
+        var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
             "PUT /jobs/shutdown.test HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"execution\": \"2099-12-31T23:59:59Z\"}",
+            &resp_buf,
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
     }
@@ -4815,7 +4935,8 @@ test "mixed TCP and HTTP concurrent requests both succeed without blocking" {
             var req_buf: [512]u8 = undefined;
             const body = "{\"execution\": \"2099-12-31T23:59:59Z\"}";
             const req = std.fmt.bufPrint(&req_buf, "PUT /jobs/{s} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ job_id, body.len, body }) catch return;
-            _ = send_http_request(stream, req) catch return;
+            var resp_buf: [8192]u8 = undefined;
+            _ = send_http_request(stream, req, &resp_buf) catch return;
         }
     };
 
@@ -4848,7 +4969,8 @@ test "mixed TCP and HTTP concurrent requests both succeed without blocking" {
         defer stream.close();
         var req_buf: [256]u8 = undefined;
         const req = std.fmt.bufPrint(&req_buf, "GET /jobs/{s} HTTP/1.1\r\n\r\n", .{job_id}) catch continue;
-        const response = send_http_request(stream, req) catch continue;
+        var resp_buf: [8192]u8 = undefined;
+        const response = send_http_request(stream, req, &resp_buf) catch continue;
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, job_id) != null);
     }
@@ -4858,7 +4980,8 @@ test "mixed TCP and HTTP concurrent requests both succeed without blocking" {
         defer stream.close();
         var req_buf: [256]u8 = undefined;
         const req = std.fmt.bufPrint(&req_buf, "GET /jobs/{s} HTTP/1.1\r\n\r\n", .{job_id}) catch continue;
-        const response = send_http_request(stream, req) catch continue;
+        var resp_buf: [8192]u8 = undefined;
+        const response = send_http_request(stream, req, &resp_buf) catch continue;
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, job_id) != null);
     }
@@ -4884,7 +5007,8 @@ test "multiple concurrent HTTP connections all complete before shutdown" {
             var req_buf: [512]u8 = undefined;
             const body = "{\"execution\": \"2099-12-31T23:59:59Z\"}";
             const req = std.fmt.bufPrint(&req_buf, "PUT /jobs/{s} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ job_id, body.len, body }) catch return;
-            const response = send_http_request(stream, req) catch return;
+            var resp_buf: [8192]u8 = undefined;
+            const response = send_http_request(stream, req, &resp_buf) catch return;
             if (std.mem.indexOf(u8, response, "200") == null) return;
         }
     };
@@ -4903,7 +5027,8 @@ test "multiple concurrent HTTP connections all complete before shutdown" {
         defer stream.close();
         var req_buf: [256]u8 = undefined;
         const req = std.fmt.bufPrint(&req_buf, "GET /jobs/{s} HTTP/1.1\r\n\r\n", .{job_id}) catch continue;
-        const response = send_http_request(stream, req) catch continue;
+        var resp_buf: [8192]u8 = undefined;
+        const response = send_http_request(stream, req, &resp_buf) catch continue;
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
     }
 
