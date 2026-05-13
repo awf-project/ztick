@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-13
+
 ### Changed
 
 - **Hexagonal architecture refactoring** — Extracted persistence codec from infrastructure to application layer (`persistence_codec.zig`), introduced vtable-based `PersistencePort` interface to decouple the scheduler from concrete backends, and made `Scheduler` generic via `SchedulerWith(comptime Backend: type)`. Promoted domain types (`timestamp.zig`, `shell_config.zig`, `telemetry_config.zig`) and OTel instruments (`instruments.zig`) out of infrastructure into their proper layers. Extracted shared subprocess logic into `runner/subprocess.zig`.
