@@ -1,9 +1,9 @@
 const std = @import("std");
 const domain = @import("../../domain.zig");
-const interfaces = @import("../../interfaces.zig");
+const subprocess = @import("subprocess.zig");
 
 const execution = domain.execution;
-const ShellConfig = interfaces.config.ShellConfig;
+const ShellConfig = domain.shell_config.ShellConfig;
 
 pub fn execute(allocator: std.mem.Allocator, shell_config: ShellConfig, payload: anytype, request: execution.Request) execution.Response {
     const args = allocator.alloc([]const u8, shell_config.args.len + 2) catch {
@@ -13,24 +13,7 @@ pub fn execute(allocator: std.mem.Allocator, shell_config: ShellConfig, payload:
     args[0] = shell_config.path;
     @memcpy(args[1 .. shell_config.args.len + 1], shell_config.args);
     args[shell_config.args.len + 1] = payload.command;
-
-    var child = std.process.Child.init(args, allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch {
-        return .{ .identifier = request.identifier, .success = false };
-    };
-
-    const term = child.wait() catch {
-        return .{ .identifier = request.identifier, .success = false };
-    };
-    const success = switch (term) {
-        .Exited => |code| code == 0,
-        else => false,
-    };
-
-    return .{ .identifier = request.identifier, .success = success };
+    return subprocess.run(allocator, args, request.identifier);
 }
 
 const default_shell_config = ShellConfig{ .path = "/bin/sh", .args = &.{"-c"} };

@@ -1,7 +1,10 @@
 const std = @import("std");
 const logfile = @import("logfile.zig");
 const encoder = @import("encoder.zig");
+const background = @import("background.zig");
 const domain = @import("../../domain.zig");
+
+pub const CompressionStatus = enum { idle, running, success, failure };
 
 pub const LogfilePersistence = struct {
     logfile_path: ?[]const u8,
@@ -37,11 +40,35 @@ pub const LogfilePersistence = struct {
         };
         defer file.close();
 
-        const content = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-        defer allocator.free(content);
+        var entries = std.ArrayListUnmanaged([]u8){};
+        errdefer {
+            for (entries.items) |e| allocator.free(e);
+            entries.deinit(allocator);
+        }
 
-        const parsed = try logfile.parse(allocator, content);
-        return parsed.entries;
+        var carry = std.ArrayListUnmanaged(u8){};
+        defer carry.deinit(allocator);
+
+        var read_buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = try file.read(&read_buf);
+            if (n == 0) break;
+            try carry.appendSlice(allocator, read_buf[0..n]);
+
+            const parsed = try logfile.parse(allocator, carry.items);
+            for (parsed.entries) |e| {
+                try entries.append(allocator, e);
+            }
+            allocator.free(parsed.entries);
+
+            const rem = parsed.remaining;
+            if (rem.len > 0) {
+                std.mem.copyForwards(u8, carry.items[0..rem.len], rem);
+            }
+            carry.shrinkRetainingCapacity(rem.len);
+        }
+
+        return try entries.toOwnedSlice(allocator);
     }
 
     pub fn deinit(self: *LogfilePersistence) void {
@@ -114,6 +141,114 @@ pub const PersistenceBackend = union(enum) {
                 if (b.load_arena) |*old| old.deinit();
                 b.load_arena = std.heap.ArenaAllocator.init(b.allocator);
                 return b.load_arena.?.allocator();
+            },
+        }
+    }
+};
+
+/// BackendState wraps a PersistenceBackend with the compression tracking fields.
+/// The scheduler stores this by value and calls its methods directly — zero vtable
+/// overhead, the compiler can inline all persistence calls.
+pub const BackendState = struct {
+    backend: PersistenceBackend,
+    active_process: ?*background.Process,
+
+    pub fn init(backend: PersistenceBackend) BackendState {
+        return .{
+            .backend = backend,
+            .active_process = null,
+        };
+    }
+
+    pub fn deinit(self: *BackendState) void {
+        if (self.active_process) |proc| {
+            if (!proc.joined) if (proc.thread) |t| t.join();
+            proc.deinit();
+            self.active_process = null;
+        }
+        self.backend.deinit();
+    }
+
+    pub fn append(self: *BackendState, entry: []const u8) !void {
+        return self.backend.append(entry);
+    }
+
+    pub fn load(self: *BackendState, allocator: std.mem.Allocator) ![][]u8 {
+        return self.backend.load(allocator);
+    }
+
+    pub fn reset_decode_arena(self: *BackendState, allocator: std.mem.Allocator) std.mem.Allocator {
+        return self.backend.reset_decode_arena(allocator);
+    }
+
+    pub fn name(self: *BackendState) []const u8 {
+        return switch (self.backend) {
+            .logfile => "logfile",
+            .memory => "memory",
+        };
+    }
+
+    pub fn compression_status(self: *BackendState) CompressionStatus {
+        const proc = self.active_process orelse return .idle;
+        return switch (proc.status()) {
+            .running => .running,
+            .success => .success,
+            .failure => .failure,
+        };
+    }
+
+    /// Attempt to start background compression. Returns true if compression was
+    /// started, false if skipped (interval not elapsed, wrong backend type, etc.).
+    pub fn start_compression(self: *BackendState, allocator: std.mem.Allocator, current_time_ns: u64) !bool {
+        _ = current_time_ns;
+        switch (self.backend) {
+            .memory => return false,
+            .logfile => |lf| {
+                if (self.active_process != null) return false;
+
+                const dir = lf.logfile_dir orelse return false;
+                const path = lf.logfile_path orelse return false;
+
+                if (dir.statFile("logfile.to_compress")) |_| {
+                    std.log.warn("compression: skipping cycle, leftover logfile.to_compress still present", .{});
+                    return false;
+                } else |_| {}
+
+                try std.fs.rename(dir, path, dir, "logfile.to_compress");
+
+                const proc = try allocator.create(background.Process);
+                errdefer allocator.destroy(proc);
+                proc.* = .{ .allocator = allocator, .thread = null, .result = null, .mutex = .{}, .joined = false };
+
+                proc.thread = try std.Thread.spawn(.{}, struct {
+                    fn run(p: *background.Process, alloc: std.mem.Allocator, compress_dir: std.fs.Dir) void {
+                        const r = background.compress(alloc, compress_dir, .{});
+                        p.mutex.lock();
+                        defer p.mutex.unlock();
+                        p.result = r;
+                    }
+                }.run, .{ proc, allocator, dir });
+
+                self.active_process = proc;
+                return true;
+            },
+        }
+    }
+
+    /// Called after compression status is polled to allow the backend to clean up
+    /// a completed process.
+    pub fn finish_compression(self: *BackendState) void {
+        const proc = self.active_process orelse return;
+        switch (proc.status()) {
+            .running => {},
+            .success => {
+                proc.deinit();
+                self.active_process = null;
+            },
+            .failure => {
+                std.log.debug("compression: background compression failed, retaining .to_compress for next cycle", .{});
+                proc.deinit();
+                self.active_process = null;
             },
         }
     }

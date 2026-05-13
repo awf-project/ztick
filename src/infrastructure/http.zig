@@ -24,6 +24,9 @@ pub const HttpServer = struct {
     next_client_id: std.atomic.Value(u128),
     bearer_token: ?[]const u8,
     active_connections: std.atomic.Value(usize),
+    /// Listen socket fd, set by start() and cleared before defer server.deinit()
+    /// runs. deinit() closes it to interrupt a blocked accept() during shutdown.
+    listen_fd: ?std.posix.socket_t,
 
     // Comptime substitution: replace the `__VERSION__` placeholder embedded
     // inside `openapi.json` with the canonical version from `build.zig.zon`,
@@ -61,18 +64,29 @@ pub const HttpServer = struct {
             .next_client_id = std.atomic.Value(u128).init(1_000_000),
             .bearer_token = bearer_token,
             .active_connections = std.atomic.Value(usize).init(0),
+            .listen_fd = null,
         };
+    }
+
+    pub fn deinit(self: *HttpServer) void {
+        if (self.listen_fd) |fd| {
+            std.posix.close(fd);
+            self.listen_fd = null;
+        }
     }
 
     pub fn start(self: *HttpServer) !void {
         const listen_addr = parse_address(self.address) orelse return;
         var server = listen_addr.listen(.{ .reuse_address = true }) catch return;
-        defer server.deinit();
+        self.listen_fd = server.stream.handle;
 
         while (self.running.load(.acquire)) {
             const conn = server.accept() catch |err| switch (err) {
-                error.SocketNotListening => return,
-                else => continue,
+                error.SocketNotListening => break,
+                else => {
+                    if (!self.running.load(.acquire)) break;
+                    continue;
+                },
             };
             _ = self.active_connections.fetchAdd(1, .release);
             const thread = std.Thread.spawn(.{}, http_connection_worker, .{ &self.active_connections, self, conn.stream }) catch {
@@ -82,6 +96,11 @@ pub const HttpServer = struct {
             };
             thread.detach();
         }
+
+        // Clear listen_fd before server.deinit() closes the underlying fd,
+        // so deinit() does not attempt a second close after start() returns.
+        self.listen_fd = null;
+        server.deinit();
     }
 
     pub fn join_all(self: *HttpServer) void {
@@ -124,7 +143,7 @@ pub const HttpServer = struct {
             if (!is_public_path(path)) {
                 const authorized = if (authorization) |auth|
                     std.mem.startsWith(u8, auth, "Bearer ") and
-                        std.mem.eql(u8, auth["Bearer ".len..], expected_token)
+                        domain.auth.constant_time_eql(auth["Bearer ".len..], expected_token)
                 else
                     false;
                 if (!authorized) {
@@ -462,7 +481,7 @@ pub const HttpServer = struct {
         var resp_ch = Channel(query.Response).init(self.allocator, 1) catch return null;
         defer resp_ch.deinit();
 
-        self.response_router.register(client_id, &resp_ch);
+        self.response_router.register(client_id, &resp_ch) catch return null;
         defer self.response_router.deregister(client_id);
 
         self.request_ch.send(.{

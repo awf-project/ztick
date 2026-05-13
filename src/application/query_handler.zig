@@ -30,7 +30,8 @@ pub const QueryHandler = struct {
                     .execution = args.execution,
                     .status = .planned,
                 };
-                self.job_storage.set(job) catch {
+                self.job_storage.set(job) catch |err| {
+                    std.log.warn("query_handler: set failed for \"{s}\": {}", .{ args.identifier, err });
                     return Response{ .request = request, .success = false, .error_code = .internal };
                 };
                 break :blk true;
@@ -41,7 +42,8 @@ pub const QueryHandler = struct {
                     .pattern = args.pattern,
                     .runner = args.runner,
                 };
-                self.rule_storage.set(rule) catch {
+                self.rule_storage.set(rule) catch |err| {
+                    std.log.warn("query_handler: rule_set failed for \"{s}\": {}", .{ args.identifier, err });
                     return Response{ .request = request, .success = false, .error_code = .internal };
                 };
                 break :blk true;
@@ -87,14 +89,14 @@ pub const QueryHandler = struct {
                 break :blk true;
             },
             .list_rules => {
-                if (self.rule_storage.rules.count() == 0) {
+                if (self.rule_storage.count() == 0) {
                     return Response{ .request = request, .success = true };
                 }
 
                 var body_buf = std.ArrayListUnmanaged(u8){};
                 errdefer body_buf.deinit(self.allocator);
 
-                var it = self.rule_storage.rules.valueIterator();
+                var it = self.rule_storage.valueIterator();
                 while (it.next()) |rule| {
                     switch (rule.runner) {
                         .shell => |sh| try body_buf.writer(self.allocator).print("{s} {s} shell {s}\n", .{ rule.identifier, rule.pattern, sh.command }),
@@ -117,7 +119,7 @@ pub const QueryHandler = struct {
                 const body = try body_buf.toOwnedSlice(self.allocator);
                 return Response{ .request = request, .success = true, .body = body };
             },
-            .stat => unreachable,
+            .stat => return Response{ .request = request, .success = false, .error_code = .internal },
         };
 
         return Response{ .request = request, .success = success };
@@ -125,9 +127,7 @@ pub const QueryHandler = struct {
 };
 
 test "handle set instruction stores job and returns success" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -145,7 +145,7 @@ test "handle set instruction stores job and returns success" {
     const response = try handler.handle(request);
     try std.testing.expect(response.success);
     try std.testing.expectEqual(request.client, response.request.client);
-    try std.testing.expectEqual(@as(?domain.query.ErrorCode, null), response.error_code);
+    try std.testing.expectEqual(@as(?domain.query.ResponseError, null), response.error_code);
     try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
 
     const job = job_storage.get("job.1");
@@ -154,9 +154,7 @@ test "handle set instruction stores job and returns success" {
 }
 
 test "handle rule_set instruction stores rule and returns success" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -177,7 +175,7 @@ test "handle rule_set instruction stores rule and returns success" {
 
     const response = try handler.handle(request);
     try std.testing.expect(response.success);
-    try std.testing.expectEqual(@as(?domain.query.ErrorCode, null), response.error_code);
+    try std.testing.expectEqual(@as(?domain.query.ResponseError, null), response.error_code);
     try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
 
     const rule = rule_storage.get("rule.1");
@@ -186,9 +184,7 @@ test "handle rule_set instruction stores rule and returns success" {
 }
 
 test "handle get instruction returns success with status and execution timestamp for existing job" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -211,14 +207,12 @@ test "handle get instruction returns success with status and execution timestamp
     try std.testing.expect(response.success);
     try std.testing.expect(response.body != null);
     try std.testing.expectEqualStrings("planned 1595586600000000000", response.body.?);
-    try std.testing.expectEqual(@as(?domain.query.ErrorCode, null), response.error_code);
+    try std.testing.expectEqual(@as(?domain.query.ResponseError, null), response.error_code);
     try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
 }
 
 test "handle get instruction returns failure for missing job" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -237,14 +231,12 @@ test "handle get instruction returns failure for missing job" {
     defer if (response.error_message) |m| allocator.free(m);
     try std.testing.expect(!response.success);
     try std.testing.expectEqual(@as(?[]const u8, null), response.body);
-    try std.testing.expectEqual(domain.query.ErrorCode.not_found, response.error_code.?);
+    try std.testing.expectEqual(domain.query.ResponseError.not_found, response.error_code.?);
     try std.testing.expectEqualStrings("job \"job.missing\" does not exist", response.error_message.?);
 }
 
 test "handle query instruction returns success with matching jobs in body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -274,9 +266,7 @@ test "handle query instruction returns success with matching jobs in body" {
 }
 
 test "handle query instruction returns success with null body when no jobs match" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -299,9 +289,7 @@ test "handle query instruction returns success with null body when no jobs match
 }
 
 test "handle query instruction with empty pattern returns all jobs" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -329,9 +317,7 @@ test "handle query instruction with empty pattern returns all jobs" {
 }
 
 test "handle remove instruction removes existing job and returns success" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -350,15 +336,13 @@ test "handle remove instruction removes existing job and returns success" {
 
     const response = try handler.handle(request);
     try std.testing.expect(response.success);
-    try std.testing.expectEqual(@as(?domain.query.ErrorCode, null), response.error_code);
+    try std.testing.expectEqual(@as(?domain.query.ResponseError, null), response.error_code);
     try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
     try std.testing.expect(job_storage.get("backup-daily") == null);
 }
 
 test "handle remove instruction returns failure for missing job" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -376,14 +360,12 @@ test "handle remove instruction returns failure for missing job" {
     const response = try handler.handle(request);
     defer if (response.error_message) |m| allocator.free(m);
     try std.testing.expect(!response.success);
-    try std.testing.expectEqual(domain.query.ErrorCode.not_found, response.error_code.?);
+    try std.testing.expectEqual(domain.query.ResponseError.not_found, response.error_code.?);
     try std.testing.expectEqualStrings("job \"nonexistent\" does not exist", response.error_message.?);
 }
 
 test "handle remove_rule instruction removes existing rule and returns success" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -406,9 +388,7 @@ test "handle remove_rule instruction removes existing rule and returns success" 
 }
 
 test "handle remove_rule instruction returns failure for missing rule" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -426,14 +406,12 @@ test "handle remove_rule instruction returns failure for missing rule" {
     const response = try handler.handle(request);
     defer if (response.error_message) |m| allocator.free(m);
     try std.testing.expect(!response.success);
-    try std.testing.expectEqual(domain.query.ErrorCode.not_found, response.error_code.?);
+    try std.testing.expectEqual(domain.query.ResponseError.not_found, response.error_code.?);
     try std.testing.expectEqualStrings("rule \"ghost-rule\" does not exist", response.error_message.?);
 }
 
 test "handle list_rules instruction returns success with null body when no rules loaded" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -454,9 +432,7 @@ test "handle list_rules instruction returns success with null body when no rules
 }
 
 test "handle list_rules instruction returns success with all shell rules in body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -488,9 +464,7 @@ test "handle list_rules instruction returns success with all shell rules in body
 }
 
 test "handle list_rules instruction returns success with amqp rule fields in body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -525,9 +499,7 @@ test "handle list_rules instruction returns success with amqp rule fields in bod
 }
 
 test "handle list_rules instruction returns success with direct rule without args in body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -559,9 +531,7 @@ test "handle list_rules instruction returns success with direct rule without arg
 }
 
 test "handle list_rules instruction returns success with direct rule with args in body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -596,9 +566,7 @@ test "handle list_rules instruction returns success with direct rule with args i
 }
 
 test "handle list_rules instruction returns success with awf rule without input in body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -631,9 +599,7 @@ test "handle list_rules instruction returns success with awf rule without input 
 }
 
 test "handle list_rules instruction returns success with awf rule with input in body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -667,9 +633,7 @@ test "handle list_rules instruction returns success with awf rule with input in 
 }
 
 test "handle list_rules instruction returns success with http GET rule in body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -702,9 +666,7 @@ test "handle list_rules instruction returns success with http GET rule in body" 
 }
 
 test "handle list_rules instruction returns success with http POST rule in body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var job_storage = JobStorage.init(allocator);
     defer job_storage.deinit();
@@ -737,9 +699,7 @@ test "handle list_rules instruction returns success with http POST rule in body"
 }
 
 test "handle set instruction returns internal error code when storage fails" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var buf: [16]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
@@ -759,14 +719,12 @@ test "handle set instruction returns internal error code when storage fails" {
 
     const response = try handler.handle(request);
     try std.testing.expect(!response.success);
-    try std.testing.expectEqual(domain.query.ErrorCode.internal, response.error_code.?);
+    try std.testing.expectEqual(domain.query.ResponseError.internal, response.error_code.?);
     try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
 }
 
 test "handle rule_set instruction returns internal error code when storage fails" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var buf: [16]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
@@ -790,6 +748,6 @@ test "handle rule_set instruction returns internal error code when storage fails
 
     const response = try handler.handle(request);
     try std.testing.expect(!response.success);
-    try std.testing.expectEqual(domain.query.ErrorCode.internal, response.error_code.?);
+    try std.testing.expectEqual(domain.query.ResponseError.internal, response.error_code.?);
     try std.testing.expectEqual(@as(?[]const u8, null), response.error_message);
 }

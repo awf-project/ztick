@@ -1,6 +1,5 @@
 const std = @import("std");
 const domain = @import("../domain.zig");
-const interfaces = @import("../interfaces.zig");
 
 const amqp = @import("runner/amqp.zig");
 const awf = @import("runner/awf.zig");
@@ -8,9 +7,10 @@ const direct = @import("runner/direct.zig");
 const http = @import("runner/http.zig");
 const redis = @import("runner/redis.zig");
 const shell = @import("runner/shell.zig");
+const subprocess = @import("runner/subprocess.zig");
 
 const execution = domain.execution;
-const ShellConfig = interfaces.config.ShellConfig;
+const ShellConfig = domain.shell_config.ShellConfig;
 
 pub fn execute(allocator: std.mem.Allocator, shell_config: ShellConfig, request: execution.Request) execution.Response {
     return switch (request.runner) {

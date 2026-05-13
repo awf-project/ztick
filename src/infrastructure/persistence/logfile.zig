@@ -3,7 +3,7 @@ const std = @import("std");
 pub const max_entry_size: usize = std.math.maxInt(u32);
 
 pub const EncodeError = error{MaximumSizeReached};
-pub const ParseError = error{ CorruptedContent, Incomplete };
+pub const ParseError = error{Incomplete};
 
 pub fn encode(allocator: std.mem.Allocator, entry: []const u8) EncodeError![]u8 {
     if (entry.len > max_entry_size) return EncodeError.MaximumSizeReached;

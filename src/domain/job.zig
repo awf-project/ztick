@@ -13,7 +13,7 @@ pub const Job = struct {
     status: JobStatus,
 };
 
-test "field access" {
+test "job stores identifier execution and status" {
     const job = Job{ .identifier = "my-job", .execution = 1605457800_000000000, .status = .planned };
     try std.testing.expectEqualStrings("my-job", job.identifier);
     try std.testing.expectEqual(@as(i64, 1605457800_000000000), job.execution);

@@ -27,7 +27,7 @@ pub fn execute(allocator: std.mem.Allocator, payload: anytype, request: executio
     };
 
     const stderr_output = if (child.stderr) |stderr_file|
-        stderr_file.readToEndAlloc(allocator, 4096) catch null
+        stderr_file.readToEndAlloc(allocator, 65536) catch null
     else
         null;
     defer if (stderr_output) |output| allocator.free(output);

@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const Runner = union(enum) {
     shell: struct {
         command: []const u8,
@@ -25,8 +27,6 @@ pub const Runner = union(enum) {
         url: []const u8,
     },
 };
-
-const std = @import("std");
 
 test "direct runner stores executable path" {
     const runner = Runner{ .direct = .{ .executable = "/bin/echo", .args = &.{} } };

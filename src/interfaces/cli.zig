@@ -65,7 +65,7 @@ fn has_recognized_subcommand(argv: []const []const u8) bool {
 fn is_version_flag(argv: []const []const u8) bool {
     if (argv.len < 2) return false;
     const first = argv[1];
-    return std.mem.eql(u8, first, "--version") or std.mem.eql(u8, first, "-v");
+    return std.mem.eql(u8, first, "--version") or std.mem.eql(u8, first, "-V");
 }
 
 fn print_version(writer: anytype) !void {
@@ -99,8 +99,10 @@ pub fn parse(allocator: std.mem.Allocator) !Command {
     defer std.process.argsFree(allocator, argv);
 
     if (is_version_flag(argv)) {
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        print_version(stdout) catch {};
+        var buf: [128]u8 = undefined;
+        var w = std.fs.File.stdout().writer(&buf);
+        print_version(&w.interface) catch {};
+        w.interface.flush() catch {};
         std.process.exit(0);
     }
 
@@ -173,7 +175,6 @@ pub fn parse(allocator: std.mem.Allocator) !Command {
     });
 
     const app = cli.App{
-        .version = version_info.version,
         .command = .{
             .name = "ztick",
             .description = .{
@@ -181,6 +182,7 @@ pub fn parse(allocator: std.mem.Allocator) !Command {
             },
             .target = .{ .subcommands = subcommands },
         },
+        .version = version_info.version,
     };
 
     try r.run(&app);
@@ -236,9 +238,9 @@ test "has_recognized_subcommand detects server, dump, --help" {
     try std.testing.expect(!has_recognized_subcommand(&.{ "ztick", "-c", "/etc/ztick.toml" }));
 }
 
-test "is_version_flag detects --version and -v at first position" {
+test "is_version_flag detects --version and -V at first position" {
     try std.testing.expect(is_version_flag(&.{ "ztick", "--version" }));
-    try std.testing.expect(is_version_flag(&.{ "ztick", "-v" }));
+    try std.testing.expect(is_version_flag(&.{ "ztick", "-V" }));
     try std.testing.expect(!is_version_flag(&.{"ztick"}));
     try std.testing.expect(!is_version_flag(&.{ "ztick", "server" }));
     try std.testing.expect(!is_version_flag(&.{ "ztick", "--help" }));

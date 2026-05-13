@@ -25,6 +25,10 @@ pub const ExecutionClient = struct {
     }
 
     pub fn deinit(self: *ExecutionClient) void {
+        var it = self.triggered.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.job_identifier);
+        }
         self.triggered.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.resolved.deinit(self.allocator);
@@ -35,18 +39,22 @@ pub const ExecutionClient = struct {
         std.crypto.random.bytes(&bytes);
         const identifier = std.mem.readInt(u128, &bytes, .big);
 
+        const owned_id = try self.allocator.dupe(u8, job_identifier);
+        errdefer self.allocator.free(owned_id);
+
         const request = execution.Request{
             .identifier = identifier,
-            .job_identifier = job_identifier,
+            .job_identifier = owned_id,
             .runner = runner,
             .execution = job_execution,
         };
         try self.triggered.put(self.allocator, identifier, request);
+        errdefer _ = self.triggered.remove(identifier);
         try self.pending.append(self.allocator, request);
     }
 
-    pub fn resolve(self: *ExecutionClient, response: execution.Response) void {
-        self.resolved.append(self.allocator, response) catch {};
+    pub fn resolve(self: *ExecutionClient, response: execution.Response) !void {
+        try self.resolved.append(self.allocator, response);
     }
 
     pub fn drain_pending(self: *ExecutionClient, sender: anytype) void {
@@ -69,12 +77,11 @@ pub const ExecutionClient = struct {
         errdefer results.deinit(allocator);
 
         for (self.resolved.items) |resp| {
-            if (self.triggered.get(resp.identifier)) |req| {
+            if (self.triggered.fetchRemove(resp.identifier)) |kv| {
                 try results.append(allocator, .{
-                    .job_identifier = req.job_identifier,
+                    .job_identifier = kv.value.job_identifier,
                     .success = resp.success,
                 });
-                _ = self.triggered.remove(resp.identifier);
             }
         }
 
@@ -85,9 +92,7 @@ pub const ExecutionClient = struct {
 };
 
 test "trigger stores request in tracking map" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var client = ExecutionClient.init(allocator);
     defer client.deinit();
@@ -98,9 +103,7 @@ test "trigger stores request in tracking map" {
 }
 
 test "trigger generates unique identifiers for each invocation" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var client = ExecutionClient.init(allocator);
     defer client.deinit();
@@ -112,9 +115,7 @@ test "trigger generates unique identifiers for each invocation" {
 }
 
 test "pull_results returns execution results for triggered jobs" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var client = ExecutionClient.init(allocator);
     defer client.deinit();
@@ -122,19 +123,20 @@ test "pull_results returns execution results for triggered jobs" {
     try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } }, 0);
 
     const identifier = client.pending.items[0].identifier;
-    client.resolve(.{ .identifier = identifier, .success = true });
+    try client.resolve(.{ .identifier = identifier, .success = true });
 
     const results = try client.pull_results(allocator);
-    defer allocator.free(results);
+    defer {
+        for (results) |r| allocator.free(r.job_identifier);
+        allocator.free(results);
+    }
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqualStrings("job.1", results[0].job_identifier);
 }
 
 test "pull_results drains tracked executions" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var client = ExecutionClient.init(allocator);
     defer client.deinit();
@@ -143,11 +145,14 @@ test "pull_results drains tracked executions" {
     try client.trigger("job.2", .{ .shell = .{ .command = "echo world" } }, 0);
 
     for (client.pending.items) |req| {
-        client.resolve(.{ .identifier = req.identifier, .success = true });
+        try client.resolve(.{ .identifier = req.identifier, .success = true });
     }
 
     const first = try client.pull_results(allocator);
-    defer allocator.free(first);
+    defer {
+        for (first) |r| allocator.free(r.job_identifier);
+        allocator.free(first);
+    }
     try std.testing.expectEqual(@as(usize, 2), first.len);
 
     const second = try client.pull_results(allocator);
@@ -155,10 +160,8 @@ test "pull_results drains tracked executions" {
     try std.testing.expectEqual(@as(usize, 0), second.len);
 }
 
-test "resolve does not propagate allocation error to caller" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+test "resolve stores result successfully" {
+    const allocator = std.testing.allocator;
 
     var client = ExecutionClient.init(allocator);
     defer client.deinit();
@@ -166,34 +169,31 @@ test "resolve does not propagate allocation error to caller" {
     try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } }, 0);
     const identifier = client.pending.items[0].identifier;
 
-    client.resolve(.{ .identifier = identifier, .success = true });
+    try client.resolve(.{ .identifier = identifier, .success = true });
 
     try std.testing.expectEqual(@as(usize, 1), client.resolved.items.len);
 }
 
-test "resolve silently discards result on allocation failure" {
+test "resolve returns error on allocation failure" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer std.debug.assert(gpa.deinit() == .ok);
 
-    // fail_index = 2: allows 2 allocations (triggered.put + pending.append in trigger)
+    // fail_index = 3: allows 3 allocations (dupe + triggered.put + pending.append in trigger)
     // then fails on resolved.append inside resolve
-    var failing = std.testing.FailingAllocator.init(gpa.allocator(), .{ .fail_index = 2 });
+    var failing = std.testing.FailingAllocator.init(gpa.allocator(), .{ .fail_index = 3 });
     var client = ExecutionClient.init(failing.allocator());
     defer client.deinit();
 
     try client.trigger("job.1", .{ .shell = .{ .command = "echo hello" } }, 0);
     const identifier = client.pending.items[0].identifier;
 
-    // resolve must not panic — silent catch handles OOM
-    client.resolve(.{ .identifier = identifier, .success = true });
+    try std.testing.expectError(error.OutOfMemory, client.resolve(.{ .identifier = identifier, .success = true }));
 
     try std.testing.expectEqual(@as(usize, 0), client.resolved.items.len);
 }
 
 test "drain_pending clears only sent prefix on channel closed" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var client = ExecutionClient.init(allocator);
     defer client.deinit();

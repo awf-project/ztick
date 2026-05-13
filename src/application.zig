@@ -4,3 +4,5 @@ pub const query_handler = @import("application/query_handler.zig");
 pub const execution_client = @import("application/execution_client.zig");
 pub const scheduler = @import("application/scheduler.zig");
 pub const token_store = @import("application/token_store.zig");
+pub const persistence_codec = @import("application/persistence_codec.zig");
+pub const instruments = @import("application/instruments.zig");

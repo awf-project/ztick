@@ -12,6 +12,7 @@ pub const TlsError = error{
     HandshakeFailed,
 };
 
+// TlsStream takes ownership of the underlying fd; callers must not close it separately.
 pub const TlsStream = struct {
     ssl: *c.SSL,
     fd: std.posix.fd_t,
@@ -31,6 +32,7 @@ pub const TlsStream = struct {
     }
 
     pub fn close(self: TlsStream) void {
+        // Single-call shutdown — sufficient for server-initiated close.
         _ = c.SSL_shutdown(self.ssl);
         c.SSL_free(self.ssl);
         std.posix.close(self.fd);
@@ -99,17 +101,25 @@ test "create returns CertificateLoadFailed when cert path does not exist" {
 }
 
 test "create returns CertificateLoadFailed when PEM content is invalid" {
-    const tmp_cert = "/tmp/ztick_test_invalid_cert.pem";
-    const tmp_key = "/tmp/ztick_test_invalid_key.pem";
-    const cert_file = try std.fs.cwd().createFile(tmp_cert, .{});
-    defer std.fs.cwd().deleteFile(tmp_cert) catch {};
-    try cert_file.writeAll("not a valid pem certificate");
-    cert_file.close();
-    const key_file = try std.fs.cwd().createFile(tmp_key, .{});
-    defer std.fs.cwd().deleteFile(tmp_key) catch {};
-    try key_file.writeAll("not a valid pem key");
-    key_file.close();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    const result = TlsContext.create(tmp_cert, tmp_key);
+    {
+        const cert_file = try tmp.dir.createFile("invalid_cert.pem", .{});
+        try cert_file.writeAll("not a valid pem certificate");
+        cert_file.close();
+    }
+    {
+        const key_file = try tmp.dir.createFile("invalid_key.pem", .{});
+        try key_file.writeAll("not a valid pem key");
+        key_file.close();
+    }
+
+    var cert_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cert_path = try tmp.dir.realpath("invalid_cert.pem", &cert_path_buf);
+    var key_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const key_path = try tmp.dir.realpath("invalid_key.pem", &key_path_buf);
+
+    const result = TlsContext.create(cert_path, key_path);
     try std.testing.expectError(TlsError.CertificateLoadFailed, result);
 }

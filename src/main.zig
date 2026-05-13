@@ -1,35 +1,45 @@
 const std = @import("std");
-const domain_job = @import("domain/job.zig");
-const domain_rule = @import("domain/rule.zig");
-const domain_runner = @import("domain/runner.zig");
-const domain_instruction = @import("domain/instruction.zig");
-const domain_query = @import("domain/query.zig");
-const domain_execution = @import("domain/execution.zig");
-const domain_auth = @import("domain/auth.zig");
-const persistence_encoder = @import("infrastructure/persistence/encoder.zig");
-const persistence_logfile = @import("infrastructure/persistence/logfile.zig");
-const persistence_backend = @import("infrastructure/persistence/backend.zig");
-const protocol_parser = @import("infrastructure/protocol/parser.zig");
-const application_job_storage = @import("application/job_storage.zig");
-const application_rule_storage = @import("application/rule_storage.zig");
-const application_query_handler = @import("application/query_handler.zig");
-const application_execution_client = @import("application/execution_client.zig");
-const application_scheduler = @import("application/scheduler.zig");
-const application_token_store = @import("application/token_store.zig");
-const infrastructure_auth = @import("infrastructure/auth.zig");
-const infrastructure_channel = @import("infrastructure/channel.zig");
-const infrastructure_clock = @import("infrastructure/clock.zig");
-const infrastructure_runner = @import("infrastructure/runner.zig");
-const infrastructure_tcp_server = @import("infrastructure/tcp_server.zig");
-const infrastructure_http = @import("infrastructure/http.zig");
-const infrastructure_tls_context = @import("infrastructure/tls_context.zig");
-const infrastructure_telemetry = @import("infrastructure/telemetry.zig");
-const infrastructure_persistence_background = @import("infrastructure/persistence/background.zig");
-const interfaces_config = @import("interfaces/config.zig");
-const interfaces_cli = @import("interfaces/cli.zig");
-const interfaces_dump = @import("interfaces/dump.zig");
+const domain = @import("domain.zig");
+const application = @import("application.zig");
+const infrastructure = @import("infrastructure.zig");
+const interfaces = @import("interfaces.zig");
+
+const query = domain.query;
+const execution = domain.execution;
+const instruction = domain.instruction;
+
+const persistence_backend = infrastructure.persistence.backend;
+const infrastructure_persistence_background = infrastructure.persistence.background;
+const infrastructure_channel = infrastructure.channel;
+const infrastructure_clock = infrastructure.clock;
+const infrastructure_tcp_server = infrastructure.tcp_server;
+const infrastructure_http = infrastructure.http;
+const infrastructure_tls_context = infrastructure.tls_context;
+const infrastructure_telemetry = infrastructure.telemetry;
+const infrastructure_auth = infrastructure.auth;
+const infrastructure_runner = infrastructure.runner;
+
+const interfaces_config = interfaces.config;
+const interfaces_cli = interfaces.cli;
+const interfaces_dump = interfaces.dump;
+
+const application_scheduler = application.scheduler;
+const application_token_store = application.token_store;
 
 var runtime_log_level: ?std.log.Level = null;
+
+var global_running: *std.atomic.Value(bool) = undefined;
+var global_listen_fd: std.atomic.Value(std.posix.socket_t) = std.atomic.Value(std.posix.socket_t).init(-1);
+
+fn signal_handler(_: c_int) callconv(.c) void {
+    global_running.store(false, .release);
+    // shutdown() (not close()) unblocks a thread blocked in accept() on Linux.
+    // close() from a different thread does not reliably interrupt accept().
+    // We load (not swap) the fd because TcpServer.start() owns the close;
+    // we only need to trigger the return from accept().
+    const fd = global_listen_fd.load(.acquire);
+    if (fd != -1) std.posix.shutdown(fd, .both) catch {};
+}
 
 pub const std_options = std.Options{
     .log_level = .debug,
@@ -62,45 +72,23 @@ fn log_fn(
     _ = scope;
     std.debug.lockStdErr();
     defer std.debug.unlockStdErr();
-    log_fn_write(std.fs.File.stderr().deprecatedWriter(), level, format, args);
+    var buf: [1024]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    log_fn_write(&w.interface, level, format, args);
+    w.interface.flush() catch {};
 }
 
 const Channel = infrastructure_channel.Channel;
 const TcpServer = infrastructure_tcp_server.TcpServer;
-const Scheduler = application_scheduler.Scheduler;
+const BackendState = persistence_backend.BackendState;
+const Scheduler = application_scheduler.SchedulerWith(BackendState);
 const Clock = infrastructure_clock.Clock;
-const query = domain_query;
-const execution = domain_execution;
 
 test {
-    _ = domain_job;
-    _ = domain_rule;
-    _ = domain_runner;
-    _ = domain_instruction;
-    _ = domain_query;
-    _ = domain_execution;
-    _ = persistence_encoder;
-    _ = persistence_logfile;
-    _ = persistence_backend;
-    _ = protocol_parser;
-    _ = application_job_storage;
-    _ = application_rule_storage;
-    _ = application_query_handler;
-    _ = application_execution_client;
-    _ = application_scheduler;
-    _ = application_token_store;
-    _ = infrastructure_auth;
-    _ = infrastructure_channel;
-    _ = infrastructure_clock;
-    _ = infrastructure_runner;
-    _ = infrastructure_tcp_server;
-    _ = infrastructure_http;
-    _ = infrastructure_tls_context;
-    _ = infrastructure_telemetry;
-    _ = infrastructure_persistence_background;
-    _ = interfaces_config;
-    _ = interfaces_cli;
-    _ = interfaces_dump;
+    _ = domain;
+    _ = application;
+    _ = infrastructure;
+    _ = interfaces;
 }
 
 const ResponseRouter = infrastructure_tcp_server.ResponseRouter;
@@ -126,13 +114,17 @@ const ControllerContext = struct {
     token_store: ?*application_token_store.TokenStore,
     instruments: ?infrastructure_telemetry.Instruments,
     active_connections: *std.atomic.Value(usize),
+    /// Passed to TcpServer.signal_listen_fd so the signal handler can close
+    /// the listen socket to unblock accept() on SIGINT/SIGTERM.
+    signal_listen_fd: *std.atomic.Value(std.posix.socket_t),
 };
 
 const DatabaseContext = struct {
     allocator: std.mem.Allocator,
     framerate: u16,
-    persistence: persistence_backend.PersistenceBackend,
-    compression_interval_ns: i64,
+    /// The raw backend is stored here so run_database can wrap it in BackendState.
+    backend: persistence_backend.PersistenceBackend,
+    compression_interval_ns: u64,
     running: *std.atomic.Value(bool),
     request_ch: *Channel(query.Request),
     response_router: *ResponseRouter,
@@ -179,6 +171,7 @@ fn run_http_controller(ctx: HttpControllerContext) void {
 
 fn run_controller(ctx: ControllerContext) void {
     var server = TcpServer.init(ctx.allocator, ctx.address, ctx.running, ctx.tls_context, ctx.active_connections, ctx.token_store);
+    server.signal_listen_fd = ctx.signal_listen_fd;
     if (ctx.instruments) |instr| server.set_instruments(instr);
     defer server.deinit();
     server.start(ctx.request_ch, ctx.response_router) catch |err| {
@@ -203,8 +196,9 @@ pub fn compress_startup_leftover(allocator: std.mem.Allocator, backend: persiste
 }
 
 fn run_database(ctx: DatabaseContext) void {
+    const backend_state = BackendState.init(ctx.backend);
     var scheduler = Scheduler.init(ctx.allocator);
-    scheduler.persistence = ctx.persistence;
+    scheduler.persistence = backend_state;
     scheduler.compression_interval_ns = ctx.compression_interval_ns;
     if (ctx.instruments) |instr| scheduler.set_instruments(instr);
     scheduler.set_stat_context(ctx.startup_ns, ctx.active_connections, ctx.auth_enabled, ctx.tls_enabled, ctx.framerate);
@@ -214,10 +208,10 @@ fn run_database(ctx: DatabaseContext) void {
         std.log.warn("database: load failed: {}", .{err});
     };
 
-    compress_startup_leftover(ctx.allocator, ctx.persistence);
+    compress_startup_leftover(ctx.allocator, ctx.backend);
     std.log.info("loaded {d} jobs, {d} rules", .{
-        scheduler.job_storage.jobs.count(),
-        scheduler.rule_storage.rules.count(),
+        scheduler.job_storage.count(),
+        scheduler.rule_storage.count(),
     });
 
     var wake_mutex = std.Thread.Mutex{};
@@ -242,7 +236,9 @@ const TickContext = struct {
 
     fn tick(self: TickContext) ?i64 {
         while (self.exec_response_ch.try_receive()) |resp| {
-            self.scheduler.execution_client.resolve(resp);
+            self.scheduler.execution_client.resolve(resp) catch |err| {
+                std.log.warn("execution_client: failed to store execution result: {}", .{err});
+            };
         }
 
         var drain_buf: [1024]query.Request = undefined;
@@ -264,7 +260,10 @@ const TickContext = struct {
 fn run_processor(ctx: ProcessorContext) void {
     while (ctx.exec_request_ch.receive()) |req| {
         const resp = infrastructure_runner.execute(ctx.allocator, ctx.shell_config, req);
-        ctx.exec_response_ch.send(resp) catch return;
+        ctx.exec_response_ch.send(resp) catch |err| {
+            std.log.err("processor: response channel full, dropping response: {}", .{err});
+            return;
+        };
     }
 }
 
@@ -492,6 +491,7 @@ test "controller context tls_context is null when no TLS cert is configured" {
     var router = ResponseRouter.init(allocator);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
+    var sig_fd = std.atomic.Value(std.posix.socket_t).init(-1);
 
     var active = std.atomic.Value(usize).init(0);
     const ctx = ControllerContext{
@@ -504,6 +504,7 @@ test "controller context tls_context is null when no TLS cert is configured" {
         .token_store = null,
         .instruments = null,
         .active_connections = &active,
+        .signal_listen_fd = &sig_fd,
     };
     try std.testing.expectEqual(@as(?*infrastructure_tls_context.TlsContext, null), ctx.tls_context);
     try std.testing.expectEqual(@as(?*application_token_store.TokenStore, null), ctx.token_store);
@@ -516,6 +517,7 @@ test "controller context token_store is non-null when auth file is configured" {
     var router = ResponseRouter.init(allocator);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
+    var sig_fd = std.atomic.Value(std.posix.socket_t).init(-1);
 
     var store = application_token_store.TokenStore.init(allocator);
     defer store.deinit();
@@ -531,6 +533,7 @@ test "controller context token_store is non-null when auth file is configured" {
         .token_store = &store,
         .instruments = null,
         .active_connections = &active,
+        .signal_listen_fd = &sig_fd,
     };
     try std.testing.expect(ctx.token_store != null);
 }
@@ -548,6 +551,7 @@ test "controller context tls_context is non-null when cert and key are configure
     var router = ResponseRouter.init(allocator);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
+    var sig_fd = std.atomic.Value(std.posix.socket_t).init(-1);
 
     var active = std.atomic.Value(usize).init(0);
     const ctx = ControllerContext{
@@ -560,6 +564,7 @@ test "controller context tls_context is non-null when cert and key are configure
         .token_store = null,
         .instruments = null,
         .active_connections = &active,
+        .signal_listen_fd = &sig_fd,
     };
     try std.testing.expect(ctx.tls_context != null);
 }
@@ -580,7 +585,7 @@ test "DatabaseContext instruments field is null when telemetry is disabled" {
     const ctx = DatabaseContext{
         .allocator = allocator,
         .framerate = 60,
-        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+        .backend = persistence_backend.PersistenceBackend{ .memory = .{
             .entries = .{},
             .allocator = allocator,
         } },
@@ -627,7 +632,7 @@ test "DatabaseContext instruments field holds Instruments when telemetry is enab
     const ctx = DatabaseContext{
         .allocator = allocator,
         .framerate = 60,
-        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+        .backend = persistence_backend.PersistenceBackend{ .memory = .{
             .entries = .{},
             .allocator = allocator,
         } },
@@ -669,7 +674,7 @@ test "tick with instrumented scheduler processes SET query and routes success re
 
     var router = ResponseRouter.init(allocator);
     defer router.deinit();
-    router.register(1, &resp_ch);
+    try router.register(1, &resp_ch);
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -715,7 +720,7 @@ test "DatabaseContext carries persistence backend and compression interval" {
     const logfile_ctx = DatabaseContext{
         .allocator = allocator,
         .framerate = 60,
-        .persistence = persistence_backend.PersistenceBackend{ .logfile = .{
+        .backend = persistence_backend.PersistenceBackend{ .logfile = .{
             .logfile_path = "ztick.log",
             .logfile_dir = tmp.dir,
             .load_arena = null,
@@ -733,13 +738,13 @@ test "DatabaseContext carries persistence backend and compression interval" {
         .auth_enabled = false,
         .tls_enabled = false,
     };
-    try std.testing.expect(logfile_ctx.persistence == .logfile);
-    try std.testing.expectEqual(@as(i64, 3600 * std.time.ns_per_s), logfile_ctx.compression_interval_ns);
+    try std.testing.expect(logfile_ctx.backend == .logfile);
+    try std.testing.expectEqual(@as(u64, 3600 * std.time.ns_per_s), logfile_ctx.compression_interval_ns);
 
     const memory_ctx = DatabaseContext{
         .allocator = allocator,
         .framerate = 60,
-        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+        .backend = persistence_backend.PersistenceBackend{ .memory = .{
             .entries = .{},
             .allocator = allocator,
         } },
@@ -755,7 +760,7 @@ test "DatabaseContext carries persistence backend and compression interval" {
         .auth_enabled = false,
         .tls_enabled = false,
     };
-    try std.testing.expect(memory_ctx.persistence == .memory);
+    try std.testing.expect(memory_ctx.backend == .memory);
 }
 
 test "DatabaseContext carries startup_ns for STAT uptime calculation" {
@@ -775,7 +780,7 @@ test "DatabaseContext carries startup_ns for STAT uptime calculation" {
     const ctx = DatabaseContext{
         .allocator = allocator,
         .framerate = 512,
-        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+        .backend = persistence_backend.PersistenceBackend{ .memory = .{
             .entries = .{},
             .allocator = allocator,
         } },
@@ -811,7 +816,7 @@ test "DatabaseContext carries active_connections pointer for STAT connection cou
     const ctx = DatabaseContext{
         .allocator = allocator,
         .framerate = 60,
-        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+        .backend = persistence_backend.PersistenceBackend{ .memory = .{
             .entries = .{},
             .allocator = allocator,
         } },
@@ -846,7 +851,7 @@ test "DatabaseContext carries auth_enabled and tls_enabled flags for STAT report
     const ctx = DatabaseContext{
         .allocator = allocator,
         .framerate = 60,
-        .persistence = persistence_backend.PersistenceBackend{ .memory = .{
+        .backend = persistence_backend.PersistenceBackend{ .memory = .{
             .entries = .{},
             .allocator = allocator,
         } },
@@ -878,14 +883,15 @@ test "tick with memory backend persists SET mutation to backend entries" {
     defer exec_resp_ch.deinit();
     var router = ResponseRouter.init(allocator);
     defer router.deinit();
-    router.register(1, &resp_ch);
+    try router.register(1, &resp_ch);
 
-    var scheduler = Scheduler.init(allocator);
-    defer scheduler.deinit();
-    scheduler.persistence = persistence_backend.PersistenceBackend{ .memory = .{
+    const backend_state = BackendState.init(persistence_backend.PersistenceBackend{ .memory = .{
         .entries = .{},
         .allocator = allocator,
-    } };
+    } });
+    var scheduler = Scheduler.init(allocator);
+    defer scheduler.deinit();
+    scheduler.persistence = backend_state;
 
     const req = query.Request{
         .client = 1,
@@ -906,7 +912,7 @@ test "tick with memory backend persists SET mutation to backend entries" {
     const resp = resp_ch.try_receive();
     try std.testing.expect(resp != null);
     try std.testing.expect(resp.?.success);
-    try std.testing.expectEqual(@as(usize, 1), scheduler.persistence.?.memory.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.persistence.?.backend.memory.entries.items.len);
 }
 
 test "tick processes query request and routes response" {
@@ -923,7 +929,7 @@ test "tick processes query request and routes response" {
     var router = ResponseRouter.init(allocator);
     defer router.deinit();
 
-    router.register(1, &resp_ch);
+    try router.register(1, &resp_ch);
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -988,7 +994,7 @@ test "tick returns earliest job execution time after drain processes SET request
     defer exec_resp_ch.deinit();
     var router = ResponseRouter.init(allocator);
     defer router.deinit();
-    router.register(1, &resp_ch);
+    try router.register(1, &resp_ch);
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
@@ -1024,7 +1030,7 @@ test "tick drains three concurrent SET requests in a single call and routes all 
     defer exec_resp_ch.deinit();
     var router = ResponseRouter.init(allocator);
     defer router.deinit();
-    router.register(1, &resp_ch);
+    try router.register(1, &resp_ch);
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
@@ -1061,7 +1067,7 @@ test "tick returns earliest of two jobs when both are future-scheduled" {
     defer exec_resp_ch.deinit();
     var router = ResponseRouter.init(allocator);
     defer router.deinit();
-    router.register(1, &resp_ch);
+    try router.register(1, &resp_ch);
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
@@ -1091,13 +1097,17 @@ pub fn main() !void {
         defer allocator.free(command.dump.options.logfile_path);
         interfaces_dump.run_dump(allocator, command.dump.options) catch |err| switch (err) {
             error.FileNotFound => {
-                const stderr = std.fs.File.stderr().deprecatedWriter();
-                stderr.print("error: file not found: {s}\n", .{command.dump.options.logfile_path}) catch {};
+                var ebuf: [256]u8 = undefined;
+                var ew = std.fs.File.stderr().writer(&ebuf);
+                ew.interface.print("error: file not found: {s}\n", .{command.dump.options.logfile_path}) catch {};
+                ew.interface.flush() catch {};
                 std.process.exit(1);
             },
             error.PermissionDenied => {
-                const stderr = std.fs.File.stderr().deprecatedWriter();
-                stderr.print("error: permission denied: {s}\n", .{command.dump.options.logfile_path}) catch {};
+                var ebuf: [256]u8 = undefined;
+                var ew = std.fs.File.stderr().writer(&ebuf);
+                ew.interface.print("error: permission denied: {s}\n", .{command.dump.options.logfile_path}) catch {};
+                ew.interface.flush() catch {};
                 std.process.exit(1);
             },
             else => return err,
@@ -1152,6 +1162,15 @@ pub fn main() !void {
 
     var running = std.atomic.Value(bool).init(true);
 
+    global_running = &running;
+    const sa = std.posix.Sigaction{
+        .handler = .{ .handler = signal_handler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+
     var tls_ctx: ?infrastructure_tls_context.TlsContext = null;
     if (cfg.controller_tls_cert) |cert| {
         const key = cfg.controller_tls_key.?;
@@ -1160,11 +1179,9 @@ pub fn main() !void {
     defer if (tls_ctx) |*ctx| ctx.deinit();
 
     var token_store: ?application_token_store.TokenStore = null;
-    var auth_tokens: ?[]domain_auth.Token = null;
+    var auth_tokens: ?[]domain.auth.Token = null;
     if (cfg.controller_auth_file) |auth_file| {
-        const content = try std.fs.cwd().readFileAlloc(allocator, auth_file, 1024 * 1024);
-        defer allocator.free(content);
-        auth_tokens = try infrastructure_auth.parse(allocator, content);
+        auth_tokens = try infrastructure_auth.load(allocator, auth_file);
         var store = application_token_store.TokenStore.init(allocator);
         try store.load(auth_tokens.?);
         token_store = store;
@@ -1189,19 +1206,28 @@ pub fn main() !void {
         .token_store = if (token_store) |*store| store else null,
         .instruments = telemetry_instruments,
         .active_connections = &active_connections,
+        .signal_listen_fd = &global_listen_fd,
     }});
+    // If any later spawn fails, signal running=false so the controller exits its accept loop.
+    errdefer {
+        running.store(false, .release);
+        controller_thread.join();
+    }
 
     const http_thread: ?std.Thread = if (cfg.http_listen) |http_addr| blk: {
         std.log.info("HTTP listening on {s}", .{http_addr});
-        break :blk try std.Thread.spawn(.{}, run_http_controller, .{HttpControllerContext{
+        const ht = try std.Thread.spawn(.{}, run_http_controller, .{HttpControllerContext{
             .allocator = allocator,
             .address = http_addr,
             .request_ch = &query_request_ch,
             .response_router = &response_router,
             .running = &running,
-            .bearer_token = null,
+            .bearer_token = cfg.http_bearer_token,
         }});
+        break :blk ht;
     } else null;
+    // If any later spawn fails, join the http thread (running already false from above errdefer).
+    errdefer if (http_thread) |ht| ht.join();
 
     const backend: persistence_backend.PersistenceBackend = switch (cfg.database_persistence) {
         .logfile => .{ .logfile = .{
@@ -1219,8 +1245,8 @@ pub fn main() !void {
     const database_thread = try std.Thread.spawn(.{}, run_database, .{DatabaseContext{
         .allocator = allocator,
         .framerate = cfg.database_framerate,
-        .persistence = backend,
-        .compression_interval_ns = @as(i64, cfg.database_compression_interval) * std.time.ns_per_s,
+        .backend = backend,
+        .compression_interval_ns = @as(u64, cfg.database_compression_interval) * std.time.ns_per_s,
         .running = &running,
         .request_ch = &query_request_ch,
         .response_router = &response_router,
@@ -1232,6 +1258,11 @@ pub fn main() !void {
         .auth_enabled = cfg.controller_auth_file != null,
         .tls_enabled = cfg.controller_tls_cert != null,
     }});
+    // If the processor spawn fails, close the request channel so the database exits its tick loop.
+    errdefer {
+        query_request_ch.close();
+        database_thread.join();
+    }
 
     const processor_thread = try std.Thread.spawn(.{}, run_processor, .{ProcessorContext{
         .allocator = allocator,
@@ -1242,9 +1273,10 @@ pub fn main() !void {
 
     controller_thread.join();
 
+    running.store(false, .release);
+
     if (http_thread) |ht| ht.join();
 
-    running.store(false, .release);
     query_request_ch.close();
 
     database_thread.join();

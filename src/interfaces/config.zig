@@ -1,4 +1,8 @@
 const std = @import("std");
+const domain = @import("../domain.zig");
+
+/// Re-exported from domain layer; defined in domain/shell_config.zig.
+pub const ShellConfig = domain.shell_config.ShellConfig;
 
 pub const LogLevel = enum {
     off,
@@ -14,12 +18,7 @@ pub const PersistenceMode = enum {
     memory,
 };
 
-pub const TelemetryConfig = struct {
-    enabled: bool,
-    endpoint: ?[]const u8,
-    service_name: []const u8,
-    flush_interval_ms: u32,
-};
+pub const TelemetryConfig = domain.telemetry_config.TelemetryConfig;
 
 pub const ConfigError = error{
     InvalidLogLevel,
@@ -30,20 +29,9 @@ pub const ConfigError = error{
     InvalidShellPath,
 };
 
-pub const ShellConfig = struct {
-    path: []const u8,
-    args: []const []const u8,
-
-    pub fn deinit(self: ShellConfig, allocator: std.mem.Allocator) void {
-        allocator.free(self.path);
-        for (self.args) |arg| allocator.free(arg);
-        allocator.free(self.args);
-    }
-
-    pub fn validate(self: ShellConfig) ConfigError!void {
-        std.posix.access(self.path, std.posix.X_OK) catch return ConfigError.InvalidShellPath;
-    }
-};
+pub fn validate_shell_config(config: ShellConfig) ConfigError!void {
+    std.posix.access(config.path, std.posix.X_OK) catch return ConfigError.InvalidShellPath;
+}
 
 pub const Config = struct {
     log_level: LogLevel,
@@ -60,6 +48,7 @@ pub const Config = struct {
     telemetry: TelemetryConfig,
     shell: ShellConfig,
     http_listen: ?[]const u8,
+    http_bearer_token: ?[]const u8,
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.controller_listen);
@@ -71,6 +60,7 @@ pub const Config = struct {
         allocator.free(self.telemetry.service_name);
         self.shell.deinit(allocator);
         if (self.http_listen) |hl| allocator.free(hl);
+        if (self.http_bearer_token) |bt| allocator.free(bt);
     }
 };
 
@@ -105,6 +95,8 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
     };
     var http_listen: ?[]u8 = null;
     errdefer if (http_listen) |hl| allocator.free(hl);
+    var http_bearer_token: ?[]u8 = null;
+    errdefer if (http_bearer_token) |bt| allocator.free(bt);
 
     var current_section: []const u8 = "";
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -141,16 +133,16 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
         } else if (std.mem.eql(u8, current_section, "controller")) {
             if (std.mem.eql(u8, key, "listen")) {
                 if (controller_listen) |prev| allocator.free(prev);
-                controller_listen = try allocator.dupe(u8, unquote(raw_val));
+                controller_listen = try unquote_and_unescape(allocator, raw_val);
             } else if (std.mem.eql(u8, key, "tls_cert")) {
                 if (controller_tls_cert) |prev| allocator.free(prev);
-                controller_tls_cert = try allocator.dupe(u8, unquote(raw_val));
+                controller_tls_cert = try unquote_and_unescape(allocator, raw_val);
             } else if (std.mem.eql(u8, key, "tls_key")) {
                 if (controller_tls_key) |prev| allocator.free(prev);
-                controller_tls_key = try allocator.dupe(u8, unquote(raw_val));
+                controller_tls_key = try unquote_and_unescape(allocator, raw_val);
             } else if (std.mem.eql(u8, key, "auth_file")) {
                 if (controller_auth_file) |prev| allocator.free(prev);
-                controller_auth_file = try allocator.dupe(u8, unquote(raw_val));
+                controller_auth_file = try unquote_and_unescape(allocator, raw_val);
             } else {
                 return ConfigError.UnknownKey;
             }
@@ -165,10 +157,10 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
                 }
             } else if (std.mem.eql(u8, key, "endpoint")) {
                 if (telemetry_endpoint) |prev| allocator.free(prev);
-                telemetry_endpoint = try allocator.dupe(u8, unquote(raw_val));
+                telemetry_endpoint = try unquote_and_unescape(allocator, raw_val);
             } else if (std.mem.eql(u8, key, "service_name")) {
                 if (telemetry_service_name) |prev| allocator.free(prev);
-                telemetry_service_name = try allocator.dupe(u8, unquote(raw_val));
+                telemetry_service_name = try unquote_and_unescape(allocator, raw_val);
             } else if (std.mem.eql(u8, key, "flush_interval_ms")) {
                 telemetry_flush_interval_ms = std.fmt.parseInt(u32, raw_val, 10) catch return ConfigError.InvalidValue;
             } else {
@@ -177,7 +169,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
         } else if (std.mem.eql(u8, current_section, "shell")) {
             if (std.mem.eql(u8, key, "path")) {
                 if (shell_path) |prev| allocator.free(prev);
-                shell_path = try allocator.dupe(u8, unquote(raw_val));
+                shell_path = try unquote_and_unescape(allocator, raw_val);
             } else if (std.mem.eql(u8, key, "args")) {
                 if (shell_args) |prev| {
                     for (prev) |arg| allocator.free(arg);
@@ -190,7 +182,10 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
         } else if (std.mem.eql(u8, current_section, "http")) {
             if (std.mem.eql(u8, key, "listen")) {
                 if (http_listen) |prev| allocator.free(prev);
-                http_listen = try allocator.dupe(u8, unquote(raw_val));
+                http_listen = try unquote_and_unescape(allocator, raw_val);
+            } else if (std.mem.eql(u8, key, "bearer_token")) {
+                if (http_bearer_token) |prev| allocator.free(prev);
+                http_bearer_token = try unquote_and_unescape(allocator, raw_val);
             } else {
                 return ConfigError.UnknownKey;
             }
@@ -209,7 +204,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
                 database_framerate = n;
             } else if (std.mem.eql(u8, key, "logfile_path")) {
                 if (database_logfile_path) |prev| allocator.free(prev);
-                database_logfile_path = try allocator.dupe(u8, unquote(raw_val));
+                database_logfile_path = try unquote_and_unescape(allocator, raw_val);
             } else if (std.mem.eql(u8, key, "persistence")) {
                 database_persistence = std.meta.stringToEnum(PersistenceMode, unquote(raw_val)) orelse return ConfigError.InvalidValue;
             } else if (std.mem.eql(u8, key, "compression_interval")) {
@@ -246,6 +241,7 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (ConfigError || 
             .args = shell_args orelse try make_default_shell_args(allocator),
         },
         .http_listen = http_listen,
+        .http_bearer_token = http_bearer_token,
     };
 }
 
@@ -256,7 +252,7 @@ fn make_default_shell_args(allocator: std.mem.Allocator) std.mem.Allocator.Error
     return args;
 }
 
-fn unescape_toml_string(allocator: std.mem.Allocator, raw: []const u8) (ConfigError || std.mem.Allocator.Error)![]const u8 {
+fn unescape_toml_string(allocator: std.mem.Allocator, raw: []const u8) (ConfigError || std.mem.Allocator.Error)![]u8 {
     var buf = try allocator.alloc(u8, raw.len);
     errdefer allocator.free(buf);
     var out: usize = 0;
@@ -271,6 +267,31 @@ fn unescape_toml_string(allocator: std.mem.Allocator, raw: []const u8) (ConfigEr
                 },
                 '\\' => {
                     buf[out] = '\\';
+                    out += 1;
+                    i += 2;
+                },
+                'n' => {
+                    buf[out] = '\n';
+                    out += 1;
+                    i += 2;
+                },
+                't' => {
+                    buf[out] = '\t';
+                    out += 1;
+                    i += 2;
+                },
+                'r' => {
+                    buf[out] = '\r';
+                    out += 1;
+                    i += 2;
+                },
+                'b' => {
+                    buf[out] = 0x08;
+                    out += 1;
+                    i += 2;
+                },
+                'f' => {
+                    buf[out] = 0x0C;
                     out += 1;
                     i += 2;
                 },
@@ -337,24 +358,29 @@ fn parse_toml_string_array(allocator: std.mem.Allocator, raw: []const u8) (Confi
 }
 
 fn unquote(s: []const u8) []const u8 {
-    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') {
-        return s[1 .. s.len - 1];
+    if (s.len >= 2) {
+        if (s[0] == '"' and s[s.len - 1] == '"') return s[1 .. s.len - 1];
+        if (s[0] == '\'' and s[s.len - 1] == '\'') return s[1 .. s.len - 1];
     }
     return s;
 }
 
+/// Strips surrounding double-quotes and unescapes TOML escape sequences.
+/// Returns a newly allocated string that the caller must free.
+fn unquote_and_unescape(allocator: std.mem.Allocator, s: []const u8) (ConfigError || std.mem.Allocator.Error)![]u8 {
+    const inner = unquote(s);
+    return unescape_toml_string(allocator, inner);
+}
+
 pub fn load(allocator: std.mem.Allocator, path: ?[]const u8) !Config {
     const actual_path = path orelse return parse(allocator, "");
-    const file = std.fs.cwd().openFile(actual_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return parse(allocator, ""),
-        else => return err,
-    };
+    const file = std.fs.cwd().openFile(actual_path, .{}) catch |err| return err;
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 1024 * 1024);
     defer allocator.free(content);
     const cfg = try parse(allocator, content);
     errdefer cfg.deinit(allocator);
-    try cfg.shell.validate();
+    try validate_shell_config(cfg.shell);
     return cfg;
 }
 
@@ -683,12 +709,12 @@ test "parse rejects unknown key in shell section" {
 
 test "shell validate succeeds for existing executable path" {
     const cfg = ShellConfig{ .path = "/bin/sh", .args = &.{} };
-    try cfg.validate();
+    try validate_shell_config(cfg);
 }
 
 test "shell validate returns error for nonexistent path" {
     const cfg = ShellConfig{ .path = "/nonexistent/shell/binary", .args = &.{} };
-    try std.testing.expectError(ConfigError.InvalidShellPath, cfg.validate());
+    try std.testing.expectError(ConfigError.InvalidShellPath, validate_shell_config(cfg));
 }
 
 test "http listen defaults to null when section absent" {
