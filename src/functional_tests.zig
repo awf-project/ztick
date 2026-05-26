@@ -18,6 +18,47 @@ const protocol_parser = @import("infrastructure/protocol/parser.zig");
 const Channel = infrastructure_channel.Channel;
 const Clock = infrastructure_clock.Clock;
 
+fn nanosleep(ns: u64) void {
+    const req = std.os.linux.timespec{
+        .sec = @intCast(ns / 1_000_000_000),
+        .nsec = @intCast(ns % 1_000_000_000),
+    };
+    _ = std.os.linux.nanosleep(&req, null);
+}
+
+fn timestamp_ns() i128 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+}
+
+// Low-level socket helpers: std.posix.write/close/fcntl were removed in 0.16.
+// These wrappers use std.os.linux syscalls directly for test-only TCP/socket operations.
+fn sock_write(fd: std.posix.fd_t, data: []const u8) !void {
+    const linux = std.os.linux;
+    const ret = linux.write(fd, data.ptr, data.len);
+    if (linux.errno(ret) != .SUCCESS) return error.WriteError;
+}
+
+fn sock_read(fd: std.posix.fd_t, buf: []u8) !usize {
+    const linux = std.os.linux;
+    const ret = linux.read(fd, buf.ptr, buf.len);
+    if (linux.errno(ret) != .SUCCESS) return error.ReadError;
+    return ret;
+}
+
+fn sock_close(fd: std.posix.fd_t) void {
+    _ = std.os.linux.close(fd);
+}
+
+fn sock_set_nonblock(fd: std.posix.fd_t) void {
+    const linux = std.os.linux;
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS) return;
+    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+    _ = linux.fcntl(fd, linux.F.SETFL, flags | nonblock);
+}
+
 const BackendState = persistence_backend.BackendState;
 const Scheduler = application_scheduler.SchedulerWith(BackendState);
 const Job = domain_job.Job;
@@ -26,9 +67,7 @@ const Rule = domain_rule.Rule;
 const Request = domain_query.Request;
 
 test "scheduler processes job from query to executed" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -66,9 +105,7 @@ test "scheduler processes job from query to executed" {
 }
 
 test "scheduler fails job when no matching rule exists" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -87,9 +124,7 @@ test "scheduler fails job when no matching rule exists" {
 }
 
 test "scheduler pairs jobs to correct rules by pattern" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -133,9 +168,7 @@ test "scheduler pairs jobs to correct rules by pattern" {
 }
 
 test "rule set via query enables subsequent job execution" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -169,7 +202,7 @@ test "rule set via query enables subsequent job execution" {
 }
 
 fn build_logfile_bytes(allocator: std.mem.Allocator, entries: []const persistence_encoder.Entry) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     for (entries) |entry| {
@@ -203,9 +236,7 @@ fn replay_into_scheduler(allocator: std.mem.Allocator, data: []const u8, schedul
 }
 
 test "persisted state restores into scheduler and resumes execution" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const original_job = Job{ .identifier = "app.restore.1", .execution = 5000, .status = .planned };
     const original_rule = Rule{
@@ -243,9 +274,7 @@ test "persisted state restores into scheduler and resumes execution" {
 }
 
 test "parsed protocol command drives scheduler via query" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const set_cmd = "A SET app.proto.job.1 1595586600000000000\n";
     const parsed = try protocol_parser.parse(allocator, set_cmd);
@@ -282,9 +311,7 @@ test "parsed protocol command drives scheduler via query" {
 }
 
 test "get existing job returns planned status with execution timestamp" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -308,9 +335,7 @@ test "get existing job returns planned status with execution timestamp" {
 }
 
 test "get nonexistent job returns failure with null body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -327,9 +352,7 @@ test "get nonexistent job returns failure with null body" {
 }
 
 test "query prefix match returns only matching jobs" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -372,9 +395,7 @@ test "query prefix match returns only matching jobs" {
 }
 
 test "query with empty pattern returns all jobs" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -414,9 +435,7 @@ test "query with empty pattern returns all jobs" {
 }
 
 test "query no match returns success with null body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -438,9 +457,7 @@ test "query no match returns success with null body" {
 }
 
 test "SET then REMOVE then GET returns absent" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -473,9 +490,7 @@ test "SET then REMOVE then GET returns absent" {
 }
 
 test "RULE SET then REMOVERULE then rule is absent" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -503,9 +518,7 @@ test "RULE SET then REMOVERULE then rule is absent" {
 }
 
 test "SET then REMOVE persisted and replayed leaves job absent" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const logfile_data = try build_logfile_bytes(allocator, &.{
         .{ .job = .{ .identifier = "cleanup.daily", .execution = 1595586600000000000, .status = .planned } },
@@ -523,9 +536,7 @@ test "SET then REMOVE persisted and replayed leaves job absent" {
 }
 
 test "RULE SET then REMOVERULE persisted and replayed leaves rule absent" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const logfile_data = try build_logfile_bytes(allocator, &.{
         .{ .rule = .{ .identifier = "notify-oncall", .pattern = "alert.", .runner = .{ .shell = .{ .command = "/bin/notify" } } } },
@@ -543,9 +554,7 @@ test "RULE SET then REMOVERULE persisted and replayed leaves rule absent" {
 }
 
 test "RULE SET then LISTRULES returns all rules" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -594,9 +603,7 @@ test "RULE SET then LISTRULES returns all rules" {
 }
 
 test "LISTRULES with no rules returns success with null body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -612,9 +619,7 @@ test "LISTRULES with no rules returns success with null body" {
 }
 
 test "LISTRULES with AMQP rule includes all runner fields" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -653,26 +658,27 @@ test "LISTRULES with AMQP rule includes all runner fields" {
 // Feature: F005
 
 fn spawn_ztick(allocator: std.mem.Allocator, config_path: []const u8) !std.process.Child {
-    var child = std.process.Child.init(
-        &[_][]const u8{ "zig-out/bin/ztick", "-c", config_path },
-        allocator,
-    );
-    child.stderr_behavior = .Pipe;
-    child.stdout_behavior = .Ignore;
-    child.stdin_behavior = .Ignore;
-    try child.spawn();
-    return child;
+    _ = allocator;
+    return std.process.spawn(std.testing.io, .{
+        .argv = &[_][]const u8{ "zig-out/bin/ztick", "-c", config_path },
+        .stderr = .pipe,
+        .stdout = .ignore,
+        .stdin = .ignore,
+    });
 }
 
-fn drain_stderr(stderr_file: std.fs.File, buf: []u8) []const u8 {
+fn drain_stderr(stderr_file: std.Io.File, buf: []u8) []const u8 {
     // Set non-blocking so read returns immediately when no data available.
-    const flags = std.posix.fcntl(stderr_file.handle, std.posix.F.GETFL, 0) catch return buf[0..0];
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(stderr_file.handle, std.posix.F.SETFL, flags | nonblock) catch return buf[0..0];
+    const linux = std.os.linux;
+    const flags_ret = linux.fcntl(stderr_file.handle, linux.F.GETFL, 0);
+    if (linux.errno(flags_ret) != .SUCCESS) return buf[0..0];
+    const flags: usize = flags_ret;
+    const nonblock: usize = @bitCast(@as(usize, @as(u32, @bitCast(linux.O{ .NONBLOCK = true }))));
+    _ = linux.fcntl(stderr_file.handle, linux.F.SETFL, flags | nonblock);
 
     var filled: usize = 0;
     while (filled < buf.len) {
-        const n = stderr_file.read(buf[filled..]) catch break;
+        const n = std.posix.read(stderr_file.handle, buf[filled..]) catch break;
         if (n == 0) break;
         filled += n;
     }
@@ -685,7 +691,11 @@ const TlsPaths = struct {
     key: []const u8,
 
     fn resolve(allocator: std.mem.Allocator) !TlsPaths {
-        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        // Dir.cwd().realPath(io, buf) fails with NOENT because AT.FDCWD (-100) is
+        // not a valid /proc/self/fd entry. Open "." first to get a real fd.
+        const cwd_len = try std.Io.Dir.cwd().realPathFile(std.testing.io, ".", &cwd_buf);
+        const cwd = try allocator.dupe(u8, cwd_buf[0..cwd_len]);
         errdefer allocator.free(cwd);
         const cert = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/tls/cert.pem", .{cwd});
         errdefer allocator.free(cert);
@@ -703,23 +713,24 @@ const TlsPaths = struct {
 const TestServer = struct {
     child: std.process.Child,
     tmp_dir: std.testing.TmpDir,
-    config_path: []const u8,
+    config_path: [:0]const u8,
     allocator: std.mem.Allocator,
 
     fn start(allocator: std.mem.Allocator, config_content: []const u8) !TestServer {
+        const io = std.testing.io;
         var tmp_dir = std.testing.tmpDir(.{});
         errdefer tmp_dir.cleanup();
 
-        var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-        try config_file.writeAll(config_content);
-        config_file.close();
+        var config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+        try config_file.writeStreamingAll(io, config_content);
+        config_file.close(io);
 
-        const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+        const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
         errdefer allocator.free(config_path);
 
         const child = try spawn_ztick(allocator, config_path);
 
-        std.Thread.sleep(300_000_000);
+        nanosleep(300_000_000);
 
         return .{
             .child = child,
@@ -730,8 +741,7 @@ const TestServer = struct {
     }
 
     fn stop(self: *TestServer) void {
-        std.posix.kill(self.child.id, std.posix.SIG.KILL) catch {};
-        _ = self.child.wait() catch {};
+        self.child.kill(std.testing.io);
         self.allocator.free(self.config_path);
         self.tmp_dir.cleanup();
     }
@@ -740,22 +750,23 @@ const TestServer = struct {
 // Feature: F006
 
 test "plaintext mode accepts commands when no TLS config is present" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(allocator, "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19879\"\n\n[database]\nlogfile_path = \"test_plaintext_f006.db\"\n");
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19879) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19879) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
 
-    _ = stream.write("req-backward-compat-1 SET app.backward.compat.job 1595586600000000000\n") catch {
-        stream.close();
+    _ = sock_write(stream.socket.handle, "req-backward-compat-1 SET app.backward.compat.job 1595586600000000000\n") catch {
+        sock_close(stream.socket.handle);
         return error.SkipZigTest;
     };
 
-    std.Thread.sleep(500_000_000);
-    stream.close();
-    std.Thread.sleep(100_000_000);
+    nanosleep(500_000_000);
+    sock_close(stream.socket.handle);
+    nanosleep(100_000_000);
 
     var stderr_buf: [8192]u8 = undefined;
     const stderr = drain_stderr(server.child.stderr.?, &stderr_buf);
@@ -763,144 +774,147 @@ test "plaintext mode accepts commands when no TLS config is present" {
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] listening on") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[DEBUG] instruction received: set") != null);
 
-    server.tmp_dir.dir.deleteFile("test_plaintext_f006.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_plaintext_f006.db") catch {};
 }
 
 test "partial TLS config with only tls_cert is rejected at startup" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-    try config_file.writeAll("[log]\nlevel = \"error\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\ntls_cert = \"/any/path/cert.pem\"\n\n[database]\nlogfile_path = \"test_partial_tls_cert.db\"\n");
-    config_file.close();
+    const config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+    try config_file.writeStreamingAll(io, "[log]\nlevel = \"error\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\ntls_cert = \"/any/path/cert.pem\"\n\n[database]\nlogfile_path = \"test_partial_tls_cert.db\"\n");
+    config_file.close(io);
 
-    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
     defer allocator.free(config_path);
 
     var child = try spawn_ztick(allocator, config_path);
-    const term = try child.wait();
+    const term = try child.wait(std.testing.io);
 
     switch (term) {
-        .Exited => |code| try std.testing.expect(code != 0),
+        .exited => |code| try std.testing.expect(code != 0),
         else => try std.testing.expect(false),
     }
 }
 
 test "partial TLS config with only tls_key is rejected at startup" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-    try config_file.writeAll("[log]\nlevel = \"error\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\ntls_key = \"/any/path/key.pem\"\n\n[database]\nlogfile_path = \"test_partial_tls_key.db\"\n");
-    config_file.close();
+    const config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+    try config_file.writeStreamingAll(io, "[log]\nlevel = \"error\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\ntls_key = \"/any/path/key.pem\"\n\n[database]\nlogfile_path = \"test_partial_tls_key.db\"\n");
+    config_file.close(io);
 
-    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
     defer allocator.free(config_path);
 
     var child = try spawn_ztick(allocator, config_path);
-    const term = try child.wait();
+    const term = try child.wait(std.testing.io);
 
     switch (term) {
-        .Exited => |code| try std.testing.expect(code != 0),
+        .exited => |code| try std.testing.expect(code != 0),
         else => try std.testing.expect(false),
     }
 }
 
 test "startup with default log level produces config and listening address on stderr" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-    try config_file.writeAll("[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\nlogfile_path = \"test_startup_log.db\"\n");
-    config_file.close();
+    const config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+    try config_file.writeStreamingAll(io, "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\nlogfile_path = \"test_startup_log.db\"\n");
+    config_file.close(io);
 
-    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
     defer allocator.free(config_path);
 
     var child = try spawn_ztick(allocator, config_path);
     const stderr_file = child.stderr.?;
 
-    std.Thread.sleep(300_000_000);
+    nanosleep(300_000_000);
 
     var stderr_buf: [4096]u8 = undefined;
     const stderr = drain_stderr(stderr_file, &stderr_buf);
 
-    _ = child.kill() catch {};
-    _ = child.wait() catch {};
+    child.kill(std.testing.io);
 
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] config:") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] log level: info") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] listening on") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] loaded") != null);
 
-    tmp_dir.dir.deleteFile("test_startup_log.db") catch {};
+    tmp_dir.dir.deleteFile(std.testing.io, "test_startup_log.db") catch {};
 }
 
 test "startup with log level off produces no stderr output" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-    try config_file.writeAll("[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\nlogfile_path = \"test_silent_log.db\"\n");
-    config_file.close();
+    const config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+    try config_file.writeStreamingAll(io, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\nlogfile_path = \"test_silent_log.db\"\n");
+    config_file.close(io);
 
-    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
     defer allocator.free(config_path);
 
     var child = try spawn_ztick(allocator, config_path);
     const stderr_file = child.stderr.?;
 
-    std.Thread.sleep(300_000_000);
+    nanosleep(300_000_000);
 
     var stderr_buf: [4096]u8 = undefined;
     const stderr = drain_stderr(stderr_file, &stderr_buf);
 
-    _ = child.kill() catch {};
-    _ = child.wait() catch {};
+    child.kill(std.testing.io);
 
     try std.testing.expectEqual(@as(usize, 0), stderr.len);
 
-    tmp_dir.dir.deleteFile("test_silent_log.db") catch {};
+    tmp_dir.dir.deleteFile(std.testing.io, "test_silent_log.db") catch {};
 }
 
 test "startup with warn log level suppresses info messages" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-    try config_file.writeAll("[log]\nlevel = \"warn\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\nlogfile_path = \"test_warn_log.db\"\n");
-    config_file.close();
+    const config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+    try config_file.writeStreamingAll(io, "[log]\nlevel = \"warn\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\nlogfile_path = \"test_warn_log.db\"\n");
+    config_file.close(io);
 
-    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
     defer allocator.free(config_path);
 
     var child = try spawn_ztick(allocator, config_path);
     const stderr_file = child.stderr.?;
 
-    std.Thread.sleep(300_000_000);
+    nanosleep(300_000_000);
 
     var stderr_buf: [4096]u8 = undefined;
     const stderr = drain_stderr(stderr_file, &stderr_buf);
 
-    _ = child.kill() catch {};
-    _ = child.wait() catch {};
+    child.kill(std.testing.io);
 
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO]") == null);
 
-    tmp_dir.dir.deleteFile("test_warn_log.db") catch {};
+    tmp_dir.dir.deleteFile(std.testing.io, "test_warn_log.db") catch {};
 }
 
 test "startup logs loaded job and rule counts from persisted data" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -921,128 +935,122 @@ test "startup logs loaded job and rule counts from persisted data" {
     });
     defer allocator.free(logfile_data);
 
-    var logfile = try tmp_dir.dir.createFile("test_counts.db", .{});
-    try logfile.writeAll(logfile_data);
-    logfile.close();
+    const logfile = try tmp_dir.dir.createFile(io, "test_counts.db", .{});
+    try logfile.writeStreamingAll(io, logfile_data);
+    logfile.close(io);
 
-    const logfile_real_path = try tmp_dir.dir.realpathAlloc(allocator, "test_counts.db");
+    const logfile_real_path = try tmp_dir.dir.realPathFileAlloc(io, "test_counts.db", allocator);
     defer allocator.free(logfile_real_path);
 
     var config_buf: [512]u8 = undefined;
     const config_content = try std.fmt.bufPrint(&config_buf, "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\nlogfile_path = \"{s}\"\n", .{logfile_real_path});
 
-    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-    try config_file.writeAll(config_content);
-    config_file.close();
+    const config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+    try config_file.writeStreamingAll(io, config_content);
+    config_file.close(io);
 
-    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
     defer allocator.free(config_path);
 
     var child = try spawn_ztick(allocator, config_path);
     const stderr_file = child.stderr.?;
 
-    std.Thread.sleep(300_000_000);
+    nanosleep(300_000_000);
 
     var stderr_buf: [4096]u8 = undefined;
     const stderr = drain_stderr(stderr_file, &stderr_buf);
 
-    _ = child.kill() catch {};
-    _ = child.wait() catch {};
+    child.kill(std.testing.io);
 
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] loaded 2 jobs, 1 rules") != null);
 }
 
 test "client connect and disconnect are logged at info level" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-    try config_file.writeAll("[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:19876\"\n\n[database]\nlogfile_path = \"test_connect_log.db\"\n");
-    config_file.close();
+    const config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+    try config_file.writeStreamingAll(io, "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:19876\"\n\n[database]\nlogfile_path = \"test_connect_log.db\"\n");
+    config_file.close(io);
 
-    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
     defer allocator.free(config_path);
 
     var child = try spawn_ztick(allocator, config_path);
     const stderr_file = child.stderr.?;
 
-    std.Thread.sleep(300_000_000);
+    nanosleep(300_000_000);
 
     // Connect a TCP client to trigger connect log
-    const addr = std.net.Address.parseIp("127.0.0.1", 19876) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19876) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch {
+        child.kill(std.testing.io);
         return error.SkipZigTest;
     };
-    std.Thread.sleep(100_000_000);
-    stream.close();
-    std.Thread.sleep(100_000_000);
+    nanosleep(100_000_000);
+    sock_close(stream.socket.handle);
+    nanosleep(100_000_000);
 
     var stderr_buf: [4096]u8 = undefined;
     const stderr = drain_stderr(stderr_file, &stderr_buf);
 
-    _ = child.kill() catch {};
-    _ = child.wait() catch {};
+    child.kill(std.testing.io);
 
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] client connected:") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] client disconnected:") != null);
 
-    tmp_dir.dir.deleteFile("test_connect_log.db") catch {};
+    tmp_dir.dir.deleteFile(std.testing.io, "test_connect_log.db") catch {};
 }
 
 test "instruction received is logged at debug level" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-    try config_file.writeAll("[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19877\"\n\n[database]\nlogfile_path = \"test_debug_log.db\"\n");
-    config_file.close();
+    const config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+    try config_file.writeStreamingAll(io, "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19877\"\n\n[database]\nlogfile_path = \"test_debug_log.db\"\n");
+    config_file.close(io);
 
-    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
     defer allocator.free(config_path);
 
     var child = try spawn_ztick(allocator, config_path);
     const stderr_file = child.stderr.?;
 
-    std.Thread.sleep(300_000_000);
+    nanosleep(300_000_000);
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19877) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19877) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch {
+        child.kill(std.testing.io);
         return error.SkipZigTest;
     };
 
-    _ = stream.write("req-1 SET app.task.1 1595586600000000000\n") catch {
-        stream.close();
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+    _ = sock_write(stream.socket.handle, "req-1 SET app.task.1 1595586600000000000\n") catch {
+        sock_close(stream.socket.handle);
+        child.kill(std.testing.io);
         return error.SkipZigTest;
     };
-    std.Thread.sleep(500_000_000);
-    stream.close();
-    std.Thread.sleep(200_000_000);
+    nanosleep(500_000_000);
+    sock_close(stream.socket.handle);
+    nanosleep(200_000_000);
 
     var stderr_buf: [8192]u8 = undefined;
     const stderr = drain_stderr(stderr_file, &stderr_buf);
 
-    _ = child.kill() catch {};
-    _ = child.wait() catch {};
+    child.kill(std.testing.io);
 
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[DEBUG] instruction received:") != null);
 
-    tmp_dir.dir.deleteFile("test_debug_log.db") catch {};
+    tmp_dir.dir.deleteFile(std.testing.io, "test_debug_log.db") catch {};
 }
 
 test "execution failure marks triggered job as failed" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1089,67 +1097,57 @@ test "TLS-enabled server accepts encrypted connections and processes SET command
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    std.Thread.sleep(200_000_000);
+    nanosleep(200_000_000);
 
     // Use openssl s_client to connect over TLS and send a SET command
-    var openssl = std.process.Child.init(
-        &[_][]const u8{
+    const io = std.testing.io;
+    var openssl = try std.process.spawn(io, .{
+        .argv = &[_][]const u8{
             "openssl",       "s_client",
             "-connect",      "127.0.0.1:19884",
             "-quiet",        "-no_ign_eof",
             "-verify_quiet",
         },
-        allocator,
-    );
-    openssl.stdin_behavior = .Pipe;
-    openssl.stdout_behavior = .Pipe;
-    openssl.stderr_behavior = .Pipe;
-    try openssl.spawn();
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
 
-    std.Thread.sleep(300_000_000);
+    nanosleep(300_000_000);
 
-    _ = openssl.stdin.?.write("req-tls-1 SET app.tls.encrypted.job 1595586600000000000\n") catch {
-        _ = openssl.kill() catch {};
-        _ = openssl.wait() catch {};
-        server.tmp_dir.dir.deleteFile("test_tls_encrypted.db") catch {};
+    _ = sock_write(openssl.stdin.?.handle, "req-tls-1 SET app.tls.encrypted.job 1595586600000000000\n") catch {
+        openssl.kill(io);
+        server.tmp_dir.dir.deleteFile(std.testing.io, "test_tls_encrypted.db") catch {};
         return error.SkipZigTest;
     };
 
     // Wait for server to process (sanitizers are ~5-10x slower)
-    std.Thread.sleep(2_000_000_000);
+    nanosleep(2_000_000_000);
 
-    openssl.stdin.?.close();
+    openssl.stdin.?.close(io);
     openssl.stdin = null;
 
-    std.Thread.sleep(500_000_000);
+    nanosleep(500_000_000);
 
     // Read openssl stdout with non-blocking polling and retry for sanitizer slowness
     const stdout_file = openssl.stdout.?;
-    const flags = std.posix.fcntl(stdout_file.handle, std.posix.F.GETFL, 0) catch {
-        _ = openssl.kill() catch {};
-        _ = openssl.wait() catch {};
-        server.tmp_dir.dir.deleteFile("test_tls_encrypted.db") catch {};
-        return error.SkipZigTest;
-    };
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(stdout_file.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+    sock_set_nonblock(stdout_file.handle);
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout_filled: usize = 0;
     // Retry up to 10 times (5s total) to handle sanitizer slowness
     for (0..10) |_| {
         while (stdout_filled < stdout_buf.len) {
-            const n = stdout_file.read(stdout_buf[stdout_filled..]) catch break;
+            const n = std.posix.read(stdout_file.handle, stdout_buf[stdout_filled..]) catch break;
             if (n == 0) break;
             stdout_filled += n;
         }
         if (stdout_filled > 0) break;
-        std.Thread.sleep(500_000_000);
+        nanosleep(500_000_000);
     }
     const tls_response = stdout_buf[0..stdout_filled];
 
-    _ = openssl.kill() catch {};
-    _ = openssl.wait() catch {};
+    openssl.kill(std.testing.io);
 
     // Read server stderr for debug logs
     var stderr_buf: [8192]u8 = undefined;
@@ -1162,10 +1160,11 @@ test "TLS-enabled server accepts encrypted connections and processes SET command
         return error.TestExpectedEqual;
     }
 
-    server.tmp_dir.dir.deleteFile("test_tls_encrypted.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_tls_encrypted.db") catch {};
 }
 
 test "failed TLS handshake closes offending connection without crashing server" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const tls = try TlsPaths.resolve(allocator);
@@ -1181,44 +1180,45 @@ test "failed TLS handshake closes offending connection without crashing server" 
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19883) catch unreachable;
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19883) catch unreachable;
 
     // Connect with plain TCP and send garbage bytes (not a TLS ClientHello)
-    var bad_conn = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    const bad_conn = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
 
-    _ = bad_conn.write("GARBAGE BYTES NOT A TLS CLIENT HELLO") catch {};
+    _ = sock_write(bad_conn.socket.handle, "GARBAGE BYTES NOT A TLS CLIENT HELLO") catch {};
 
-    std.Thread.sleep(500_000_000);
+    nanosleep(500_000_000);
 
     const recv_timeout = std.posix.timeval{ .sec = 0, .usec = 300_000 };
     std.posix.setsockopt(
-        bad_conn.handle,
+        bad_conn.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.RCVTIMEO,
         std.mem.asBytes(&recv_timeout),
     ) catch {};
 
     var read_buf: [16]u8 = undefined;
-    _ = bad_conn.read(&read_buf) catch |err| switch (err) {
+    _ = std.posix.read(bad_conn.socket.handle, &read_buf) catch |err| switch (err) {
         error.ConnectionResetByPeer, error.WouldBlock => {},
         else => {
-            bad_conn.close();
-            server.tmp_dir.dir.deleteFile("test_tls_bad_handshake.db") catch {};
+            sock_close(bad_conn.socket.handle);
+            server.tmp_dir.dir.deleteFile(std.testing.io, "test_tls_bad_handshake.db") catch {};
             return err;
         },
     };
-    bad_conn.close();
+    sock_close(bad_conn.socket.handle);
 
-    var next_conn = std.net.tcpConnectToAddress(addr) catch |err| {
-        server.tmp_dir.dir.deleteFile("test_tls_bad_handshake.db") catch {};
+    const next_conn = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch |err| {
+        server.tmp_dir.dir.deleteFile(std.testing.io, "test_tls_bad_handshake.db") catch {};
         return err;
     };
-    next_conn.close();
+    sock_close(next_conn.socket.handle);
 
-    server.tmp_dir.dir.deleteFile("test_tls_bad_handshake.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_tls_bad_handshake.db") catch {};
 }
 
 test "server recovers after client disconnects during TLS handshake" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const tls = try TlsPaths.resolve(allocator);
@@ -1234,22 +1234,22 @@ test "server recovers after client disconnects during TLS handshake" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19885) catch unreachable;
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19885) catch unreachable;
 
-    var partial_conn = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
+    const partial_conn = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
 
-    _ = partial_conn.write("\x16\x03\x03\x00\x01") catch {};
-    partial_conn.close();
+    _ = sock_write(partial_conn.socket.handle, "\x16\x03\x03\x00\x01") catch {};
+    sock_close(partial_conn.socket.handle);
 
-    std.Thread.sleep(500_000_000);
+    nanosleep(500_000_000);
 
-    var next_conn = std.net.tcpConnectToAddress(addr) catch |err| {
-        server.tmp_dir.dir.deleteFile("test_tls_mid_handshake.db") catch {};
+    const next_conn = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch |err| {
+        server.tmp_dir.dir.deleteFile(std.testing.io, "test_tls_mid_handshake.db") catch {};
         return err;
     };
-    next_conn.close();
+    sock_close(next_conn.socket.handle);
 
-    server.tmp_dir.dir.deleteFile("test_tls_mid_handshake.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_tls_mid_handshake.db") catch {};
 }
 
 const DumpTestResult = struct {
@@ -1257,7 +1257,7 @@ const DumpTestResult = struct {
     exit_code: u8,
     allocator: std.mem.Allocator,
     _tmp_dir: std.testing.TmpDir,
-    _logfile_path: []const u8,
+    _logfile_path: [:0]const u8,
 
     fn deinit(self: *DumpTestResult) void {
         self.allocator.free(self.stdout);
@@ -1267,20 +1267,21 @@ const DumpTestResult = struct {
 };
 
 fn run_dump_command(allocator: std.mem.Allocator, logfile_data: ?[]const u8, extra_args: []const []const u8) !DumpTestResult {
+    const io = std.testing.io;
     var tmp_dir = std.testing.tmpDir(.{});
     errdefer tmp_dir.cleanup();
 
     const filename = "test.bin";
     if (logfile_data) |data| {
-        var log_file = try tmp_dir.dir.createFile(filename, .{});
-        try log_file.writeAll(data);
-        log_file.close();
+        const log_file = try tmp_dir.dir.createFile(io, filename, .{});
+        try log_file.writeStreamingAll(io, data);
+        log_file.close(io);
     } else {
-        var log_file = try tmp_dir.dir.createFile(filename, .{});
-        log_file.close();
+        const log_file = try tmp_dir.dir.createFile(io, filename, .{});
+        log_file.close(io);
     }
 
-    const logfile_path = try tmp_dir.dir.realpathAlloc(allocator, filename);
+    const logfile_path = try tmp_dir.dir.realPathFileAlloc(io, filename, allocator);
     errdefer allocator.free(logfile_path);
 
     var args_buf: [16][]const u8 = undefined;
@@ -1290,18 +1291,23 @@ fn run_dump_command(allocator: std.mem.Allocator, logfile_data: ?[]const u8, ext
     for (extra_args, 0..) |arg, i| args_buf[3 + i] = arg;
     const args = args_buf[0 .. 3 + extra_args.len];
 
-    var child = std.process.Child.init(args, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.stdin_behavior = .Ignore;
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = args,
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    });
 
-    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 65536);
+    var stdout_buf: [65536]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &stdout_buf);
+    var stdout_list: std.ArrayList(u8) = .empty;
+    try stdout_reader.interface.appendRemaining(allocator, &stdout_list, .unlimited);
+    const stdout_data = try stdout_list.toOwnedSlice(allocator);
     errdefer allocator.free(stdout_data);
 
-    const term = try child.wait();
+    const term = try child.wait(io);
     const exit_code: u8 = switch (term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => return error.TestUnexpectedResult,
     };
 
@@ -1314,31 +1320,31 @@ fn run_dump_command(allocator: std.mem.Allocator, logfile_data: ?[]const u8, ext
     };
 }
 
-fn expect_follow_exits_cleanly_on_signal(allocator: std.mem.Allocator, signal: u6) !void {
+fn expect_follow_exits_cleanly_on_signal(allocator: std.mem.Allocator, signal: std.posix.SIG) !void {
+    const io = std.testing.io;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var log_file = try tmp_dir.dir.createFile("follow_signal.bin", .{});
-    log_file.close();
+    const log_file = try tmp_dir.dir.createFile(io, "follow_signal.bin", .{});
+    log_file.close(io);
 
-    const logfile_path = try tmp_dir.dir.realpathAlloc(allocator, "follow_signal.bin");
+    const logfile_path = try tmp_dir.dir.realPathFileAlloc(io, "follow_signal.bin", allocator);
     defer allocator.free(logfile_path);
 
-    var child = std.process.Child.init(
-        &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path, "--follow" },
-        allocator,
-    );
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.stdin_behavior = .Ignore;
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path, "--follow" },
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    });
 
-    std.Thread.sleep(200_000_000);
-    std.posix.kill(child.id, signal) catch {};
-    const term = try child.wait();
+    nanosleep(200_000_000);
+    std.posix.kill(child.id.?, signal) catch {};
+    const term = try child.wait(io);
 
     switch (term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .signal => |sig| try std.testing.expectEqual(signal, sig),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -1377,7 +1383,7 @@ test "dump command prints NDJSON entries with --format json" {
     defer result.deinit();
 
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, result.stdout, "\n"), '\n');
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, result.stdout, "\n"), '\n');
     const line1 = lines.next() orelse return error.TestUnexpectedResult;
     const line2 = lines.next() orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, line1, "\"type\":\"set\"") != null);
@@ -1397,20 +1403,16 @@ test "dump command produces no output for empty logfile" {
 }
 
 test "dump command exits 1 for missing logfile" {
-    const allocator = std.testing.allocator;
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &[_][]const u8{ "zig-out/bin/ztick", "dump", "/nonexistent/path/ztick-f007-test.bin" },
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    });
 
-    var child = std.process.Child.init(
-        &[_][]const u8{ "zig-out/bin/ztick", "dump", "/nonexistent/path/ztick-f007-test.bin" },
-        allocator,
-    );
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.stdin_behavior = .Ignore;
-    try child.spawn();
-
-    const term = try child.wait();
+    const term = try child.wait(std.testing.io);
     switch (term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 1), code),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 1), code),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -1461,31 +1463,39 @@ test "dump command prints warning to stderr and outputs complete entries for par
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var log_file = try tmp_dir.dir.createFile("partial.bin", .{});
-    try log_file.writeAll(logfile_data);
-    try log_file.writeAll(&[_]u8{ 0, 0, 42 });
-    log_file.close();
+    const io = std.testing.io;
+    const log_file = try tmp_dir.dir.createFile(io, "partial.bin", .{});
+    try log_file.writeStreamingAll(io, logfile_data);
+    try log_file.writeStreamingAll(io, &[_]u8{ 0, 0, 42 });
+    log_file.close(io);
 
-    const logfile_path = try tmp_dir.dir.realpathAlloc(allocator, "partial.bin");
+    const logfile_path = try tmp_dir.dir.realPathFileAlloc(io, "partial.bin", allocator);
     defer allocator.free(logfile_path);
 
-    var child = std.process.Child.init(
-        &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path },
-        allocator,
-    );
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.stdin_behavior = .Ignore;
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path },
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .stdin = .ignore,
+    });
 
-    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 65536);
+    var stdout_buf: [65536]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &stdout_buf);
+    var stdout_list: std.ArrayList(u8) = .empty;
+    try stdout_reader.interface.appendRemaining(allocator, &stdout_list, .unlimited);
+    const stdout_data = try stdout_list.toOwnedSlice(allocator);
     defer allocator.free(stdout_data);
-    const stderr_data = try child.stderr.?.readToEndAlloc(allocator, 65536);
+
+    var stderr_buf: [65536]u8 = undefined;
+    var stderr_reader = child.stderr.?.reader(io, &stderr_buf);
+    var stderr_list: std.ArrayList(u8) = .empty;
+    try stderr_reader.interface.appendRemaining(allocator, &stderr_list, .unlimited);
+    const stderr_data = try stderr_list.toOwnedSlice(allocator);
     defer allocator.free(stderr_data);
 
-    const term = try child.wait();
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
         else => return error.TestUnexpectedResult,
     }
 
@@ -1509,7 +1519,7 @@ test "dump command prints rule_set entry as NDJSON with nested runner object for
     defer result.deinit();
 
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    const line = std.mem.trimRight(u8, result.stdout, "\n");
+    const line = std.mem.trimEnd(u8, result.stdout, "\n");
     try std.testing.expect(std.mem.indexOf(u8, line, "\"type\":\"rule_set\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"identifier\":\"rule.shell\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"runner\":{") != null);
@@ -1537,7 +1547,7 @@ test "dump command prints rule_set entry as NDJSON with nested runner object for
     defer result.deinit();
 
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    const line = std.mem.trimRight(u8, result.stdout, "\n");
+    const line = std.mem.trimEnd(u8, result.stdout, "\n");
     try std.testing.expect(std.mem.indexOf(u8, line, "\"type\":\"rule_set\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"identifier\":\"rule.amqp\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"type\":\"amqp\"") != null);
@@ -1558,7 +1568,7 @@ test "dump command prints rule_removal entry as NDJSON" {
     defer result.deinit();
 
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    const line = std.mem.trimRight(u8, result.stdout, "\n");
+    const line = std.mem.trimEnd(u8, result.stdout, "\n");
     try std.testing.expect(std.mem.indexOf(u8, line, "\"type\":\"remove_rule\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "\"identifier\":\"rule.gone\"") != null);
 }
@@ -1578,7 +1588,7 @@ test "dump command --compact with --format json outputs compacted entries as NDJ
     defer result.deinit();
 
     try std.testing.expectEqual(@as(u8, 0), result.exit_code);
-    const trimmed = std.mem.trimRight(u8, result.stdout, "\n");
+    const trimmed = std.mem.trimEnd(u8, result.stdout, "\n");
     var lines = std.mem.splitScalar(u8, trimmed, '\n');
     const line1 = lines.next() orelse return error.TestUnexpectedResult;
     try std.testing.expect(lines.next() == null);
@@ -1655,43 +1665,47 @@ test "dump command --follow prints newly appended entries" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var log_file = try tmp_dir.dir.createFile("follow_append.bin", .{});
-    try log_file.writeAll(initial_data);
-    log_file.close();
+    const io = std.testing.io;
+    const log_file = try tmp_dir.dir.createFile(io, "follow_append.bin", .{});
+    try log_file.writeStreamingAll(io, initial_data);
+    log_file.close(io);
 
-    const logfile_path = try tmp_dir.dir.realpathAlloc(allocator, "follow_append.bin");
+    const logfile_path = try tmp_dir.dir.realPathFileAlloc(io, "follow_append.bin", allocator);
     defer allocator.free(logfile_path);
 
-    var child = std.process.Child.init(
-        &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path, "--follow" },
-        allocator,
-    );
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.stdin_behavior = .Ignore;
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path, "--follow" },
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    });
 
-    std.Thread.sleep(200_000_000);
+    nanosleep(200_000_000);
 
     const appended_data = try build_logfile_bytes(allocator, &.{
         .{ .job = .{ .identifier = "follow.appended", .execution = 2000000000000000000, .status = .planned } },
     });
     defer allocator.free(appended_data);
 
-    var append_file = try tmp_dir.dir.openFile("follow_append.bin", .{ .mode = .write_only });
-    try append_file.seekFromEnd(0);
-    try append_file.writeAll(appended_data);
-    append_file.close();
+    const append_file = try tmp_dir.dir.openFile(io, "follow_append.bin", .{ .mode = .write_only });
+    const append_stat = try append_file.stat(io);
+    _ = try append_file.writePositional(io, &.{appended_data}, append_stat.size);
+    append_file.close(io);
 
-    std.Thread.sleep(2_500_000_000);
+    nanosleep(2_500_000_000);
 
-    std.posix.kill(child.id, std.posix.SIG.INT) catch {};
-    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 65536);
+    std.posix.kill(child.id.?, std.posix.SIG.INT) catch {};
+    var stdout_buf: [65536]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &stdout_buf);
+    var stdout_list: std.ArrayList(u8) = .empty;
+    try stdout_reader.interface.appendRemaining(allocator, &stdout_list, .unlimited);
+    const stdout_data = try stdout_list.toOwnedSlice(allocator);
     defer allocator.free(stdout_data);
 
-    const term = try child.wait();
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .signal => |sig| try std.testing.expectEqual(std.posix.SIG.INT, sig),
         else => return error.TestUnexpectedResult,
     }
 
@@ -1710,49 +1724,53 @@ test "dump command --follow --format json prints new entries as NDJSON" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var log_file = try tmp_dir.dir.createFile("follow_json.bin", .{});
-    try log_file.writeAll(initial_data);
-    log_file.close();
+    const io = std.testing.io;
+    const log_file = try tmp_dir.dir.createFile(io, "follow_json.bin", .{});
+    try log_file.writeStreamingAll(io, initial_data);
+    log_file.close(io);
 
-    const logfile_path = try tmp_dir.dir.realpathAlloc(allocator, "follow_json.bin");
+    const logfile_path = try tmp_dir.dir.realPathFileAlloc(io, "follow_json.bin", allocator);
     defer allocator.free(logfile_path);
 
-    var child = std.process.Child.init(
-        &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path, "--follow", "--format", "json" },
-        allocator,
-    );
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.stdin_behavior = .Ignore;
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = &[_][]const u8{ "zig-out/bin/ztick", "dump", logfile_path, "--follow", "--format", "json" },
+        .stdout = .pipe,
+        .stderr = .ignore,
+        .stdin = .ignore,
+    });
 
-    std.Thread.sleep(200_000_000);
+    nanosleep(200_000_000);
 
     const appended_data = try build_logfile_bytes(allocator, &.{
         .{ .job = .{ .identifier = "follow.json.appended", .execution = 2000000000000000000, .status = .planned } },
     });
     defer allocator.free(appended_data);
 
-    var append_file = try tmp_dir.dir.openFile("follow_json.bin", .{ .mode = .write_only });
-    try append_file.seekFromEnd(0);
-    try append_file.writeAll(appended_data);
-    append_file.close();
+    const append_file = try tmp_dir.dir.openFile(io, "follow_json.bin", .{ .mode = .write_only });
+    const append_stat = try append_file.stat(io);
+    _ = try append_file.writePositional(io, &.{appended_data}, append_stat.size);
+    append_file.close(io);
 
-    std.Thread.sleep(2_500_000_000);
+    nanosleep(2_500_000_000);
 
-    std.posix.kill(child.id, std.posix.SIG.INT) catch {};
-    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 65536);
+    std.posix.kill(child.id.?, std.posix.SIG.INT) catch {};
+    var stdout_buf: [65536]u8 = undefined;
+    var stdout_reader = child.stdout.?.reader(io, &stdout_buf);
+    var stdout_list: std.ArrayList(u8) = .empty;
+    try stdout_reader.interface.appendRemaining(allocator, &stdout_list, .unlimited);
+    const stdout_data = try stdout_list.toOwnedSlice(allocator);
     defer allocator.free(stdout_data);
 
-    const term = try child.wait();
+    const term = try child.wait(io);
     switch (term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .signal => |sig| try std.testing.expectEqual(std.posix.SIG.INT, sig),
         else => return error.TestUnexpectedResult,
     }
 
     try std.testing.expect(std.mem.indexOf(u8, stdout_data, "\"identifier\":\"follow.json.initial\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_data, "\"identifier\":\"follow.json.appended\"") != null);
-    var lines = std.mem.splitScalar(u8, std.mem.trimRight(u8, stdout_data, "\n"), '\n');
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, stdout_data, "\n"), '\n');
     while (lines.next()) |line| {
         try std.testing.expect(line[0] == '{');
         try std.testing.expect(line[line.len - 1] == '}');
@@ -1766,16 +1784,17 @@ test "dump command --follow exits 0 on SIGTERM" {
 // Feature: F008
 
 test "memory backend processes SET command without creating files on disk" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var placeholder = try tmp_dir.dir.createFile("memory.db", .{});
-    placeholder.close();
-    const db_abs_path = try tmp_dir.dir.realpathAlloc(allocator, "memory.db");
+    const placeholder = try tmp_dir.dir.createFile(io, "memory.db", .{});
+    placeholder.close(io);
+    const db_abs_path = try tmp_dir.dir.realPathFileAlloc(io, "memory.db", allocator);
     defer allocator.free(db_abs_path);
-    try tmp_dir.dir.deleteFile("memory.db");
+    try tmp_dir.dir.deleteFile(io, "memory.db");
 
     var config_buf: [1024]u8 = undefined;
     const config_content = try std.fmt.bufPrint(
@@ -1784,42 +1803,39 @@ test "memory backend processes SET command without creating files on disk" {
         .{db_abs_path},
     );
 
-    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-    try config_file.writeAll(config_content);
-    config_file.close();
+    const config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+    try config_file.writeStreamingAll(io, config_content);
+    config_file.close(io);
 
-    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
     defer allocator.free(config_path);
 
     var child = try spawn_ztick(allocator, config_path);
     const stderr_file = child.stderr.?;
-    std.Thread.sleep(300_000_000);
+    nanosleep(300_000_000);
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19880) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19880) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch {
+        child.kill(std.testing.io);
         return error.SkipZigTest;
     };
 
-    _ = stream.write("req-mem-1 SET app.mem.job 1595586600000000000\n") catch {
-        stream.close();
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+    _ = sock_write(stream.socket.handle, "req-mem-1 SET app.mem.job 1595586600000000000\n") catch {
+        sock_close(stream.socket.handle);
+        child.kill(std.testing.io);
         return error.SkipZigTest;
     };
-    std.Thread.sleep(500_000_000);
-    stream.close();
-    std.Thread.sleep(200_000_000);
+    nanosleep(500_000_000);
+    sock_close(stream.socket.handle);
+    nanosleep(200_000_000);
 
     var stderr_buf: [8192]u8 = undefined;
     const stderr = drain_stderr(stderr_file, &stderr_buf);
 
-    _ = child.kill() catch {};
-    _ = child.wait() catch {};
+    child.kill(std.testing.io);
 
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[DEBUG] instruction received: set") != null);
-    try std.testing.expectError(error.FileNotFound, tmp_dir.dir.access("memory.db", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp_dir.dir.access(std.testing.io, "memory.db", .{}));
 }
 
 test "memory backend starts with zero loaded jobs and rules" {
@@ -1828,23 +1844,23 @@ test "memory backend starts with zero loaded jobs and rules" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-    try config_file.writeAll("[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n");
-    config_file.close();
+    const io = std.testing.io;
+    var config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+    try config_file.writeStreamingAll(io, "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n");
+    config_file.close(io);
 
-    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
     defer allocator.free(config_path);
 
     var child = try spawn_ztick(allocator, config_path);
     const stderr_file = child.stderr.?;
 
-    std.Thread.sleep(300_000_000);
+    nanosleep(300_000_000);
 
     var stderr_buf: [4096]u8 = undefined;
     const stderr = drain_stderr(stderr_file, &stderr_buf);
 
-    _ = child.kill() catch {};
-    _ = child.wait() catch {};
+    child.kill(std.testing.io);
 
     try std.testing.expect(std.mem.indexOf(u8, stderr, "[INFO] loaded 0 jobs, 0 rules") != null);
 }
@@ -1854,7 +1870,7 @@ test "memory backend SET and GET round-trip returns planned job" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .empty, .allocator = allocator } });
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -1877,7 +1893,7 @@ test "memory backend data does not survive scheduler reload" {
     const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
-    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .empty, .allocator = allocator } });
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -1893,7 +1909,7 @@ test "memory backend data does not survive scheduler reload" {
     // New scheduler with fresh memory backend — no data carried over
     var scheduler2 = Scheduler.init(allocator);
     defer scheduler2.deinit();
-    scheduler2.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    scheduler2.persistence = BackendState.init(.{ .memory = .{ .entries = .empty, .allocator = allocator } });
     try scheduler2.load(allocator);
 
     try std.testing.expectEqual(@as(?Job, null), scheduler2.job_storage.get("ephemeral.job"));
@@ -1904,7 +1920,7 @@ test "memory backend REMOVE command removes job from storage" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .empty, .allocator = allocator } });
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -1928,7 +1944,7 @@ test "memory backend REMOVERULE command removes rule from storage" {
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .empty, .allocator = allocator } });
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -1948,12 +1964,7 @@ test "memory backend REMOVERULE command removes rule from storage" {
 }
 
 test "default persistence uses logfile when no persistence key configured" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1965,6 +1976,7 @@ test "default persistence uses logfile when no persistence key configured" {
         .logfile_dir = tmp_dir.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
 
     _ = try scheduler.handle_query(Request{
@@ -1974,7 +1986,7 @@ test "default persistence uses logfile when no persistence key configured" {
     });
 
     // Logfile backend creates the file on disk
-    try tmp_dir.dir.access("default.log", .{});
+    try tmp_dir.dir.access(std.testing.io, "default.log", .{});
 
     // New scheduler loads persisted data from same logfile
     var scheduler2 = Scheduler.init(allocator);
@@ -1984,6 +1996,7 @@ test "default persistence uses logfile when no persistence key configured" {
         .logfile_dir = tmp_dir.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     try scheduler2.load(allocator);
 
@@ -1995,9 +2008,7 @@ test "default persistence uses logfile when no persistence key configured" {
 // Feature: F009
 
 test "compression produces deduplicated logfile after interval" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2009,6 +2020,7 @@ test "compression produces deduplicated logfile after interval" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     scheduler.compression_interval_ns = 1;
 
@@ -2041,7 +2053,7 @@ test "compression produces deduplicated logfile after interval" {
     proc.deinit();
     scheduler.persistence.?.active_process = null;
 
-    const compressed_data = try tmp.dir.readFileAlloc(allocator, "logfile.compressed", std.math.maxInt(usize));
+    const compressed_data = try tmp.dir.readFileAlloc(std.testing.io, "logfile.compressed", allocator, .unlimited);
     defer allocator.free(compressed_data);
 
     const parsed = try persistence_logfile.parse(allocator, compressed_data);
@@ -2075,29 +2087,25 @@ test "compression produces deduplicated logfile after interval" {
 }
 
 test "memory backend skips compression and produces no file artifacts" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
-    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    scheduler.persistence = BackendState.init(.{ .memory = .{ .entries = .empty, .allocator = allocator } });
     scheduler.compression_interval_ns = 1;
 
     try scheduler.tick(1);
 
     try std.testing.expectEqual(@as(?*@import("infrastructure/persistence/background.zig").Process, null), scheduler.persistence.?.active_process);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("logfile.to_compress", .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("logfile.compressed", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "logfile.to_compress", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "logfile.compressed", .{}));
 }
 
 test "leftover .to_compress file is compressed at startup" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2109,18 +2117,20 @@ test "leftover .to_compress file is compressed at startup" {
     });
     defer allocator.free(logfile_data);
 
-    const to_compress = try tmp.dir.createFile("logfile.to_compress", .{});
-    try to_compress.writeAll(logfile_data);
-    to_compress.close();
+    const io = std.testing.io;
+    const to_compress = try tmp.dir.createFile(io, "logfile.to_compress", .{});
+    try to_compress.writeStreamingAll(io, logfile_data);
+    to_compress.close(io);
 
-    main.compress_startup_leftover(allocator, .{ .logfile = .{
+    main.compress_startup_leftover(io, allocator, .{ .logfile = .{
         .logfile_path = "logfile",
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = io,
     } });
 
-    const compressed_data = try tmp.dir.readFileAlloc(allocator, "logfile.compressed", std.math.maxInt(usize));
+    const compressed_data = try tmp.dir.readFileAlloc(std.testing.io, "logfile.compressed", allocator, .unlimited);
     defer allocator.free(compressed_data);
 
     const parsed = try persistence_logfile.parse(allocator, compressed_data);
@@ -2150,15 +2160,16 @@ test "leftover .to_compress file is compressed at startup" {
 
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqual(@as(i64, 3000), last_execution);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access("logfile.to_compress", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "logfile.to_compress", .{}));
 }
 
 fn count_process_threads() usize {
-    var dir = std.fs.openDirAbsolute("/proc/self/task", .{ .iterate = true }) catch return 0;
-    defer dir.close();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = std.Io.Dir.cwd().openDir(io, "/proc/self/task", .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
     var it = dir.iterate();
     var n: usize = 0;
-    while (it.next() catch null) |_| n += 1;
+    while (it.next(io) catch null) |_| n += 1;
     return n;
 }
 
@@ -2171,7 +2182,7 @@ test "telemetry disabled by default produces no exporter thread" {
         .service_name = "ztick",
         .flush_interval_ms = 5000,
     };
-    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg);
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg, &std.process.Environ.Map.init(std.testing.allocator), std.testing.io);
     try std.testing.expectEqual(@as(?*infrastructure_telemetry.Providers, null), providers);
 
     const thread_count_after = count_process_threads();
@@ -2179,11 +2190,12 @@ test "telemetry disabled by default produces no exporter thread" {
 }
 
 test "telemetry enabled exports metrics to collector endpoint" {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
-    var mock_server = try addr.listen(.{ .reuse_address = true });
-    defer mock_server.deinit();
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var mock_server = try std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true });
+    defer mock_server.deinit(io);
 
-    const port = mock_server.listen_address.in.getPort();
+    const port = mock_server.socket.address.getPort();
 
     const endpoint_buf = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
     defer std.testing.allocator.free(endpoint_buf);
@@ -2195,7 +2207,7 @@ test "telemetry enabled exports metrics to collector endpoint" {
         .flush_interval_ms = 5000,
     };
 
-    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg);
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg, &std.process.Environ.Map.init(std.testing.allocator), std.Io.Threaded.global_single_threaded.io());
     try std.testing.expect(providers != null);
     defer providers.?.shutdown();
 
@@ -2213,15 +2225,15 @@ test "telemetry enabled exports metrics to collector endpoint" {
         path_len: usize = 0,
         alloc: std.mem.Allocator,
 
-        fn acceptOne(self: *@This(), server: *std.net.Server) void {
-            var conn = server.accept() catch return;
-            defer conn.stream.close();
+        fn acceptOne(self: *@This(), server: *std.Io.net.Server) void {
+            var conn = server.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
 
             var buf: [8192]u8 = undefined;
             var total: usize = 0;
             var header_end_offset: ?usize = null;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch break;
+                const n = std.posix.read(conn.socket.handle, buf[total..]) catch break;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |he| {
@@ -2244,11 +2256,11 @@ test "telemetry enabled exports metrics to collector endpoint" {
                 }
             }
 
-            _ = conn.stream.write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+            sock_write(conn.socket.handle, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
         }
     };
 
-    var capture = Capture{ .body = .{}, .alloc = std.testing.allocator };
+    var capture = Capture{ .body = .empty, .alloc = std.testing.allocator };
     defer capture.body.deinit(std.testing.allocator);
 
     const t = try std.Thread.spawn(.{}, Capture.acceptOne, .{ &capture, &mock_server });
@@ -2264,11 +2276,12 @@ test "telemetry enabled exports metrics to collector endpoint" {
 
 // Feature: F010
 test "scheduler SET and tick exports metrics through OTLP to mock collector" {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
-    var mock_server = try addr.listen(.{ .reuse_address = true });
-    defer mock_server.deinit();
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var mock_server = try std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true });
+    defer mock_server.deinit(io);
 
-    const port = mock_server.listen_address.in.getPort();
+    const port = mock_server.socket.address.getPort();
 
     const endpoint_buf = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
     defer std.testing.allocator.free(endpoint_buf);
@@ -2280,7 +2293,7 @@ test "scheduler SET and tick exports metrics through OTLP to mock collector" {
         .flush_interval_ms = 5000,
     };
 
-    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg);
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg, &std.process.Environ.Map.init(std.testing.allocator), std.Io.Threaded.global_single_threaded.io());
     try std.testing.expect(providers != null);
     defer providers.?.shutdown();
 
@@ -2316,14 +2329,14 @@ test "scheduler SET and tick exports metrics through OTLP to mock collector" {
         path_len: usize = 0,
         received: bool = false,
 
-        fn acceptOne(self: *@This(), server: *std.net.Server) void {
-            var conn = server.accept() catch return;
-            defer conn.stream.close();
+        fn acceptOne(self: *@This(), server: *std.Io.net.Server) void {
+            var conn = server.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
 
             var buf: [8192]u8 = undefined;
             var total: usize = 0;
             while (total < buf.len) {
-                const n = conn.stream.read(buf[total..]) catch break;
+                const n = std.posix.read(conn.socket.handle, buf[total..]) catch break;
                 if (n == 0) break;
                 total += n;
                 if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |_| break;
@@ -2338,7 +2351,7 @@ test "scheduler SET and tick exports metrics through OTLP to mock collector" {
                 self.received = true;
             }
 
-            _ = conn.stream.write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+            sock_write(conn.socket.handle, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
         }
     };
 
@@ -2354,11 +2367,12 @@ test "scheduler SET and tick exports metrics through OTLP to mock collector" {
 
 // Feature: F010
 test "trace spans exported to collector on job execution" {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
-    var mock_server = try addr.listen(.{ .reuse_address = true });
-    defer mock_server.deinit();
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var mock_server = try std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true });
+    defer mock_server.deinit(io);
 
-    const port = mock_server.listen_address.in.getPort();
+    const port = mock_server.socket.address.getPort();
 
     const endpoint_buf = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
     defer std.testing.allocator.free(endpoint_buf);
@@ -2370,7 +2384,7 @@ test "trace spans exported to collector on job execution" {
         .flush_interval_ms = 5000,
     };
 
-    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg);
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg, &std.process.Environ.Map.init(std.testing.allocator), std.Io.Threaded.global_single_threaded.io());
     try std.testing.expect(providers != null);
     defer providers.?.shutdown();
 
@@ -2387,16 +2401,16 @@ test "trace spans exported to collector on job execution" {
         path_lens: [4]usize = [_]usize{0} ** 4,
         count: usize = 0,
 
-        fn acceptN(self: *@This(), server: *std.net.Server, n: usize) void {
+        fn acceptN(self: *@This(), server: *std.Io.net.Server, n: usize) void {
             var accepted: usize = 0;
             while (accepted < n) {
-                var conn = server.accept() catch return;
-                defer conn.stream.close();
+                var conn = server.accept(std.testing.io) catch return;
+                defer conn.close(std.testing.io);
 
                 var buf: [8192]u8 = undefined;
                 var total: usize = 0;
                 while (total < buf.len) {
-                    const bytes = conn.stream.read(buf[total..]) catch break;
+                    const bytes = std.posix.read(conn.socket.handle, buf[total..]) catch break;
                     if (bytes == 0) break;
                     total += bytes;
                     if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |_| break;
@@ -2414,7 +2428,7 @@ test "trace spans exported to collector on job execution" {
                     }
                 }
 
-                _ = conn.stream.write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+                sock_write(conn.socket.handle, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
                 accepted += 1;
             }
         }
@@ -2424,7 +2438,7 @@ test "trace spans exported to collector on job execution" {
     // SimpleProcessor exports synchronously on endSpan via OTLP HTTP.
     var capture = TraceCapture{};
     const t = try std.Thread.spawn(.{}, TraceCapture.acceptN, .{ &capture, &mock_server, 1 });
-    std.Thread.sleep(1_000_000);
+    nanosleep(1_000_000);
 
     // Now create scheduler and trigger spans — mock server is ready
     var scheduler = Scheduler.init(std.testing.allocator);
@@ -2493,7 +2507,7 @@ test "telemetry config parsed from TOML creates functional providers" {
     try std.testing.expectEqualStrings("ztick-config-test", cfg.telemetry.service_name);
     try std.testing.expectEqual(@as(u32, 1000), cfg.telemetry.flush_interval_ms);
 
-    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg.telemetry);
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg.telemetry, &std.process.Environ.Map.init(std.testing.allocator), std.Io.Threaded.global_single_threaded.io());
     try std.testing.expect(providers != null);
     providers.?.shutdown();
 }
@@ -2508,7 +2522,7 @@ test "scheduler operates normally when telemetry collector is unreachable" {
         .flush_interval_ms = 5000,
     };
 
-    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg);
+    const providers = try infrastructure_telemetry.setup(std.testing.allocator, cfg, &std.process.Environ.Map.init(std.testing.allocator), std.Io.Threaded.global_single_threaded.io());
     try std.testing.expect(providers != null);
     defer providers.?.shutdown();
 
@@ -2543,15 +2557,13 @@ test "scheduler operates normally when telemetry collector is unreachable" {
 // Feature: F012
 
 test "stat command returns all 15 metric keys in response body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(1);
-    scheduler.set_stat_context(std.time.nanoTimestamp() - 1_000_000_000, &connections, false, false, 100);
+    scheduler.set_stat_context(std.testing.io, timestamp_ns() - 1_000_000_000, &connections, false, false, 100);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -2581,15 +2593,13 @@ test "stat command returns all 15 metric keys in response body" {
 }
 
 test "stat command reports correct job counts after storage mutations" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.set_stat_context(0, &connections, false, false, 1);
+    scheduler.set_stat_context(std.testing.io, 0, &connections, false, false, 1);
 
     _ = try scheduler.handle_query(Request{
         .client = 1,
@@ -2618,16 +2628,14 @@ test "stat command reports correct job counts after storage mutations" {
 }
 
 test "stat command does not append entries to logfile" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("stat_nopersist.db", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "stat_nopersist.db", .{});
+        f.close(std.testing.io);
     }
 
     var scheduler = Scheduler.init(allocator);
@@ -2637,6 +2645,7 @@ test "stat command does not append entries to logfile" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     try scheduler.load(allocator);
 
@@ -2646,10 +2655,10 @@ test "stat command does not append entries to logfile" {
         .instruction = .{ .set = .{ .identifier = "baseline.job", .execution = 1595586600_000000000 } },
     });
 
-    const stat_before = try tmp.dir.statFile("stat_nopersist.db");
+    const stat_before = try tmp.dir.statFile(std.testing.io, "stat_nopersist.db", .{});
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.set_stat_context(0, &connections, false, false, 1);
+    scheduler.set_stat_context(std.testing.io, 0, &connections, false, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 2,
@@ -2659,20 +2668,18 @@ test "stat command does not append entries to logfile" {
     defer if (response.body) |b| allocator.free(b);
 
     try std.testing.expect(response.success);
-    const stat_after = try tmp.dir.statFile("stat_nopersist.db");
+    const stat_after = try tmp.dir.statFile(std.testing.io, "stat_nopersist.db", .{});
     try std.testing.expectEqual(stat_before.size, stat_after.size);
 }
 
 test "stat command reports auth_enabled 1 when authentication is configured" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.set_stat_context(0, &connections, true, false, 1);
+    scheduler.set_stat_context(std.testing.io, 0, &connections, true, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -2687,15 +2694,13 @@ test "stat command reports auth_enabled 1 when authentication is configured" {
 }
 
 test "stat command succeeds and reports auth_enabled 0 when auth is not configured" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.set_stat_context(0, &connections, false, false, 1);
+    scheduler.set_stat_context(std.testing.io, 0, &connections, false, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -2710,27 +2715,26 @@ test "stat command succeeds and reports auth_enabled 0 when auth is not configur
 }
 
 test "stat command over TCP returns multi-line response with all keys ending with OK" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19886\"\n\n[database]\npersistence = \"memory\"\n");
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19886) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19886) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
-    _ = stream.write("req-1 STAT\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-1 STAT\n") catch return error.SkipZigTest;
 
-    std.Thread.sleep(300_000_000);
+    nanosleep(300_000_000);
 
-    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+    sock_set_nonblock(stream.socket.handle);
 
     var buf: [4096]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
-        const n = stream.read(buf[total..]) catch break;
+        const n = std.posix.read(stream.socket.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
     }
@@ -2755,16 +2759,17 @@ test "stat command over TCP returns multi-line response with all keys ending wit
 }
 
 test "stat command over TCP rejects unauthenticated client when auth is enabled" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tokens_file = try tmp_dir.dir.createFile("tokens.toml", .{});
-    try tokens_file.writeAll("[token.test]\nsecret = \"secret-token\"\nnamespace = \"*\"\n");
-    tokens_file.close();
+    const tokens_file = try tmp_dir.dir.createFile(io, "tokens.toml", .{});
+    try tokens_file.writeStreamingAll(io, "[token.test]\nsecret = \"secret-token\"\nnamespace = \"*\"\n");
+    tokens_file.close(io);
 
-    const tokens_path = try tmp_dir.dir.realpathAlloc(allocator, "tokens.toml");
+    const tokens_path = try tmp_dir.dir.realPathFileAlloc(io, "tokens.toml", allocator);
     defer allocator.free(tokens_path);
 
     const config = try std.fmt.allocPrint(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19888\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n", .{tokens_path});
@@ -2773,15 +2778,15 @@ test "stat command over TCP rejects unauthenticated client when auth is enabled"
     var server = try TestServer.start(allocator, config);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19888) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19888) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
-    _ = stream.write("req-unauth STAT\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-unauth STAT\n") catch return error.SkipZigTest;
 
     // Use poll instead of sleep+nonblocking for sanitizer reliability
     var pfd = [1]std.posix.pollfd{.{
-        .fd = stream.handle,
+        .fd = stream.socket.handle,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
@@ -2789,7 +2794,7 @@ test "stat command over TCP rejects unauthenticated client when auth is enabled"
     if (ready == 0) return error.SkipZigTest;
 
     var buf: [4096]u8 = undefined;
-    const n = stream.read(buf[0..]) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, buf[0..]) catch return error.SkipZigTest;
     const response = buf[0..n];
 
     // Server responds ERROR without request_id for non-AUTH commands before authentication
@@ -2797,41 +2802,40 @@ test "stat command over TCP rejects unauthenticated client when auth is enabled"
 }
 
 test "stat command over TCP reports connections reflecting active connection count" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19887\"\n\n[database]\npersistence = \"memory\"\n");
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19887) catch unreachable;
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19887) catch unreachable;
 
-    var conn1 = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer conn1.close();
-    var conn2 = std.net.tcpConnectToAddress(addr) catch {
-        conn1.close();
+    const conn1 = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(conn1.socket.handle);
+    const conn2 = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch {
+        sock_close(conn1.socket.handle);
         return error.SkipZigTest;
     };
-    defer conn2.close();
-    var conn3 = std.net.tcpConnectToAddress(addr) catch {
-        conn1.close();
-        conn2.close();
+    defer sock_close(conn2.socket.handle);
+    const conn3 = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch {
+        sock_close(conn1.socket.handle);
+        sock_close(conn2.socket.handle);
         return error.SkipZigTest;
     };
-    defer conn3.close();
+    defer sock_close(conn3.socket.handle);
 
-    std.Thread.sleep(200_000_000);
+    nanosleep(200_000_000);
 
-    _ = conn1.write("req-stat-conn STAT\n") catch return error.SkipZigTest;
+    _ = sock_write(conn1.socket.handle, "req-stat-conn STAT\n") catch return error.SkipZigTest;
 
-    std.Thread.sleep(300_000_000);
+    nanosleep(300_000_000);
 
-    const flags = std.posix.fcntl(conn1.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(conn1.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+    sock_set_nonblock(conn1.socket.handle);
 
     var buf: [4096]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
-        const n = conn1.read(buf[total..]) catch break;
+        const n = std.posix.read(conn1.socket.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
     }
@@ -2848,7 +2852,9 @@ const AuthPaths = struct {
     wildcard: []const u8,
 
     fn resolve(allocator: std.mem.Allocator) !AuthPaths {
-        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        const io = std.testing.io;
+        const cwd_dir = std.Io.Dir.cwd();
+        const cwd = try cwd_dir.realPathFileAlloc(io, ".", allocator);
         defer allocator.free(cwd);
         const valid = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/auth/valid.toml", .{cwd});
         errdefer allocator.free(valid);
@@ -2863,6 +2869,7 @@ const AuthPaths = struct {
 };
 
 test "F011: valid AUTH followed by SET command succeeds" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -2878,38 +2885,39 @@ test "F011: valid AUTH followed by SET command succeeds" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19881) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19881) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(
-        stream.handle,
+        stream.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.RCVTIMEO,
         std.mem.asBytes(&recv_timeout),
     ) catch {};
 
-    _ = stream.write("AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
 
     var auth_buf: [16]u8 = undefined;
-    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    const auth_n = std.posix.read(stream.socket.handle, &auth_buf) catch return error.SkipZigTest;
     const auth_response = auth_buf[0..auth_n];
 
     try std.testing.expectEqualStrings("OK\n", auth_response);
 
-    _ = stream.write("req-auth-1 SET deploy.release.1 1595586600000000000\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-auth-1 SET deploy.release.1 1595586600000000000\n") catch return error.SkipZigTest;
 
     var set_buf: [64]u8 = undefined;
-    const set_n = stream.read(&set_buf) catch return error.SkipZigTest;
+    const set_n = std.posix.read(stream.socket.handle, &set_buf) catch return error.SkipZigTest;
     const set_response = set_buf[0..set_n];
 
     try std.testing.expect(std.mem.indexOf(u8, set_response, "OK") != null);
 
-    server.tmp_dir.dir.deleteFile("test_auth_valid_set.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_auth_valid_set.db") catch {};
 }
 
 test "F011: invalid AUTH closes connection" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -2925,35 +2933,36 @@ test "F011: invalid AUTH closes connection" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19882) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19882) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(
-        stream.handle,
+        stream.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.RCVTIMEO,
         std.mem.asBytes(&recv_timeout),
     ) catch {};
 
-    _ = stream.write("AUTH invalid_secret\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "AUTH invalid_secret\n") catch return error.SkipZigTest;
 
     var buf: [32]u8 = undefined;
-    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
     const response = buf[0..n];
 
     try std.testing.expectEqualStrings("ERROR auth_failed\n", response);
 
     // Server closes the connection after rejecting invalid AUTH
     var closed_buf: [16]u8 = undefined;
-    const closed_n = stream.read(&closed_buf) catch 0;
+    const closed_n = std.posix.read(stream.socket.handle, &closed_buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), closed_n);
 
-    server.tmp_dir.dir.deleteFile("test_auth_invalid.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_auth_invalid.db") catch {};
 }
 
 test "F011: namespace deny rejects SET outside namespace, allow within namespace" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -2969,40 +2978,41 @@ test "F011: namespace deny rejects SET outside namespace, allow within namespace
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19909) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19909) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(
-        stream.handle,
+        stream.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.RCVTIMEO,
         std.mem.asBytes(&recv_timeout),
     ) catch {};
 
-    _ = stream.write("AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
 
     var auth_buf: [16]u8 = undefined;
-    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    const auth_n = std.posix.read(stream.socket.handle, &auth_buf) catch return error.SkipZigTest;
     try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
 
-    _ = stream.write("req-ns-deny-1 SET backup.daily 1595586600000000000\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-ns-deny-1 SET backup.daily 1595586600000000000\n") catch return error.SkipZigTest;
 
     var deny_buf: [64]u8 = undefined;
-    const deny_n = stream.read(&deny_buf) catch return error.SkipZigTest;
+    const deny_n = std.posix.read(stream.socket.handle, &deny_buf) catch return error.SkipZigTest;
     try std.testing.expect(std.mem.indexOf(u8, deny_buf[0..deny_n], "ERROR") != null);
 
-    _ = stream.write("req-ns-allow-1 SET deploy.release.1 1595586600000000000\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-ns-allow-1 SET deploy.release.1 1595586600000000000\n") catch return error.SkipZigTest;
 
     var allow_buf: [64]u8 = undefined;
-    const allow_n = stream.read(&allow_buf) catch return error.SkipZigTest;
+    const allow_n = std.posix.read(stream.socket.handle, &allow_buf) catch return error.SkipZigTest;
     try std.testing.expect(std.mem.indexOf(u8, allow_buf[0..allow_n], "OK") != null);
 
-    server.tmp_dir.dir.deleteFile("test_auth_ns_deny.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_auth_ns_deny.db") catch {};
 }
 
 test "F011: no auth_file allows commands without AUTH" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
@@ -3011,30 +3021,31 @@ test "F011: no auth_file allows commands without AUTH" {
     );
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19883) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19883) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(
-        stream.handle,
+        stream.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.RCVTIMEO,
         std.mem.asBytes(&recv_timeout),
     ) catch {};
 
-    _ = stream.write("req-noauth-1 SET test.job 1595586600000000000\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-noauth-1 SET test.job 1595586600000000000\n") catch return error.SkipZigTest;
 
     var buf: [64]u8 = undefined;
-    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
     const response = buf[0..n];
 
     try std.testing.expect(std.mem.indexOf(u8, response, "OK") != null);
 
-    server.tmp_dir.dir.deleteFile("test_no_auth.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_no_auth.db") catch {};
 }
 
 test "F011: wildcard namespace allows commands targeting any identifier" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -3050,38 +3061,39 @@ test "F011: wildcard namespace allows commands targeting any identifier" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19885) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19885) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(
-        stream.handle,
+        stream.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.RCVTIMEO,
         std.mem.asBytes(&recv_timeout),
     ) catch {};
 
-    _ = stream.write("AUTH sk_admin_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "AUTH sk_admin_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
 
     var auth_buf: [16]u8 = undefined;
-    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    const auth_n = std.posix.read(stream.socket.handle, &auth_buf) catch return error.SkipZigTest;
     try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
 
-    _ = stream.write("req-wc-1 SET deploy.job1 1595586600000000000\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-wc-1 SET deploy.job1 1595586600000000000\n") catch return error.SkipZigTest;
     var buf1: [64]u8 = undefined;
-    const n1 = stream.read(&buf1) catch return error.SkipZigTest;
+    const n1 = std.posix.read(stream.socket.handle, &buf1) catch return error.SkipZigTest;
     try std.testing.expect(std.mem.indexOf(u8, buf1[0..n1], "OK") != null);
 
-    _ = stream.write("req-wc-2 SET backup.job1 1595586600000000000\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-wc-2 SET backup.job1 1595586600000000000\n") catch return error.SkipZigTest;
     var buf2: [64]u8 = undefined;
-    const n2 = stream.read(&buf2) catch return error.SkipZigTest;
+    const n2 = std.posix.read(stream.socket.handle, &buf2) catch return error.SkipZigTest;
     try std.testing.expect(std.mem.indexOf(u8, buf2[0..n2], "OK") != null);
 
-    server.tmp_dir.dir.deleteFile("test_auth_wildcard.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_auth_wildcard.db") catch {};
 }
 
 test "F011: QUERY filters results to client namespace" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -3097,13 +3109,13 @@ test "F011: QUERY filters results to client namespace" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19886) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19886) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(
-        stream.handle,
+        stream.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.RCVTIMEO,
         std.mem.asBytes(&recv_timeout),
@@ -3111,39 +3123,39 @@ test "F011: QUERY filters results to client namespace" {
 
     // Authenticate as the backup. token first to seed a backup. job via a separate connection
     {
-        var seed_stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-        defer seed_stream.close();
+        const seed_stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+        defer sock_close(seed_stream.socket.handle);
         std.posix.setsockopt(
-            seed_stream.handle,
+            seed_stream.socket.handle,
             std.posix.SOL.SOCKET,
             std.posix.SO.RCVTIMEO,
             std.mem.asBytes(&recv_timeout),
         ) catch {};
-        _ = seed_stream.write("AUTH sk_backup_d4e5f6a1b2c3\n") catch return error.SkipZigTest;
+        _ = sock_write(seed_stream.socket.handle, "AUTH sk_backup_d4e5f6a1b2c3\n") catch return error.SkipZigTest;
         var sb: [16]u8 = undefined;
-        _ = seed_stream.read(&sb) catch return error.SkipZigTest;
-        _ = seed_stream.write("seed-1 SET backup.job1 1595586600000000000\n") catch return error.SkipZigTest;
+        _ = std.posix.read(seed_stream.socket.handle, &sb) catch return error.SkipZigTest;
+        _ = sock_write(seed_stream.socket.handle, "seed-1 SET backup.job1 1595586600000000000\n") catch return error.SkipZigTest;
         var sb2: [64]u8 = undefined;
-        _ = seed_stream.read(&sb2) catch return error.SkipZigTest;
+        _ = std.posix.read(seed_stream.socket.handle, &sb2) catch return error.SkipZigTest;
     }
 
-    _ = stream.write("AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
     var auth_buf: [16]u8 = undefined;
-    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    const auth_n = std.posix.read(stream.socket.handle, &auth_buf) catch return error.SkipZigTest;
     try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
 
-    _ = stream.write("req-set-1 SET deploy.job1 1595586600000000000\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-set-1 SET deploy.job1 1595586600000000000\n") catch return error.SkipZigTest;
     var set_buf: [64]u8 = undefined;
-    _ = stream.read(&set_buf) catch return error.SkipZigTest;
+    _ = std.posix.read(stream.socket.handle, &set_buf) catch return error.SkipZigTest;
 
     // Empty pattern returns all jobs from scheduler; TCP handler filters by namespace
-    _ = stream.write("req-q-1 QUERY\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-q-1 QUERY\n") catch return error.SkipZigTest;
 
     // Accumulate all response lines until OK terminator
     var response_buf: [1024]u8 = undefined;
     var total: usize = 0;
     while (total < response_buf.len) {
-        const n = stream.read(response_buf[total..]) catch break;
+        const n = std.posix.read(stream.socket.handle, response_buf[total..]) catch break;
         if (n == 0) break;
         total += n;
         if (std.mem.indexOf(u8, response_buf[0..total], "req-q-1 OK\n") != null) break;
@@ -3153,10 +3165,11 @@ test "F011: QUERY filters results to client namespace" {
     try std.testing.expect(std.mem.indexOf(u8, response, "deploy.job1") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "backup.job1") == null);
 
-    server.tmp_dir.dir.deleteFile("test_auth_query_filter.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_auth_query_filter.db") catch {};
 }
 
 test "F011: RULE SET namespace enforcement rejects pattern outside namespace, allows within namespace" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -3172,40 +3185,41 @@ test "F011: RULE SET namespace enforcement rejects pattern outside namespace, al
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19887) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19887) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(
-        stream.handle,
+        stream.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.RCVTIMEO,
         std.mem.asBytes(&recv_timeout),
     ) catch {};
 
-    _ = stream.write("AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
 
     var auth_buf: [16]u8 = undefined;
-    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    const auth_n = std.posix.read(stream.socket.handle, &auth_buf) catch return error.SkipZigTest;
     try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
 
-    _ = stream.write("req-rs-deny-1 RULE SET x backup. shell echo\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-rs-deny-1 RULE SET x backup. shell echo\n") catch return error.SkipZigTest;
 
     var deny_buf: [64]u8 = undefined;
-    const deny_n = stream.read(&deny_buf) catch return error.SkipZigTest;
+    const deny_n = std.posix.read(stream.socket.handle, &deny_buf) catch return error.SkipZigTest;
     try std.testing.expect(std.mem.indexOf(u8, deny_buf[0..deny_n], "ERROR") != null);
 
-    _ = stream.write("req-rs-allow-1 RULE SET deploy.r deploy. shell echo\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-rs-allow-1 RULE SET deploy.r deploy. shell echo\n") catch return error.SkipZigTest;
 
     var allow_buf: [64]u8 = undefined;
-    const allow_n = stream.read(&allow_buf) catch return error.SkipZigTest;
+    const allow_n = std.posix.read(stream.socket.handle, &allow_buf) catch return error.SkipZigTest;
     try std.testing.expect(std.mem.indexOf(u8, allow_buf[0..allow_n], "OK") != null);
 
-    server.tmp_dir.dir.deleteFile("test_auth_rule_set_ns.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_auth_rule_set_ns.db") catch {};
 }
 
 test "F011: connection closed when no AUTH data received within timeout" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -3221,31 +3235,29 @@ test "F011: connection closed when no AUTH data received within timeout" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19888) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19888) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     // Connect but send no data; server must close the connection after auth timeout (FR-010: 5 seconds)
     var pfd = [1]std.posix.pollfd{.{
-        .fd = stream.handle,
+        .fd = stream.socket.handle,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
     const ready = std.posix.poll(&pfd, 6000) catch return error.SkipZigTest;
     try std.testing.expect(ready > 0);
     var buf: [1]u8 = undefined;
-    const n = std.posix.read(stream.handle, &buf) catch 0;
+    const n = std.posix.read(stream.socket.handle, &buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n);
 
-    server.tmp_dir.dir.deleteFile("test_auth_timeout.db") catch {};
+    server.tmp_dir.dir.deleteFile(std.testing.io, "test_auth_timeout.db") catch {};
 }
 
 // Feature: F013
 
 test "direct runner rule set via scheduler stores rule with correct runner fields" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -3276,9 +3288,7 @@ test "direct runner rule set via scheduler stores rule with correct runner field
 }
 
 test "direct runner rule stored and retrieved via list rules query" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -3310,9 +3320,7 @@ test "direct runner rule stored and retrieved via list rules query" {
 }
 
 test "direct runner rule persisted and replayed with correct fields" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const args = [_][]const u8{ "-s", "http://example.com" };
     const logfile_data = try build_logfile_bytes(allocator, &.{
@@ -3388,29 +3396,28 @@ test "dump command prints JSON for direct runner rule" {
 }
 
 test "RULE SET with direct runner over TCP stores rule and appears in LISTRULES" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19890\"\n\n[database]\npersistence = \"memory\"\n");
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19890) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19890) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
-    _ = stream.write("req-1 RULE SET rule.direct print. direct /bin/echo \"hello world\"\n") catch return error.SkipZigTest;
-    std.Thread.sleep(200_000_000);
+    _ = sock_write(stream.socket.handle, "req-1 RULE SET rule.direct print. direct /bin/echo \"hello world\"\n") catch return error.SkipZigTest;
+    nanosleep(200_000_000);
 
-    _ = stream.write("req-2 LISTRULES\n") catch return error.SkipZigTest;
-    std.Thread.sleep(300_000_000);
+    _ = sock_write(stream.socket.handle, "req-2 LISTRULES\n") catch return error.SkipZigTest;
+    nanosleep(300_000_000);
 
-    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+    sock_set_nonblock(stream.socket.handle);
 
     var buf: [4096]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
-        const n = stream.read(buf[total..]) catch break;
+        const n = std.posix.read(stream.socket.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
     }
@@ -3423,26 +3430,25 @@ test "RULE SET with direct runner over TCP stores rule and appears in LISTRULES"
 }
 
 test "server with custom shell config starts successfully and accepts commands" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19891\"\n\n[database]\npersistence = \"memory\"\n\n[shell]\npath = \"/bin/sh\"\nargs = [\"-c\"]\n");
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19891) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19891) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
-    _ = stream.write("req-1 RULE SET rule.shell run. shell /bin/true\n") catch return error.SkipZigTest;
-    std.Thread.sleep(200_000_000);
+    _ = sock_write(stream.socket.handle, "req-1 RULE SET rule.shell run. shell /bin/true\n") catch return error.SkipZigTest;
+    nanosleep(200_000_000);
 
-    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+    sock_set_nonblock(stream.socket.handle);
 
     var buf: [4096]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
-        const n = stream.read(buf[total..]) catch break;
+        const n = std.posix.read(stream.socket.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
     }
@@ -3457,40 +3463,44 @@ test "server with invalid shell path fails to start" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var config_file = try tmp_dir.dir.createFile("ztick.toml", .{});
-    try config_file.writeAll("[log]\nlevel = \"error\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n\n[shell]\npath = \"/nonexistent/shell\"\n");
-    config_file.close();
+    const io = std.testing.io;
+    var config_file = try tmp_dir.dir.createFile(io, "ztick.toml", .{});
+    try config_file.writeStreamingAll(io, "[log]\nlevel = \"error\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n\n[shell]\npath = \"/nonexistent/shell\"\n");
+    config_file.close(io);
 
-    const config_path = try tmp_dir.dir.realpathAlloc(allocator, "ztick.toml");
+    const config_path = try tmp_dir.dir.realPathFileAlloc(io, "ztick.toml", allocator);
     defer allocator.free(config_path);
 
     var child = try spawn_ztick(allocator, config_path);
-    const term = try child.wait();
+    const term = try child.wait(std.testing.io);
 
     switch (term) {
-        .Exited => |code| try std.testing.expect(code != 0),
+        .exited => |code| try std.testing.expect(code != 0),
         else => try std.testing.expect(false),
     }
 }
 
 // Feature: F015
 
-fn send_http_request(stream: std.net.Stream, request: []const u8, buf: []u8) ![]const u8 {
+fn send_http_request(stream: std.Io.net.Stream, request: []const u8, buf: []u8) ![]const u8 {
     var sent: usize = 0;
     while (sent < request.len) {
-        sent += std.posix.write(stream.handle, request[sent..]) catch return error.SkipZigTest;
+        const linux = std.os.linux;
+        const ret = linux.write(stream.socket.handle, request.ptr + sent, request.len - sent);
+        if (linux.errno(ret) != .SUCCESS) return error.SkipZigTest;
+        sent += ret;
     }
 
     var total: usize = 0;
     while (total < buf.len) {
         var pfd = [1]std.posix.pollfd{.{
-            .fd = stream.handle,
+            .fd = stream.socket.handle,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
         const ready = std.posix.poll(&pfd, 3000) catch return error.SkipZigTest;
         if (ready == 0) break;
-        const n = std.posix.read(stream.handle, buf[total..]) catch break;
+        const n = std.posix.read(stream.socket.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
         if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") != null) break;
@@ -3499,9 +3509,10 @@ fn send_http_request(stream: std.net.Stream, request: []const u8, buf: []u8) ![]
     return buf[0..total];
 }
 
-fn http_connect(port: u16) !std.net.Stream {
-    const addr = std.net.Address.parseIp("127.0.0.1", port) catch unreachable;
-    return std.net.tcpConnectToAddress(addr) catch error.SkipZigTest;
+fn http_connect(port: u16) !std.Io.net.Stream {
+    const io = std.testing.io;
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
+    return std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch error.SkipZigTest;
 }
 
 // Feature: F015
@@ -3514,8 +3525,8 @@ test "HTTP PUT creates a job" {
     );
     defer server.stop();
 
-    var stream = try http_connect(19941);
-    defer stream.close();
+    const stream = try http_connect(19941);
+    defer sock_close(stream.socket.handle);
     // Far-future execution keeps the job in .planned status; a past date would let the
     // scheduler tick transition it to .failed (no matching rule) before any GET.
     var resp_buf: [8192]u8 = undefined;
@@ -3540,8 +3551,8 @@ test "HTTP GET retrieves a created job" {
     defer server.stop();
 
     {
-        var stream = try http_connect(19943);
-        defer stream.close();
+        const stream = try http_connect(19943);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         _ = try send_http_request(
             stream,
@@ -3551,8 +3562,8 @@ test "HTTP GET retrieves a created job" {
     }
 
     {
-        var stream = try http_connect(19943);
-        defer stream.close();
+        const stream = try http_connect(19943);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
@@ -3576,8 +3587,8 @@ test "HTTP DELETE removes a job" {
     defer server.stop();
 
     {
-        var stream = try http_connect(19945);
-        defer stream.close();
+        const stream = try http_connect(19945);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         _ = try send_http_request(
             stream,
@@ -3587,8 +3598,8 @@ test "HTTP DELETE removes a job" {
     }
 
     {
-        var stream = try http_connect(19945);
-        defer stream.close();
+        const stream = try http_connect(19945);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
@@ -3610,8 +3621,8 @@ test "HTTP GET returns 404 for deleted job" {
     defer server.stop();
 
     {
-        var stream = try http_connect(19947);
-        defer stream.close();
+        const stream = try http_connect(19947);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         _ = try send_http_request(
             stream,
@@ -3621,8 +3632,8 @@ test "HTTP GET returns 404 for deleted job" {
     }
 
     {
-        var stream = try http_connect(19947);
-        defer stream.close();
+        const stream = try http_connect(19947);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         _ = try send_http_request(
             stream,
@@ -3632,8 +3643,8 @@ test "HTTP GET returns 404 for deleted job" {
     }
 
     {
-        var stream = try http_connect(19947);
-        defer stream.close();
+        const stream = try http_connect(19947);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
@@ -3655,8 +3666,8 @@ test "health check returns 200 with status ok" {
     );
     defer server.stop();
 
-    var stream = try http_connect(19895);
-    defer stream.close();
+    const stream = try http_connect(19895);
+    defer sock_close(stream.socket.handle);
     var resp_buf: [8192]u8 = undefined;
     const response = try send_http_request(
         stream,
@@ -3678,8 +3689,8 @@ test "unknown path returns 404 not found" {
     );
     defer server.stop();
 
-    var stream = try http_connect(19897);
-    defer stream.close();
+    const stream = try http_connect(19897);
+    defer sock_close(stream.socket.handle);
     var resp_buf: [8192]u8 = undefined;
     const response = try send_http_request(
         stream,
@@ -3692,6 +3703,7 @@ test "unknown path returns 404 not found" {
 
 // Feature: F015
 test "config without http section does not open HTTP port" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
@@ -3700,16 +3712,17 @@ test "config without http section does not open HTTP port" {
     );
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19899) catch unreachable;
-    const result = std.net.tcpConnectToAddress(addr);
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19899) catch unreachable;
+    const result = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream });
     if (result) |stream| {
-        stream.close();
+        sock_close(stream.socket.handle);
         return error.TestExpectedEqual;
     } else |_| {}
 }
 
 // Feature: F015
 test "job created via HTTP is retrievable via TCP" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
@@ -3719,8 +3732,8 @@ test "job created via HTTP is retrievable via TCP" {
     defer server.stop();
 
     {
-        var stream = try http_connect(19901);
-        defer stream.close();
+        const stream = try http_connect(19901);
+        defer sock_close(stream.socket.handle);
         // Far-future execution keeps the job in .planned status; the TCP GET below asserts
         // on "planned", which would not appear if the scheduler transitioned the job to .failed.
         var resp_buf: [8192]u8 = undefined;
@@ -3733,23 +3746,23 @@ test "job created via HTTP is retrievable via TCP" {
     }
 
     {
-        const addr = std.net.Address.parseIp("127.0.0.1", 19900) catch unreachable;
-        var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-        defer stream.close();
+        const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19900) catch unreachable;
+        const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+        defer sock_close(stream.socket.handle);
 
-        _ = stream.write("req-tcp-1 GET cross.1\n") catch return error.SkipZigTest;
+        _ = sock_write(stream.socket.handle, "req-tcp-1 GET cross.1\n") catch return error.SkipZigTest;
 
         var buf: [4096]u8 = undefined;
         var total: usize = 0;
         while (total < buf.len) {
             var pfd = [1]std.posix.pollfd{.{
-                .fd = stream.handle,
+                .fd = stream.socket.handle,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
             const ready = std.posix.poll(&pfd, 2000) catch break;
             if (ready == 0) break;
-            const n = stream.read(buf[total..]) catch break;
+            const n = std.posix.read(stream.socket.handle, buf[total..]) catch break;
             if (n == 0) break;
             total += n;
             if (std.mem.indexOf(u8, buf[0..total], "req-tcp-1") != null) break;
@@ -3771,8 +3784,8 @@ test "rule lifecycle via HTTP creates and deletes a rule" {
     defer server.stop();
 
     {
-        var stream = try http_connect(19903);
-        defer stream.close();
+        const stream = try http_connect(19903);
+        defer sock_close(stream.socket.handle);
         const body = "{\"pattern\":\"deploy.*\",\"runner\":\"shell\",\"args\":[\"/usr/bin/notify\"]}";
         var content_length_buf: [64]u8 = undefined;
         const content_length_str = std.fmt.bufPrint(&content_length_buf, "{d}", .{body.len}) catch unreachable;
@@ -3786,8 +3799,8 @@ test "rule lifecycle via HTTP creates and deletes a rule" {
     }
 
     {
-        var stream = try http_connect(19903);
-        defer stream.close();
+        const stream = try http_connect(19903);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
@@ -3798,8 +3811,8 @@ test "rule lifecycle via HTTP creates and deletes a rule" {
     }
 
     {
-        var stream = try http_connect(19903);
-        defer stream.close();
+        const stream = try http_connect(19903);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
@@ -3822,8 +3835,8 @@ test "job listing with prefix filter returns matching jobs" {
     defer server.stop();
 
     {
-        var stream = try http_connect(19905);
-        defer stream.close();
+        const stream = try http_connect(19905);
+        defer sock_close(stream.socket.handle);
         const body = "{\"execution\": \"2026-04-10T12:00:00Z\"}";
         var req_buf: [256]u8 = undefined;
         const request = std.fmt.bufPrint(&req_buf, "PUT /jobs/deploy.v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
@@ -3833,8 +3846,8 @@ test "job listing with prefix filter returns matching jobs" {
     }
 
     {
-        var stream = try http_connect(19905);
-        defer stream.close();
+        const stream = try http_connect(19905);
+        defer sock_close(stream.socket.handle);
         const body = "{\"execution\": \"2026-04-11T12:00:00Z\"}";
         var req_buf: [256]u8 = undefined;
         const request = std.fmt.bufPrint(&req_buf, "PUT /jobs/deploy.v2 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
@@ -3844,8 +3857,8 @@ test "job listing with prefix filter returns matching jobs" {
     }
 
     {
-        var stream = try http_connect(19905);
-        defer stream.close();
+        const stream = try http_connect(19905);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
@@ -3860,29 +3873,28 @@ test "job listing with prefix filter returns matching jobs" {
 
 // Feature: F016
 test "RULE SET with AWF runner over TCP stores rule and appears in LISTRULES" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19908\"\n\n[database]\npersistence = \"memory\"\n");
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19908) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19908) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
-    _ = stream.write("req-1 RULE SET rule.awf app. awf code-review --input target=main\n") catch return error.SkipZigTest;
-    std.Thread.sleep(200_000_000);
+    _ = sock_write(stream.socket.handle, "req-1 RULE SET rule.awf app. awf code-review --input target=main\n") catch return error.SkipZigTest;
+    nanosleep(200_000_000);
 
-    _ = stream.write("req-2 LISTRULES\n") catch return error.SkipZigTest;
-    std.Thread.sleep(300_000_000);
+    _ = sock_write(stream.socket.handle, "req-2 LISTRULES\n") catch return error.SkipZigTest;
+    nanosleep(300_000_000);
 
-    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+    sock_set_nonblock(stream.socket.handle);
 
     var buf: [4096]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
-        const n = stream.read(buf[total..]) catch break;
+        const n = std.posix.read(stream.socket.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
     }
@@ -3904,8 +3916,8 @@ test "malformed JSON on PUT returns 400 bad request" {
     );
     defer server.stop();
 
-    var stream = try http_connect(19907);
-    defer stream.close();
+    const stream = try http_connect(19907);
+    defer sock_close(stream.socket.handle);
     const body = "{not valid json}";
     var req_buf: [256]u8 = undefined;
     const request = std.fmt.bufPrint(&req_buf, "PUT /jobs/bad.json HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
@@ -3917,9 +3929,7 @@ test "malformed JSON on PUT returns 400 bad request" {
 
 // Feature: F016
 test "AWF rule with input persists and replays from logfile" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const original_rule = Rule{
         .identifier = "rule.report",
@@ -3949,29 +3959,28 @@ test "AWF rule with input persists and replays from logfile" {
 
 // Feature: F016
 test "RULE SET with AWF runner and --input over TCP stores rule with input parameter" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19910\"\n\n[database]\npersistence = \"memory\"\n");
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19910) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19910) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
-    _ = stream.write("req-1 RULE SET rule.report report. awf generate-report --input format=pdf --input target=main\n") catch return error.SkipZigTest;
-    std.Thread.sleep(200_000_000);
+    _ = sock_write(stream.socket.handle, "req-1 RULE SET rule.report report. awf generate-report --input format=pdf --input target=main\n") catch return error.SkipZigTest;
+    nanosleep(200_000_000);
 
-    _ = stream.write("req-2 LISTRULES\n") catch return error.SkipZigTest;
-    std.Thread.sleep(300_000_000);
+    _ = sock_write(stream.socket.handle, "req-2 LISTRULES\n") catch return error.SkipZigTest;
+    nanosleep(300_000_000);
 
-    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+    sock_set_nonblock(stream.socket.handle);
 
     var buf: [4096]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
-        const n = stream.read(buf[total..]) catch break;
+        const n = std.posix.read(stream.socket.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
     }
@@ -3984,9 +3993,7 @@ test "RULE SET with AWF runner and --input over TCP stores rule with input param
 
 // Feature: F016
 test "AWF rule without input persists and replays from logfile" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const original_rule = Rule{
         .identifier = "rule.review",
@@ -4023,8 +4030,8 @@ test "HTTP PUT creates AWF rule and GET returns it in listing" {
     defer server.stop();
 
     {
-        var stream = try http_connect(19913);
-        defer stream.close();
+        const stream = try http_connect(19913);
+        defer sock_close(stream.socket.handle);
         const body = "{\"pattern\": \"app.\", \"runner\": \"awf\", \"args\": [\"code-review\"]}";
         var req_buf: [512]u8 = undefined;
         const request = std.fmt.bufPrint(&req_buf, "PUT /rules/rule.awf HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
@@ -4035,8 +4042,8 @@ test "HTTP PUT creates AWF rule and GET returns it in listing" {
     }
 
     {
-        var stream = try http_connect(19913);
-        defer stream.close();
+        const stream = try http_connect(19913);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
@@ -4051,26 +4058,25 @@ test "HTTP PUT creates AWF rule and GET returns it in listing" {
 
 // Feature: F016
 test "TCP RULE SET with awf runner missing workflow returns ERROR" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19914\"\n\n[database]\npersistence = \"memory\"\n");
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19914) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19914) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
-    _ = stream.write("req-1 RULE SET rule.bad app. awf\n") catch return error.SkipZigTest;
-    std.Thread.sleep(200_000_000);
+    _ = sock_write(stream.socket.handle, "req-1 RULE SET rule.bad app. awf\n") catch return error.SkipZigTest;
+    nanosleep(200_000_000);
 
-    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+    sock_set_nonblock(stream.socket.handle);
 
     var buf: [4096]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
-        const n = stream.read(buf[total..]) catch break;
+        const n = std.posix.read(stream.socket.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
     }
@@ -4080,29 +4086,28 @@ test "TCP RULE SET with awf runner missing workflow returns ERROR" {
 }
 
 test "RULE SET with HTTP runner over TCP stores rule and appears in LISTRULES" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19915\"\n\n[database]\npersistence = \"memory\"\n");
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19915) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19915) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
-    _ = stream.write("req-1 RULE SET rule.http webhook. http POST https://hooks.example.com/notify\n") catch return error.SkipZigTest;
-    std.Thread.sleep(200_000_000);
+    _ = sock_write(stream.socket.handle, "req-1 RULE SET rule.http webhook. http POST https://hooks.example.com/notify\n") catch return error.SkipZigTest;
+    nanosleep(200_000_000);
 
-    _ = stream.write("req-2 LISTRULES\n") catch return error.SkipZigTest;
-    std.Thread.sleep(300_000_000);
+    _ = sock_write(stream.socket.handle, "req-2 LISTRULES\n") catch return error.SkipZigTest;
+    nanosleep(300_000_000);
 
-    const flags = std.posix.fcntl(stream.handle, std.posix.F.GETFL, 0) catch return error.SkipZigTest;
-    const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    _ = std.posix.fcntl(stream.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+    sock_set_nonblock(stream.socket.handle);
 
     var buf: [4096]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
-        const n = stream.read(buf[total..]) catch break;
+        const n = std.posix.read(stream.socket.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
     }
@@ -4125,8 +4130,8 @@ test "HTTP PUT creates HTTP rule and GET returns it in listing" {
     defer server.stop();
 
     {
-        var stream = try http_connect(19917);
-        defer stream.close();
+        const stream = try http_connect(19917);
+        defer sock_close(stream.socket.handle);
         const body = "{\"pattern\": \"deploy.\", \"runner\": \"http\", \"args\": [\"POST\", \"https://hooks.example.com/webhook\"]}";
         var req_buf: [512]u8 = undefined;
         const request = std.fmt.bufPrint(&req_buf, "PUT /rules/rule.http HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
@@ -4137,8 +4142,8 @@ test "HTTP PUT creates HTTP rule and GET returns it in listing" {
     }
 
     {
-        var stream = try http_connect(19917);
-        defer stream.close();
+        const stream = try http_connect(19917);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
@@ -4160,8 +4165,8 @@ test "HTTP PUT with HTTP runner missing url returns 400 bad request" {
     );
     defer server.stop();
 
-    var stream = try http_connect(19919);
-    defer stream.close();
+    const stream = try http_connect(19919);
+    defer sock_close(stream.socket.handle);
     const body = "{\"pattern\": \"x\", \"runner\": \"http\", \"args\": [\"GET\"]}";
     var req_buf: [512]u8 = undefined;
     const request = std.fmt.bufPrint(&req_buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
@@ -4179,8 +4184,8 @@ test "HTTP PUT with HTTP runner unsupported method returns 400 bad request" {
     );
     defer server.stop();
 
-    var stream = try http_connect(19921);
-    defer stream.close();
+    const stream = try http_connect(19921);
+    defer sock_close(stream.socket.handle);
     const body = "{\"pattern\": \"x\", \"runner\": \"http\", \"args\": [\"PATCH\", \"https://hooks.example.com/webhook\"]}";
     var req_buf: [512]u8 = undefined;
     const request = std.fmt.bufPrint(&req_buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
@@ -4198,8 +4203,8 @@ test "HTTP PUT with HTTP runner invalid url scheme returns 400 bad request" {
     );
     defer server.stop();
 
-    var stream = try http_connect(19923);
-    defer stream.close();
+    const stream = try http_connect(19923);
+    defer sock_close(stream.socket.handle);
     const body = "{\"pattern\": \"x\", \"runner\": \"http\", \"args\": [\"POST\", \"ftp://hooks.example.com/webhook\"]}";
     var req_buf: [512]u8 = undefined;
     const request = std.fmt.bufPrint(&req_buf, "PUT /rules/rule.bad HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
@@ -4209,9 +4214,7 @@ test "HTTP PUT with HTTP runner invalid url scheme returns 400 bad request" {
 }
 
 test "HTTP rule persists and replays from logfile with correct method and url" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const original_rule = Rule{
         .identifier = "rule.webhook",
@@ -4240,6 +4243,7 @@ test "HTTP rule persists and replays from logfile with correct method and url" {
 // Feature: F018
 
 test "stat command over TCP reports auth_enabled 1 when auth_file is configured" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -4255,38 +4259,38 @@ test "stat command over TCP reports auth_enabled 1 when auth_file is configured"
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19924) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19924) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(
-        stream.handle,
+        stream.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.RCVTIMEO,
         std.mem.asBytes(&recv_timeout),
     ) catch {};
 
-    _ = stream.write("AUTH sk_admin_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "AUTH sk_admin_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
 
     var auth_buf: [16]u8 = undefined;
-    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    const auth_n = std.posix.read(stream.socket.handle, &auth_buf) catch return error.SkipZigTest;
     try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
 
-    _ = stream.write("req-stat-f018 STAT\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-stat-f018 STAT\n") catch return error.SkipZigTest;
 
     // Poll in a loop to accumulate multi-line STAT response for sanitizer reliability
     var buf: [4096]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
         var pfd = [1]std.posix.pollfd{.{
-            .fd = stream.handle,
+            .fd = stream.socket.handle,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
         const ready = std.posix.poll(&pfd, 2000) catch return error.SkipZigTest;
         if (ready == 0) break;
-        const n = stream.read(buf[total..]) catch break;
+        const n = std.posix.read(stream.socket.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
         if (std.mem.indexOf(u8, buf[0..total], "req-stat-f018 OK\n") != null) break;
@@ -4298,6 +4302,7 @@ test "stat command over TCP reports auth_enabled 1 when auth_file is configured"
 }
 
 test "stat command succeeds for namespace-scoped authenticated client" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -4314,39 +4319,39 @@ test "stat command succeeds for namespace-scoped authenticated client" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 19925) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19925) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(
-        stream.handle,
+        stream.socket.handle,
         std.posix.SOL.SOCKET,
         std.posix.SO.RCVTIMEO,
         std.mem.asBytes(&recv_timeout),
     ) catch {};
 
-    _ = stream.write("AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
 
     var auth_buf: [16]u8 = undefined;
-    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    const auth_n = std.posix.read(stream.socket.handle, &auth_buf) catch return error.SkipZigTest;
     try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
 
     // STAT has no namespace prefix — must succeed despite namespace-scoped token
-    _ = stream.write("req-stat-ns STAT\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "req-stat-ns STAT\n") catch return error.SkipZigTest;
 
     // Poll in a loop to accumulate multi-line STAT response for sanitizer reliability
     var buf: [4096]u8 = undefined;
     var total: usize = 0;
     while (total < buf.len) {
         var pfd = [1]std.posix.pollfd{.{
-            .fd = stream.handle,
+            .fd = stream.socket.handle,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
         const ready = std.posix.poll(&pfd, 2000) catch return error.SkipZigTest;
         if (ready == 0) break;
-        const n = stream.read(buf[total..]) catch break;
+        const n = std.posix.read(stream.socket.handle, buf[total..]) catch break;
         if (n == 0) break;
         total += n;
         if (std.mem.indexOf(u8, buf[0..total], "req-stat-ns OK\n") != null) break;
@@ -4360,9 +4365,7 @@ test "stat command succeeds for namespace-scoped authenticated client" {
 // Feature: F019
 
 test "scheduler dispatches AMQP runner request when matching job triggers" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -4405,9 +4408,7 @@ test "scheduler dispatches AMQP runner request when matching job triggers" {
 }
 
 test "persisted AMQP rule replays and dispatches matching job after reload" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const persisted_rule = Rule{
         .identifier = "rule.publish",
@@ -4455,11 +4456,12 @@ test "persisted AMQP rule replays and dispatches matching job after reload" {
 }
 
 test "shell runner dispatches AMQP runner without raising when broker unreachable" {
+    const io = std.testing.io;
     const refused_port: u16 = blk: {
-        const a = try std.net.Address.parseIp4("127.0.0.1", 0);
-        var s = try a.listen(.{ .reuse_address = true });
-        const p = s.listen_address.in.getPort();
-        s.deinit();
+        const a = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var s = try std.Io.net.IpAddress.listen(&a, io, .{ .reuse_address = true });
+        const p = s.socket.address.getPort();
+        s.deinit(io);
         break :blk p;
     };
     const dsn = try std.fmt.allocPrint(std.testing.allocator, "amqp://guest:guest@127.0.0.1:{d}/", .{refused_port});
@@ -4472,16 +4474,14 @@ test "shell runner dispatches AMQP runner without raising when broker unreachabl
         .runner = .{ .amqp = .{ .dsn = dsn, .exchange = "jobs", .routing_key = "notifications" } },
     };
 
-    const response = infrastructure_runner.execute(std.testing.allocator, shell_config, request);
+    const response = infrastructure_runner.execute(std.testing.io, std.testing.allocator, shell_config, request);
 
     try std.testing.expectEqual(@as(u128, 0xF019_F019_F019_F019), response.identifier);
     try std.testing.expect(!response.success);
 }
 
 test "scheduler dispatches Redis runner request when matching job triggers" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -4524,9 +4524,7 @@ test "scheduler dispatches Redis runner request when matching job triggers" {
 }
 
 test "persisted Redis rule replays and dispatches matching job after reload" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const persisted_rule = Rule{
         .identifier = "rule.publish",
@@ -4574,11 +4572,12 @@ test "persisted Redis rule replays and dispatches matching job after reload" {
 }
 
 test "runner dispatches Redis runner without raising when broker unreachable" {
+    const io = std.testing.io;
     const refused_port: u16 = blk: {
-        const a = try std.net.Address.parseIp4("127.0.0.1", 0);
-        var s = try a.listen(.{ .reuse_address = true });
-        const p = s.listen_address.in.getPort();
-        s.deinit();
+        const a = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var s = try std.Io.net.IpAddress.listen(&a, io, .{ .reuse_address = true });
+        const p = s.socket.address.getPort();
+        s.deinit(io);
         break :blk p;
     };
     const url = try std.fmt.allocPrint(std.testing.allocator, "redis://127.0.0.1:{d}/0", .{refused_port});
@@ -4591,16 +4590,14 @@ test "runner dispatches Redis runner without raising when broker unreachable" {
         .runner = .{ .redis = .{ .url = url, .command = "PUBLISH", .key = "deploy:events" } },
     };
 
-    const response = infrastructure_runner.execute(std.testing.allocator, shell_config, request);
+    const response = infrastructure_runner.execute(std.testing.io, std.testing.allocator, shell_config, request);
 
     try std.testing.expectEqual(@as(u128, 0xF020_F020_F020_F020), response.identifier);
     try std.testing.expect(!response.success);
 }
 
 test "logfile containing shell amqp direct awf http rules replays under F020 (discriminant 5 does not clash with existing values)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     const direct_args = [_][]const u8{ "-s", "http://example.com" };
     const awf_inputs = [_][]const u8{ "format=pdf", "target=main" };
@@ -4700,9 +4697,7 @@ test "logfile containing shell amqp direct awf http rules replays under F020 (di
 // Feature: F021
 
 test "jobs SET in reverse order trigger in execution-time order via priority queue" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -4739,9 +4734,7 @@ test "jobs SET in reverse order trigger in execution-time order via priority que
 }
 
 test "PQ maintains min-heap after interleaved SET and DELETE operations" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -4774,35 +4767,37 @@ test "clock wakes immediately when channel signals notify_condition" {
     const allocator = std.testing.allocator;
     const query = domain_query;
 
-    var req_ch = try Channel(query.Request).init(allocator, 1024);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 1024);
     defer req_ch.deinit();
 
-    var wake_mutex = std.Thread.Mutex{};
-    var wake_condition = std.Thread.Condition{};
-    req_ch.notify_condition = &wake_condition;
+    var wake_mutex: std.Io.Mutex = .init;
+    var wake_token = std.atomic.Value(u32).init(0);
+    req_ch.wake_token = &wake_token;
 
     var running = std.atomic.Value(bool).init(true);
     var tick_count = std.atomic.Value(u32).init(0);
 
-    const clock = Clock.init(1, &running);
+    const clock = Clock.init(1, &running, std.testing.io);
+
+    const ClockArgs = struct {
+        clk: Clock,
+        count: *std.atomic.Value(u32),
+        wm: *std.Io.Mutex,
+        wt: *std.atomic.Value(u32),
+    };
 
     const clock_thread = try std.Thread.spawn(.{}, struct {
-        fn run(
-            clk: Clock,
-            count: *std.atomic.Value(u32),
-            wm: *std.Thread.Mutex,
-            wc: *std.Thread.Condition,
-        ) void {
-            clk.start(count, struct {
+        fn run(args: ClockArgs) void {
+            args.clk.start(args.count, struct {
                 fn tick(c: *std.atomic.Value(u32)) ?i64 {
                     _ = c.fetchAdd(1, .monotonic);
                     return null;
                 }
-            }.tick, wm, wc);
+            }.tick, args.wm, args.wt);
         }
-    }.run, .{ clock, &tick_count, &wake_mutex, &wake_condition });
+    }.run, .{ClockArgs{ .clk = clock, .count = &tick_count, .wm = &wake_mutex, .wt = &wake_token }});
 
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    nanosleep(20 * std.time.ns_per_ms);
     const count_before = tick_count.load(.monotonic);
 
     try req_ch.send(query.Request{
@@ -4811,20 +4806,20 @@ test "clock wakes immediately when channel signals notify_condition" {
         .instruction = .{ .set = .{ .identifier = "wake.job", .execution = 999 } },
     });
 
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    nanosleep(20 * std.time.ns_per_ms);
     const count_after = tick_count.load(.monotonic);
 
     running.store(false, .release);
-    wake_condition.signal();
+    // Increment token and wake the futex so the clock exits its idle wait promptly.
+    _ = wake_token.fetchAdd(1, .release);
+    std.testing.io.futexWake(u32, &wake_token.raw, 1);
     clock_thread.join();
 
     try std.testing.expect(count_after > count_before);
 }
 
 test "last SET for same identifier wins and PQ contains single entry" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -4858,8 +4853,8 @@ test "concurrent HTTP requests are handled simultaneously by separate worker thr
 
     const Worker = struct {
         fn run(port: u16, job_id: []const u8) void {
-            var stream = http_connect(port) catch return;
-            defer stream.close();
+            const stream = http_connect(port) catch return;
+            defer sock_close(stream.socket.handle);
 
             var req_buf: [512]u8 = undefined;
             const body = "{\"execution\": \"2099-12-31T23:59:59Z\"}";
@@ -4880,8 +4875,8 @@ test "concurrent HTTP requests are handled simultaneously by separate worker thr
     for (&threads) |*t| t.join();
 
     for (job_ids) |job_id| {
-        var stream = try http_connect(19931);
-        defer stream.close();
+        const stream = try http_connect(19931);
+        defer sock_close(stream.socket.handle);
         var req_buf: [256]u8 = undefined;
         const req = std.fmt.bufPrint(&req_buf, "GET /jobs/{s} HTTP/1.1\r\n\r\n", .{job_id}) catch continue;
         var resp_buf: [8192]u8 = undefined;
@@ -4899,10 +4894,11 @@ test "HTTP server shuts down gracefully after concurrent requests complete" {
         allocator,
         "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19932\"\n\n[http]\nlisten = \"127.0.0.1:19933\"\n\n[database]\npersistence = \"memory\"\n",
     );
+    defer server.stop();
 
     {
-        var stream = try http_connect(19933);
-        defer stream.close();
+        const stream = try http_connect(19933);
+        defer sock_close(stream.socket.handle);
         var resp_buf: [8192]u8 = undefined;
         const response = try send_http_request(
             stream,
@@ -4911,8 +4907,6 @@ test "HTTP server shuts down gracefully after concurrent requests complete" {
         );
         try std.testing.expect(std.mem.indexOf(u8, response, "200") != null);
     }
-
-    server.stop();
 }
 
 // Feature: F022
@@ -4929,8 +4923,8 @@ test "mixed TCP and HTTP concurrent requests both succeed without blocking" {
 
     const HttpWorker = struct {
         fn run(port: u16, job_id: []const u8) void {
-            var stream = http_connect(port) catch return;
-            defer stream.close();
+            const stream = http_connect(port) catch return;
+            defer sock_close(stream.socket.handle);
 
             var req_buf: [512]u8 = undefined;
             const body = "{\"execution\": \"2099-12-31T23:59:59Z\"}";
@@ -4942,14 +4936,15 @@ test "mixed TCP and HTTP concurrent requests both succeed without blocking" {
 
     const TcpWorker = struct {
         fn run(port: u16, job_id: []const u8) void {
-            const addr = std.net.Address.parseIp("127.0.0.1", port) catch unreachable;
-            var stream = std.net.tcpConnectToAddress(addr) catch return;
-            defer stream.close();
+            const io = std.testing.io;
+            const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
+            const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return;
+            defer sock_close(stream.socket.handle);
 
             var req_buf: [256]u8 = undefined;
             const req = std.fmt.bufPrint(&req_buf, "req-mix-1 SET {s} 4102444799000000000\n", .{job_id}) catch return;
-            _ = stream.write(req) catch return;
-            std.Thread.sleep(500_000_000);
+            _ = sock_write(stream.socket.handle, req) catch return;
+            nanosleep(500_000_000);
         }
     };
 
@@ -4965,8 +4960,8 @@ test "mixed TCP and HTTP concurrent requests both succeed without blocking" {
     for (&threads) |*t| t.join();
 
     for (http_ids) |job_id| {
-        var stream = try http_connect(19935);
-        defer stream.close();
+        const stream = try http_connect(19935);
+        defer sock_close(stream.socket.handle);
         var req_buf: [256]u8 = undefined;
         const req = std.fmt.bufPrint(&req_buf, "GET /jobs/{s} HTTP/1.1\r\n\r\n", .{job_id}) catch continue;
         var resp_buf: [8192]u8 = undefined;
@@ -4976,8 +4971,8 @@ test "mixed TCP and HTTP concurrent requests both succeed without blocking" {
     }
 
     for (tcp_ids) |job_id| {
-        var stream = try http_connect(19935);
-        defer stream.close();
+        const stream = try http_connect(19935);
+        defer sock_close(stream.socket.handle);
         var req_buf: [256]u8 = undefined;
         const req = std.fmt.bufPrint(&req_buf, "GET /jobs/{s} HTTP/1.1\r\n\r\n", .{job_id}) catch continue;
         var resp_buf: [8192]u8 = undefined;
@@ -5001,8 +4996,8 @@ test "multiple concurrent HTTP connections all complete before shutdown" {
 
     const Worker = struct {
         fn run(port: u16, job_id: []const u8) void {
-            var stream = http_connect(port) catch return;
-            defer stream.close();
+            const stream = http_connect(port) catch return;
+            defer sock_close(stream.socket.handle);
 
             var req_buf: [512]u8 = undefined;
             const body = "{\"execution\": \"2099-12-31T23:59:59Z\"}";
@@ -5023,8 +5018,8 @@ test "multiple concurrent HTTP connections all complete before shutdown" {
     for (&threads) |*t| t.join();
 
     for (job_ids) |job_id| {
-        var stream = try http_connect(19937);
-        defer stream.close();
+        const stream = try http_connect(19937);
+        defer sock_close(stream.socket.handle);
         var req_buf: [256]u8 = undefined;
         const req = std.fmt.bufPrint(&req_buf, "GET /jobs/{s} HTTP/1.1\r\n\r\n", .{job_id}) catch continue;
         var resp_buf: [8192]u8 = undefined;
@@ -5038,6 +5033,7 @@ test "multiple concurrent HTTP connections all complete before shutdown" {
 // Feature: F023
 
 test "F023: GET for non-existent job returns not_found error code" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
@@ -5046,22 +5042,23 @@ test "F023: GET for non-existent job returns not_found error code" {
     );
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 20001) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20001) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = stream.write("r1 GET nonexistent.job\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "r1 GET nonexistent.job\n") catch return error.SkipZigTest;
 
     var buf: [128]u8 = undefined;
-    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "r1 ERROR not_found") != null);
 }
 
 test "F023: REMOVE for non-existent job returns not_found error code" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
@@ -5070,22 +5067,23 @@ test "F023: REMOVE for non-existent job returns not_found error code" {
     );
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 20002) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20002) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = stream.write("r1 REMOVE nonexistent.job\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "r1 REMOVE nonexistent.job\n") catch return error.SkipZigTest;
 
     var buf: [128]u8 = undefined;
-    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "r1 ERROR not_found") != null);
 }
 
 test "F023: REMOVERULE for non-existent rule returns not_found error code" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
@@ -5094,22 +5092,23 @@ test "F023: REMOVERULE for non-existent rule returns not_found error code" {
     );
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 20003) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20003) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = stream.write("r1 REMOVERULE nonexistent.rule\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "r1 REMOVERULE nonexistent.rule\n") catch return error.SkipZigTest;
 
     var buf: [128]u8 = undefined;
-    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "r1 ERROR not_found") != null);
 }
 
 test "F023: SET without timestamp returns invalid_args error code" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
@@ -5118,22 +5117,23 @@ test "F023: SET without timestamp returns invalid_args error code" {
     );
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 20004) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20004) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = stream.write("r1 SET job.1\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "r1 SET job.1\n") catch return error.SkipZigTest;
 
     var buf: [128]u8 = undefined;
-    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "r1 ERROR invalid_args") != null);
 }
 
 test "F023: GET without identifier returns invalid_args error code" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
@@ -5142,22 +5142,23 @@ test "F023: GET without identifier returns invalid_args error code" {
     );
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 20005) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20005) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = stream.write("r1 GET\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "r1 GET\n") catch return error.SkipZigTest;
 
     var buf: [128]u8 = undefined;
-    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "r1 ERROR invalid_args") != null);
 }
 
 test "F023: RULE SET without required args returns invalid_args error code" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
@@ -5166,22 +5167,23 @@ test "F023: RULE SET without required args returns invalid_args error code" {
     );
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 20006) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20006) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = stream.write("r1 RULE SET rule.1\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "r1 RULE SET rule.1\n") catch return error.SkipZigTest;
 
     var buf: [128]u8 = undefined;
-    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "ERROR invalid_args") != null);
 }
 
 test "F023: non-AUTH command before authentication returns auth_required" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -5197,22 +5199,23 @@ test "F023: non-AUTH command before authentication returns auth_required" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 20007) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20007) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = stream.write("r1 SET job.1 12345\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "r1 SET job.1 12345\n") catch return error.SkipZigTest;
 
     var buf: [64]u8 = undefined;
-    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
 
     try std.testing.expectEqualStrings("ERROR auth_required\n", buf[0..n]);
 }
 
 test "F023: AUTH with invalid token returns auth_failed" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -5228,22 +5231,23 @@ test "F023: AUTH with invalid token returns auth_failed" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 20008) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20008) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = stream.write("AUTH bad_token\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "AUTH bad_token\n") catch return error.SkipZigTest;
 
     var buf: [64]u8 = undefined;
-    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
 
     try std.testing.expectEqualStrings("ERROR auth_failed\n", buf[0..n]);
 }
 
 test "F023: command outside namespace scope returns auth_denied" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -5259,28 +5263,29 @@ test "F023: command outside namespace scope returns auth_denied" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 20009) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20009) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = stream.write("AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
 
     var auth_buf: [16]u8 = undefined;
-    const auth_n = stream.read(&auth_buf) catch return error.SkipZigTest;
+    const auth_n = std.posix.read(stream.socket.handle, &auth_buf) catch return error.SkipZigTest;
     try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
 
-    _ = stream.write("r1 SET backup.job 12345\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "r1 SET backup.job 12345\n") catch return error.SkipZigTest;
 
     var buf: [128]u8 = undefined;
-    const n = stream.read(&buf) catch return error.SkipZigTest;
+    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "ERROR auth_denied") != null);
 }
 
 test "F023: existing SET-GET-REMOVE flow still works" {
+    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
@@ -5289,28 +5294,131 @@ test "F023: existing SET-GET-REMOVE flow still works" {
     );
     defer server.stop();
 
-    const addr = std.net.Address.parseIp("127.0.0.1", 20010) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return error.SkipZigTest;
-    defer stream.close();
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20010) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = stream.write("r1 SET compat.job 1595586600000000000\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "r1 SET compat.job 1595586600000000000\n") catch return error.SkipZigTest;
 
     var set_buf: [64]u8 = undefined;
-    const set_n = stream.read(&set_buf) catch return error.SkipZigTest;
+    const set_n = std.posix.read(stream.socket.handle, &set_buf) catch return error.SkipZigTest;
     try std.testing.expect(std.mem.indexOf(u8, set_buf[0..set_n], "OK") != null);
 
-    _ = stream.write("r2 GET compat.job\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "r2 GET compat.job\n") catch return error.SkipZigTest;
 
     var get_buf: [64]u8 = undefined;
-    const get_n = stream.read(&get_buf) catch return error.SkipZigTest;
+    const get_n = std.posix.read(stream.socket.handle, &get_buf) catch return error.SkipZigTest;
     try std.testing.expect(std.mem.indexOf(u8, get_buf[0..get_n], "OK") != null);
 
-    _ = stream.write("r3 REMOVE compat.job\n") catch return error.SkipZigTest;
+    _ = sock_write(stream.socket.handle, "r3 REMOVE compat.job\n") catch return error.SkipZigTest;
 
     var rem_buf: [64]u8 = undefined;
-    const rem_n = stream.read(&rem_buf) catch return error.SkipZigTest;
+    const rem_n = std.posix.read(stream.socket.handle, &rem_buf) catch return error.SkipZigTest;
     try std.testing.expect(std.mem.indexOf(u8, rem_buf[0..rem_n], "OK") != null);
+}
+
+// Feature: F024
+
+test "migrated daemon binary completes TCP SET and GET round-trip" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    var server = try TestServer.start(allocator,
+        \\[log]
+        \\level = "debug"
+        \\
+        \\[controller]
+        \\listen = "127.0.0.1:20100"
+        \\
+        \\[database]
+        \\logfile_path = "test_f024_roundtrip.db"
+        \\
+    );
+    defer server.stop();
+    defer server.tmp_dir.dir.deleteFile(std.testing.io, "test_f024_roundtrip.db") catch {};
+
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20100) catch unreachable;
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer sock_close(stream.socket.handle);
+
+    const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
+
+    _ = sock_write(stream.socket.handle, "req-1 SET migrated.job 1700000000000000000\n") catch return error.SkipZigTest;
+
+    var set_buf: [64]u8 = undefined;
+    const set_n = std.posix.read(stream.socket.handle, &set_buf) catch return error.SkipZigTest;
+    try std.testing.expect(std.mem.indexOf(u8, set_buf[0..set_n], "OK") != null);
+
+    _ = sock_write(stream.socket.handle, "req-2 GET migrated.job\n") catch return error.SkipZigTest;
+
+    var get_buf: [128]u8 = undefined;
+    const get_n = std.posix.read(stream.socket.handle, &get_buf) catch return error.SkipZigTest;
+    try std.testing.expect(std.mem.indexOf(u8, get_buf[0..get_n], "OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_buf[0..get_n], "1700000000000000000") != null);
+}
+
+test "migrated persistence codec round-trip preserves entries bit-for-bit" {
+    const allocator = std.testing.allocator;
+
+    const entries = [_]persistence_encoder.Entry{
+        .{ .job = .{ .identifier = "alpha.task", .execution = 1700000000000000000, .status = .planned } },
+        .{ .rule = .{ .identifier = "rule.alpha", .pattern = "alpha.", .runner = .{ .shell = .{ .command = "/bin/true" } } } },
+        .{ .job_removal = .{ .identifier = "alpha.task" } },
+        .{ .rule_removal = .{ .identifier = "rule.alpha" } },
+    };
+
+    const framed = try build_logfile_bytes(allocator, &entries);
+    defer allocator.free(framed);
+
+    const parsed = try persistence_logfile.parse(allocator, framed);
+    defer {
+        for (parsed.entries) |e| allocator.free(e);
+        allocator.free(parsed.entries);
+    }
+
+    try std.testing.expectEqual(entries.len, parsed.entries.len);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    for (parsed.entries, 0..) |frame, i| {
+        const decoded = try persistence_encoder.decode(arena.allocator(), frame);
+        try std.testing.expectEqual(std.meta.activeTag(entries[i]), std.meta.activeTag(decoded));
+        switch (decoded) {
+            .job => |j| {
+                try std.testing.expectEqualStrings(entries[i].job.identifier, j.identifier);
+                try std.testing.expectEqual(entries[i].job.execution, j.execution);
+                try std.testing.expectEqual(entries[i].job.status, j.status);
+            },
+            .rule => |r| {
+                try std.testing.expectEqualStrings(entries[i].rule.identifier, r.identifier);
+                try std.testing.expectEqualStrings(entries[i].rule.pattern, r.pattern);
+            },
+            .job_removal => |r| try std.testing.expectEqualStrings(entries[i].job_removal.identifier, r.identifier),
+            .rule_removal => |r| try std.testing.expectEqualStrings(entries[i].rule_removal.identifier, r.identifier),
+        }
+    }
+}
+
+test "migrated dump binary parses framed logfile and emits all entries" {
+    const allocator = std.testing.allocator;
+
+    const entries = [_]persistence_encoder.Entry{
+        .{ .job = .{ .identifier = "dump.job.one", .execution = 1700000000000000000, .status = .planned } },
+        .{ .job = .{ .identifier = "dump.job.two", .execution = 1700000000000001000, .status = .triggered } },
+    };
+
+    const framed = try build_logfile_bytes(allocator, &entries);
+    defer allocator.free(framed);
+
+    var result = try run_dump_command(allocator, framed, &.{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "dump.job.one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "dump.job.two") != null);
 }

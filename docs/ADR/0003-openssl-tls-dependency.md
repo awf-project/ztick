@@ -11,7 +11,7 @@ title: "0003: System OpenSSL for Server-Side TLS"
 
 F006 adds TLS support to ztick's TCP server (FR-001). This requires a server-side TLS implementation capable of accepting connections, performing handshakes, and wrapping streams.
 
-Zig's stdlib `std.crypto.tls` provides **client-side TLS only** — the `std/crypto/tls/` directory contains only `Client.zig` as of Zig 0.15.2. There is no server-side handshake capability in the stdlib.
+Zig's stdlib `std.crypto.tls` provides **client-side TLS only** — the `std/crypto/tls/` directory contains only `Client.zig` as of Zig 0.16.0. There is no server-side handshake capability in the stdlib.
 
 ADR 0002 chose Zig specifically for its zero-dependency philosophy, with `build.zig.zon dependencies = .{}`. Adding TLS support forces the first decision to reach outside the Zig stdlib, creating tension with this foundational constraint.
 
@@ -20,7 +20,7 @@ ADR 0002 chose Zig specifically for its zero-dependency philosophy, with `build.
 | Option | Pros | Cons |
 |--------|------|------|
 | **System OpenSSL via `@cImport`** | Zig's C interop is zero-overhead and first-class; OpenSSL is universally available and battle-tested; `build.zig.zon dependencies` stays `= .{}` | Adds platform dependency on `libssl-dev`; TLS behavior tied to system OpenSSL version |
-| **iguanaTLS (Zig package)** | Pure Zig; no system library dependency | Zig 0.15.2 compatibility unverified; appears unmaintained; adds entry to `build.zig.zon dependencies`, breaking zero-Zig-package invariant |
+| **iguanaTLS (Zig package)** | Pure Zig; no system library dependency | Zig 0.16.0 compatibility unverified; appears unmaintained; adds entry to `build.zig.zon dependencies`, breaking zero-Zig-package invariant |
 | **Defer TLS (abstraction only)** | No new dependencies; lowest risk | Does not deliver functional TLS (FR-001, US1); defers the core feature deliverable |
 
 ## Decision

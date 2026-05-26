@@ -123,9 +123,9 @@ fn read_frame(allocator: std.mem.Allocator, reader: anytype) !Frame {
 }
 
 fn encode_connection_start_ok(allocator: std.mem.Allocator, writer: anytype, user: []const u8, password: []const u8) !void {
-    var payload = std.ArrayListUnmanaged(u8){};
-    defer payload.deinit(allocator);
-    const w = payload.writer(allocator);
+    var aw_payload: std.Io.Writer.Allocating = .init(allocator);
+    defer aw_payload.deinit();
+    const w = &aw_payload.writer;
 
     // class-id Connection (10), method-id StartOk (11)
     try w.writeInt(u16, 0x000A, .big);
@@ -152,7 +152,7 @@ fn encode_connection_start_ok(allocator: std.mem.Allocator, writer: anytype, use
     try w.writeByte(@intCast(locale.len));
     try w.writeAll(locale);
 
-    try write_frame(writer, 0x01, 0, payload.items);
+    try write_frame(writer, 0x01, 0, w.buffered());
 }
 
 fn encode_connection_tune_ok(writer: anytype, channel_max: u16, frame_max: u32, heartbeat: u16) !void {
@@ -207,9 +207,9 @@ fn encode_basic_publish(allocator: std.mem.Allocator, writer: anytype, channel: 
     if (exchange.len > 255) return error.ExchangeNameTooLong;
     if (routing_key.len > 255) return error.RoutingKeyTooLong;
     // === Method frame: Basic.Publish ===
-    var method_payload = std.ArrayListUnmanaged(u8){};
-    defer method_payload.deinit(allocator);
-    const mw = method_payload.writer(allocator);
+    var aw_method: std.Io.Writer.Allocating = .init(allocator);
+    defer aw_method.deinit();
+    const mw = &aw_method.writer;
 
     // class-id Basic (60), method-id Publish (40)
     try mw.writeInt(u16, 0x003C, .big);
@@ -229,7 +229,7 @@ fn encode_basic_publish(allocator: std.mem.Allocator, writer: anytype, channel: 
     // bits: mandatory=0, immediate=0
     try mw.writeByte(0);
 
-    try write_frame(writer, 0x01, channel, method_payload.items);
+    try write_frame(writer, 0x01, channel, mw.buffered());
 
     // === Content header frame ===
     var header_payload: [14]u8 = undefined;
@@ -285,13 +285,33 @@ fn encode_connection_close(writer: anytype) !void {
 
 const protocol_header = [_]u8{ 'A', 'M', 'Q', 'P', 0, 0, 9, 1 };
 
+/// Raw posix write loop — used to avoid threading io through every inner helper.
+fn posix_write_all(fd: std.posix.fd_t, data: []const u8) !void {
+    var remaining = data;
+    while (remaining.len > 0) {
+        const rc = std.os.linux.write(fd, remaining.ptr, remaining.len);
+        const err = std.os.linux.errno(rc);
+        switch (err) {
+            .SUCCESS => remaining = remaining[@intCast(rc)..],
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .BADF => return error.Unexpected,
+            .FAULT => unreachable,
+            .INVAL => unreachable,
+            .NOSPC => return error.NoSpaceLeft,
+            .PIPE => return error.BrokenPipe,
+            else => return error.Unexpected,
+        }
+    }
+}
+
 const StreamReader = struct {
-    stream: std.net.Stream,
+    fd: std.posix.fd_t,
 
     fn readNoEof(self: StreamReader, buf: []u8) !void {
         var total: usize = 0;
         while (total < buf.len) {
-            const n = try self.stream.read(buf[total..]);
+            const n = try std.posix.read(self.fd, buf[total..]);
             if (n == 0) return error.EndOfStream;
             total += n;
         }
@@ -304,9 +324,9 @@ const StreamReader = struct {
     }
 };
 
-fn flush_buf(stream: std.net.Stream, buf: *std.ArrayListUnmanaged(u8)) !void {
-    try stream.writeAll(buf.items);
-    buf.clearRetainingCapacity();
+fn flush_buf(fd: std.posix.fd_t, aw: *std.Io.Writer.Allocating) !void {
+    try posix_write_all(fd, aw.writer.buffered());
+    aw.writer.end = 0;
 }
 
 // Reads the next method frame from the stream. If the server sent
@@ -338,63 +358,62 @@ fn expect_method(
 
 fn run_handshake(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    fd: std.posix.fd_t,
     dsn_info: AmqpDsn,
     exchange: []const u8,
     routing_key: []const u8,
     body: []const u8,
 ) !void {
-    const reader = StreamReader{ .stream = stream };
+    const reader = StreamReader{ .fd = fd };
 
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
     // 1. Send protocol header
-    try stream.writeAll(&protocol_header);
+    try posix_write_all(fd, &protocol_header);
 
     // 2. Receive Connection.Start (class=10, method=10)
     try expect_method(allocator, reader, 0x000A, 0x000A);
 
     // 3. Send Connection.StartOk (PLAIN auth)
-    try encode_connection_start_ok(allocator, writer, dsn_info.user, dsn_info.password);
-    try flush_buf(stream, &buf);
+    try encode_connection_start_ok(allocator, &aw.writer, dsn_info.user, dsn_info.password);
+    try flush_buf(fd, &aw);
 
     // 4. Receive Connection.Tune (class=10, method=30)
     try expect_method(allocator, reader, 0x000A, 0x001E);
 
     // 5. Send Connection.TuneOk with conservative client values
-    try encode_connection_tune_ok(writer, 2047, 131072, 0);
-    try flush_buf(stream, &buf);
+    try encode_connection_tune_ok(&aw.writer, 2047, 131072, 0);
+    try flush_buf(fd, &aw);
 
     // 6. Send Connection.Open with vhost
-    try encode_connection_open(writer, dsn_info.vhost);
-    try flush_buf(stream, &buf);
+    try encode_connection_open(&aw.writer, dsn_info.vhost);
+    try flush_buf(fd, &aw);
 
     // 7. Receive Connection.OpenOk (class=10, method=41)
     try expect_method(allocator, reader, 0x000A, 0x0029);
 
     // 8. Send Channel.Open on channel 1
-    try encode_channel_open(writer, 1);
-    try flush_buf(stream, &buf);
+    try encode_channel_open(&aw.writer, 1);
+    try flush_buf(fd, &aw);
 
     // 9. Receive Channel.OpenOk (class=20, method=11)
     try expect_method(allocator, reader, 0x0014, 0x000B);
 
     // 10. Send Basic.Publish
-    try encode_basic_publish(allocator, writer, 1, exchange, routing_key, body);
-    try flush_buf(stream, &buf);
+    try encode_basic_publish(allocator, &aw.writer, 1, exchange, routing_key, body);
+    try flush_buf(fd, &aw);
 
     // 11. Send Channel.Close on channel 1
-    try encode_channel_close(writer, 1);
-    try flush_buf(stream, &buf);
+    try encode_channel_close(&aw.writer, 1);
+    try flush_buf(fd, &aw);
 
     // 12. Receive Channel.CloseOk (class=20, method=41)
     try expect_method(allocator, reader, 0x0014, 0x0029);
 
     // 13. Send Connection.Close
-    try encode_connection_close(writer);
-    try flush_buf(stream, &buf);
+    try encode_connection_close(&aw.writer);
+    try flush_buf(fd, &aw);
 
     // 14. Receive Connection.CloseOk (class=10, method=51)
     try expect_method(allocator, reader, 0x000A, 0x0033);
@@ -412,19 +431,24 @@ pub fn execute(
         return failure;
     };
 
-    const stream = std.net.tcpConnectToHost(allocator, dsn_info.host, dsn_info.port) catch |err| {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const addr = std.Io.net.IpAddress.parseIp4(dsn_info.host, dsn_info.port) catch |err| {
+        std.log.warn("amqp runner: address parse failed: dsn={s} err={any}", .{ redact_dsn(payload.dsn), err });
+        return failure;
+    };
+    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch |err| {
         std.log.warn("amqp runner: tcp connect failed: dsn={s} err={any}", .{ redact_dsn(payload.dsn), err });
         return failure;
     };
-    defer stream.close();
+    defer stream.close(io);
 
     const timeout = std.posix.timeval{ .sec = 30, .usec = 0 };
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
-    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
 
     run_handshake(
         allocator,
-        stream,
+        stream.socket.handle,
         dsn_info,
         payload.exchange,
         payload.routing_key,
@@ -491,18 +515,18 @@ test "redact_dsn returns DSN unchanged when no userinfo is present" {
 }
 
 test "write_frame produces framed bytes with type channel payload and frame-end sentinel" {
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(std.testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
     const payload = [_]u8{ 0x01, 0x02 };
-    try write_frame(buf.writer(std.testing.allocator), 0x01, 0, &payload);
+    try write_frame(&aw.writer, 0x01, 0, &payload);
     const expected = [_]u8{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02, 0xCE };
-    try std.testing.expectEqualSlices(u8, &expected, buf.items);
+    try std.testing.expectEqualSlices(u8, &expected, aw.writer.buffered());
 }
 
 test "encode_connection_start_ok produces PLAIN auth frame for AMQP 0-9-1 handshake" {
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(std.testing.allocator);
-    try encode_connection_start_ok(std.testing.allocator, buf.writer(std.testing.allocator), "guest", "guest");
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try encode_connection_start_ok(std.testing.allocator, &aw.writer, "guest", "guest");
     const expected = [_]u8{
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24,
         0x00, 0x0A, 0x00, 0x0B, 0x00, 0x00, 0x00,
@@ -512,48 +536,48 @@ test "encode_connection_start_ok produces PLAIN auth frame for AMQP 0-9-1 handsh
         's',  't',  0x05, 'e',  'n',  '_',  'U',
         'S',  0xCE,
     };
-    try std.testing.expectEqualSlices(u8, &expected, buf.items);
+    try std.testing.expectEqualSlices(u8, &expected, aw.writer.buffered());
 }
 
 test "encode_connection_tune_ok echoes channel_max frame_max and heartbeat as TuneOk frame" {
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(std.testing.allocator);
-    try encode_connection_tune_ok(buf.writer(std.testing.allocator), 2047, 131072, 60);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try encode_connection_tune_ok(&aw.writer, 2047, 131072, 60);
     const expected = [_]u8{
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C,
         0x00, 0x0A, 0x00, 0x1F, 0x07, 0xFF, 0x00,
         0x02, 0x00, 0x00, 0x00, 0x3C, 0xCE,
     };
-    try std.testing.expectEqualSlices(u8, &expected, buf.items);
+    try std.testing.expectEqualSlices(u8, &expected, aw.writer.buffered());
 }
 
 test "encode_connection_open produces Connection.Open frame for vhost /" {
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(std.testing.allocator);
-    try encode_connection_open(buf.writer(std.testing.allocator), "/");
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try encode_connection_open(&aw.writer, "/");
     const expected = [_]u8{
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08,
         0x00, 0x0A, 0x00, 0x28, 0x01, '/',  0x00,
         0x00, 0xCE,
     };
-    try std.testing.expectEqualSlices(u8, &expected, buf.items);
+    try std.testing.expectEqualSlices(u8, &expected, aw.writer.buffered());
 }
 
 test "encode_channel_open on channel 1 produces Channel.Open frame" {
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(std.testing.allocator);
-    try encode_channel_open(buf.writer(std.testing.allocator), 1);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try encode_channel_open(&aw.writer, 1);
     const expected = [_]u8{
         0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05,
         0x00, 0x14, 0x00, 0x0A, 0x00, 0xCE,
     };
-    try std.testing.expectEqualSlices(u8, &expected, buf.items);
+    try std.testing.expectEqualSlices(u8, &expected, aw.writer.buffered());
 }
 
 test "encode_basic_publish produces method header and body frames with 0xCE sentinels" {
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(std.testing.allocator);
-    try encode_basic_publish(std.testing.allocator, buf.writer(std.testing.allocator), 1, "jobs", "notifications", "test");
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try encode_basic_publish(std.testing.allocator, &aw.writer, 1, "jobs", "notifications", "test");
     const expected = [_]u8{
         0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x1A,
         0x00, 0x3C, 0x00, 0x28, 0x00, 0x00, 0x04,
@@ -566,45 +590,45 @@ test "encode_basic_publish produces method header and body frames with 0xCE sent
         0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04,
         't',  'e',  's',  't',  0xCE,
     };
-    try std.testing.expectEqualSlices(u8, &expected, buf.items);
+    try std.testing.expectEqualSlices(u8, &expected, aw.writer.buffered());
 }
 
 test "encode_channel_close produces Channel.Close frame with normal closure" {
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(std.testing.allocator);
-    try encode_channel_close(buf.writer(std.testing.allocator), 1);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try encode_channel_close(&aw.writer, 1);
     const expected = [_]u8{
         0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0D,
         0x00, 0x14, 0x00, 0x28, 0x00, 0xC8, 0x02,
         'O',  'K',  0x00, 0x00, 0x00, 0x00, 0xCE,
     };
-    try std.testing.expectEqualSlices(u8, &expected, buf.items);
+    try std.testing.expectEqualSlices(u8, &expected, aw.writer.buffered());
 }
 
 test "encode_connection_close produces Connection.Close frame with normal closure" {
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(std.testing.allocator);
-    try encode_connection_close(buf.writer(std.testing.allocator));
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try encode_connection_close(&aw.writer);
     const expected = [_]u8{
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0D,
         0x00, 0x0A, 0x00, 0x32, 0x00, 0xC8, 0x02,
         'O',  'K',  0x00, 0x00, 0x00, 0x00, 0xCE,
     };
-    try std.testing.expectEqualSlices(u8, &expected, buf.items);
+    try std.testing.expectEqualSlices(u8, &expected, aw.writer.buffered());
 }
 
 test "encode_connection_open returns error.VhostTooLong for vhost > 255 bytes" {
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(std.testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
     const long_vhost = "a" ** 256;
-    try std.testing.expectError(error.VhostTooLong, encode_connection_open(buf.writer(std.testing.allocator), long_vhost));
+    try std.testing.expectError(error.VhostTooLong, encode_connection_open(&aw.writer, long_vhost));
 }
 
 test "encode_basic_publish returns error.ExchangeNameTooLong for exchange > 255 bytes" {
-    var buf = std.ArrayListUnmanaged(u8){};
-    defer buf.deinit(std.testing.allocator);
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
     const long_exchange = "x" ** 256;
-    try std.testing.expectError(error.ExchangeNameTooLong, encode_basic_publish(std.testing.allocator, buf.writer(std.testing.allocator), 1, long_exchange, "key", "body"));
+    try std.testing.expectError(error.ExchangeNameTooLong, encode_basic_publish(std.testing.allocator, &aw.writer, 1, long_exchange, "key", "body"));
 }
 
 test "execute returns success=false for malformed DSN without raising" {
@@ -619,11 +643,12 @@ test "execute returns success=false for malformed DSN without raising" {
 }
 
 test "execute returns success=false on connection refused without raising" {
+    const io = std.testing.io;
     const refused_port: u16 = blk: {
-        const a = try std.net.Address.parseIp4("127.0.0.1", 0);
-        var s = try a.listen(.{ .reuse_address = true });
-        const p = s.listen_address.in.getPort();
-        s.deinit();
+        var a = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var s = try std.Io.net.IpAddress.listen(&a, io, .{ .reuse_address = true });
+        const p = s.socket.address.getPort();
+        s.deinit(io);
         break :blk p;
     };
     const dsn = try std.fmt.allocPrint(std.testing.allocator, "amqp://guest:guest@127.0.0.1:{d}/", .{refused_port});
@@ -649,15 +674,15 @@ test "execute preserves request identifier in response on every error path" {
 }
 
 const PeerCloseStub = struct {
-    fn run(server: *std.net.Server) void {
-        var conn = server.accept() catch return;
-        defer conn.stream.close();
+    fn run(io: std.Io, server: *std.Io.net.Server) void {
+        const stream = server.accept(io) catch return;
+        defer stream.close(io);
 
         // Read the 8-byte AMQP protocol header
         var header: [8]u8 = undefined;
         var total: usize = 0;
         while (total < header.len) {
-            const n = conn.stream.read(header[total..]) catch return;
+            const n = std.posix.read(stream.socket.handle, header[total..]) catch return;
             if (n == 0) return;
             total += n;
         }
@@ -681,18 +706,19 @@ const PeerCloseStub = struct {
         std.mem.writeInt(u16, frame[30..32], 0, .big); // method-id 0
         frame[32] = 0xCE; // frame-end sentinel
 
-        _ = conn.stream.writeAll(&frame) catch {};
+        posix_write_all(stream.socket.handle, &frame) catch {};
     }
 };
 
 test "execute returns success=false when peer closes connection mid-handshake" {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const listen_addr = server.listen_address;
-    defer server.deinit();
-    const port = listen_addr.in.getPort();
+    const io = std.testing.io;
+    var a = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try std.Io.net.IpAddress.listen(&a, io, .{ .reuse_address = true });
+    const listen_addr = server.socket.address;
+    defer server.deinit(io);
+    const port = listen_addr.getPort();
 
-    const t = try std.Thread.spawn(.{}, PeerCloseStub.run, .{&server});
+    const t = try std.Thread.spawn(.{}, PeerCloseStub.run, .{ io, &server });
 
     const dsn = try std.fmt.allocPrint(std.testing.allocator, "amqp://baduser:badpass@127.0.0.1:{d}/", .{port});
     defer std.testing.allocator.free(dsn);
@@ -705,7 +731,7 @@ test "execute returns success=false when peer closes connection mid-handshake" {
     const response = execute(std.testing.allocator, request.runner.amqp, request);
 
     // If the listener thread is still waiting for some reason, unblock it
-    if (std.net.tcpConnectToAddress(listen_addr)) |c| c.close() else |_| {}
+    if (std.Io.net.IpAddress.connect(&listen_addr, io, .{ .mode = .stream })) |c| c.close(io) else |_| {}
     t.join();
 
     try std.testing.expectEqual(@as(u128, 0xCAFE_F00D_BABE_BEEF), response.identifier);
@@ -716,9 +742,10 @@ test "amqp runner publishes to broker and reports success" {
     const build_options = @import("build_options");
     if (!build_options.amqp_integration) return error.SkipZigTest;
 
-    const address = try std.net.Address.parseIp4("127.0.0.1", 5672);
-    const probe = std.net.tcpConnectToAddress(address) catch return error.SkipZigTest;
-    probe.close();
+    const io = std.testing.io;
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 5672);
+    const probe = std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    probe.close(io);
 
     const request = execution.Request{
         .identifier = 0xA1B2C3D4E5F60718,
@@ -738,9 +765,10 @@ test "amqp runner reports failure for bad credentials and never logs raw secrets
     const build_options = @import("build_options");
     if (!build_options.amqp_integration) return error.SkipZigTest;
 
-    const address = try std.net.Address.parseIp4("127.0.0.1", 5672);
-    const probe = std.net.tcpConnectToAddress(address) catch return error.SkipZigTest;
-    probe.close();
+    const io = std.testing.io;
+    var address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 5672);
+    const probe = std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    probe.close(io);
 
     const dsn = "amqp://baduser:badpass@127.0.0.1:5672/";
     const request = execution.Request{

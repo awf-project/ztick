@@ -5,7 +5,7 @@ const subprocess = @import("subprocess.zig");
 const execution = domain.execution;
 const ShellConfig = domain.shell_config.ShellConfig;
 
-pub fn execute(allocator: std.mem.Allocator, shell_config: ShellConfig, payload: anytype, request: execution.Request) execution.Response {
+pub fn execute(io: std.Io, allocator: std.mem.Allocator, shell_config: ShellConfig, payload: anytype, request: execution.Request) execution.Response {
     const args = allocator.alloc([]const u8, shell_config.args.len + 2) catch {
         return .{ .identifier = request.identifier, .success = false };
     };
@@ -13,7 +13,7 @@ pub fn execute(allocator: std.mem.Allocator, shell_config: ShellConfig, payload:
     args[0] = shell_config.path;
     @memcpy(args[1 .. shell_config.args.len + 1], shell_config.args);
     args[shell_config.args.len + 1] = payload.command;
-    return subprocess.run(allocator, args, request.identifier);
+    return subprocess.run(io, allocator, args, request.identifier);
 }
 
 const default_shell_config = ShellConfig{ .path = "/bin/sh", .args = &.{"-c"} };
@@ -24,7 +24,7 @@ test "shell runner executes command and reports success on exit code 0" {
         .job_identifier = "test.job",
         .runner = .{ .shell = .{ .command = "/bin/true" } },
     };
-    const response = execute(std.testing.allocator, default_shell_config, request.runner.shell, request);
+    const response = execute(std.testing.io, std.testing.allocator, default_shell_config, request.runner.shell, request);
     try std.testing.expectEqual(@as(u128, 1), response.identifier);
     try std.testing.expect(response.success);
 }
@@ -35,7 +35,7 @@ test "shell runner reports failure for non-zero exit code" {
         .job_identifier = "test.job",
         .runner = .{ .shell = .{ .command = "/bin/false" } },
     };
-    const response = execute(std.testing.allocator, default_shell_config, request.runner.shell, request);
+    const response = execute(std.testing.io, std.testing.allocator, default_shell_config, request.runner.shell, request);
     try std.testing.expectEqual(@as(u128, 2), response.identifier);
     try std.testing.expect(!response.success);
 }
@@ -46,7 +46,7 @@ test "shell runner preserves identifier in response" {
         .job_identifier = "scheduled.job",
         .runner = .{ .shell = .{ .command = "/bin/echo" } },
     };
-    const response = execute(std.testing.allocator, default_shell_config, request.runner.shell, request);
+    const response = execute(std.testing.io, std.testing.allocator, default_shell_config, request.runner.shell, request);
     try std.testing.expectEqual(@as(u128, 0xdeadbeef_cafebabe), response.identifier);
 }
 
@@ -59,6 +59,6 @@ test "shell runner uses configured shell path instead of hardcoded /bin/sh" {
         .job_identifier = "test.job",
         .runner = .{ .shell = .{ .command = "/bin/true" } },
     };
-    const response = execute(std.testing.allocator, config, request.runner.shell, request);
+    const response = execute(std.testing.io, std.testing.allocator, config, request.runner.shell, request);
     try std.testing.expect(!response.success);
 }

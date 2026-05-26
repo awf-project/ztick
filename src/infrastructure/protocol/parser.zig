@@ -31,7 +31,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) (ParseError || std
     if (input[pos] == '\n') {
         // Command with no arguments (e.g. "QUERY\n") is valid; return empty args.
         pos += 1; // skip '\n'
-        var empty = std.ArrayListUnmanaged([]u8){};
+        var empty: std.ArrayListUnmanaged([]u8) = .empty;
         const args = try empty.toOwnedSlice(allocator);
         return ParseResult{
             .command = command,
@@ -40,7 +40,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) (ParseError || std
         };
     }
 
-    var args_list = std.ArrayListUnmanaged([]u8){};
+    var args_list: std.ArrayListUnmanaged([]u8) = .empty;
     errdefer {
         for (args_list.items) |a| allocator.free(a);
         args_list.deinit(allocator);
@@ -83,7 +83,7 @@ fn parse_simple_string(allocator: std.mem.Allocator, input: []const u8, pos: *us
 
 fn parse_quoted_string(allocator: std.mem.Allocator, input: []const u8, pos: *usize) (ParseError || std.mem.Allocator.Error)![]u8 {
     pos.* += 1; // skip opening '"'
-    var result = std.ArrayListUnmanaged(u8){};
+    var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
 
     while (pos.* < input.len) {

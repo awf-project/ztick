@@ -12,13 +12,13 @@ const subprocess = @import("runner/subprocess.zig");
 const execution = domain.execution;
 const ShellConfig = domain.shell_config.ShellConfig;
 
-pub fn execute(allocator: std.mem.Allocator, shell_config: ShellConfig, request: execution.Request) execution.Response {
+pub fn execute(io: std.Io, allocator: std.mem.Allocator, shell_config: ShellConfig, request: execution.Request) execution.Response {
     return switch (request.runner) {
-        .shell => |s| shell.execute(allocator, shell_config, s, request),
-        .direct => |d| direct.execute(allocator, d, request),
+        .shell => |s| shell.execute(io, allocator, shell_config, s, request),
+        .direct => |d| direct.execute(io, allocator, d, request),
         .amqp => |a| amqp.execute(allocator, a, request),
-        .http => |h| http.execute(allocator, h, request),
-        .awf => |a| awf.execute(allocator, a, request),
+        .http => |h| http.execute(io, allocator, h, request),
+        .awf => |a| awf.execute(io, allocator, a, request),
         .redis => |r| redis.execute(allocator, r, request),
     };
 }

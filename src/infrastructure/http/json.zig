@@ -47,7 +47,7 @@ pub fn parse_rule_body(allocator: std.mem.Allocator, body: []const u8) (std.mem.
     errdefer allocator.free(pattern);
     const runner = try allocator.dupe(u8, parsed.value.runner);
     errdefer allocator.free(runner);
-    var args = std.ArrayListUnmanaged([]const u8){};
+    var args: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (args.items) |a| allocator.free(a);
         args.deinit(allocator);

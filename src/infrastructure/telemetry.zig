@@ -56,14 +56,15 @@ const Pb = struct {
 /// Workaround for SDK v0.1.1 where the trace OTLPExporter sends empty resource attributes.
 const ResourceAwareOTLPExporter = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     otlp_config: *sdk.otlp.ConfigOptions,
     resource_attrs: ?[]const sdk.Attribute,
 
     const Self = @This();
 
-    fn init(allocator: std.mem.Allocator, otlp_config: *sdk.otlp.ConfigOptions, resource_attrs: ?[]const sdk.Attribute) !*Self {
+    fn init(allocator: std.mem.Allocator, io: std.Io, otlp_config: *sdk.otlp.ConfigOptions, resource_attrs: ?[]const sdk.Attribute) !*Self {
         const self = try allocator.create(Self);
-        self.* = .{ .allocator = allocator, .otlp_config = otlp_config, .resource_attrs = resource_attrs };
+        self.* = .{ .allocator = allocator, .io = io, .otlp_config = otlp_config, .resource_attrs = resource_attrs };
         return self;
     }
 
@@ -95,20 +96,20 @@ const ResourceAwareOTLPExporter = struct {
         ).init(a);
         for (spans) |span| {
             const result = try scope_groups.getOrPut(span.scope);
-            if (!result.found_existing) result.value_ptr.* = std.ArrayList(sdk.api.trace.Span){};
+            if (!result.found_existing) result.value_ptr.* = .empty;
             try result.value_ptr.append(a, span);
         }
 
         // Build ScopeSpans
-        var scope_spans_list = std.ArrayList(Pb.ScopeSpans){};
+        var scope_spans_list: std.ArrayList(Pb.ScopeSpans) = .empty;
         var scope_iter = scope_groups.iterator();
         while (scope_iter.next()) |entry| {
-            var otlp_spans = std.ArrayList(Pb.PbSpan){};
+            var otlp_spans: std.ArrayList(Pb.PbSpan) = .empty;
             for (entry.value_ptr.items) |span| {
                 try otlp_spans.append(a, try spanToProto(a, span));
             }
             const scope_info = if (entry.value_ptr.items.len > 0) entry.value_ptr.items[0].scope else sdk.InstrumentationScope{ .name = "unknown" };
-            var scope_attrs = std.ArrayList(Pb.KeyValue){};
+            var scope_attrs: std.ArrayList(Pb.KeyValue) = .empty;
             if (scope_info.attributes) |attrs| {
                 for (attrs) |attr| try scope_attrs.append(a, attrToKeyValue(attr.key, attr.value));
             }
@@ -120,20 +121,20 @@ const ResourceAwareOTLPExporter = struct {
         }
 
         // Build resource attributes
-        var resource_kv = std.ArrayList(Pb.KeyValue){};
+        var resource_kv: std.ArrayList(Pb.KeyValue) = .empty;
         if (self.resource_attrs) |attrs| {
             for (attrs) |attr| try resource_kv.append(a, attrToKeyValue(attr.key, attr.value));
         }
 
-        var resource_spans = std.ArrayList(Pb.ResourceSpans){};
+        var resource_spans: std.ArrayList(Pb.ResourceSpans) = .empty;
         try resource_spans.append(a, .{
-            .resource = .{ .attributes = resource_kv, .dropped_attributes_count = 0, .entity_refs = std.ArrayList(Pb.EntityRef){} },
+            .resource = .{ .attributes = resource_kv, .dropped_attributes_count = 0, .entity_refs = .empty },
             .scope_spans = scope_spans_list,
             .schema_url = "",
         });
 
         const data = sdk.otlp.Signal.Data{ .traces = .{ .resource_spans = resource_spans } };
-        return sdk.otlp.Export(a, self.otlp_config, data);
+        return sdk.otlp.Export(a, self.io, self.otlp_config, data);
     }
 
     fn spanToProto(a: std.mem.Allocator, span: sdk.api.trace.Span) !Pb.PbSpan {
@@ -141,23 +142,23 @@ const ResourceAwareOTLPExporter = struct {
         const trace_id = try a.dupe(u8, &sc.trace_id.toBinary());
         const span_id = try a.dupe(u8, &sc.span_id.toBinary());
 
-        var attrs = std.ArrayList(Pb.KeyValue){};
+        var attrs: std.ArrayList(Pb.KeyValue) = .empty;
         for (span.attributes.keys(), span.attributes.values()) |key, value| {
             try attrs.append(a, attrToKeyValue(key, value));
         }
 
-        var events = std.ArrayList(Pb.SpanEvent){};
+        var events: std.ArrayList(Pb.SpanEvent) = .empty;
         for (span.events.items) |event| {
-            var ev_attrs = std.ArrayList(Pb.KeyValue){};
+            var ev_attrs: std.ArrayList(Pb.KeyValue) = .empty;
             for (event.attributes.keys(), event.attributes.values()) |key, value| {
                 try ev_attrs.append(a, attrToKeyValue(key, value));
             }
             try events.append(a, .{ .time_unix_nano = event.timestamp, .name = event.name, .attributes = ev_attrs, .dropped_attributes_count = 0 });
         }
 
-        var links = std.ArrayList(Pb.SpanLink){};
+        var links: std.ArrayList(Pb.SpanLink) = .empty;
         for (span.links.items) |link| {
-            var lk_attrs = std.ArrayList(Pb.KeyValue){};
+            var lk_attrs: std.ArrayList(Pb.KeyValue) = .empty;
             for (link.attributes.keys(), link.attributes.values()) |key, value| {
                 try lk_attrs.append(a, attrToKeyValue(key, value));
             }
@@ -235,6 +236,7 @@ pub const Providers = struct {
     log_processor: sdk.logs.SimpleLogRecordProcessor,
     log_otlp: *sdk.logs.OTLPExporter,
     otlp_config: *sdk.otlp.ConfigOptions,
+    io_rng: std.Random.IoSource,
 
     pub fn shutdown(self: *Providers) void {
         sdk.logs.std_log_bridge.shutdown();
@@ -250,12 +252,12 @@ pub const Providers = struct {
     }
 };
 
-pub fn setup(allocator: std.mem.Allocator, cfg: domain.telemetry_config.TelemetryConfig) !?*Providers {
+pub fn setup(allocator: std.mem.Allocator, cfg: domain.telemetry_config.TelemetryConfig, env_map: *const std.process.Environ.Map, io: std.Io) !?*Providers {
     if (!cfg.enabled) return null;
 
     const endpoint_url = cfg.endpoint orelse return error.SetupFailed;
 
-    const otlp_config = try sdk.otlp.ConfigOptions.init(allocator);
+    const otlp_config = try sdk.otlp.ConfigOptions.init(allocator, env_map);
     errdefer otlp_config.deinit();
     otlp_config.protocol = .http_protobuf;
     otlp_config.timeout_sec = 2;
@@ -270,15 +272,15 @@ pub fn setup(allocator: std.mem.Allocator, cfg: domain.telemetry_config.Telemetr
         otlp_config.endpoint = endpoint_url;
     }
 
-    const metric_otlp = try sdk.metrics.OTLPExporter.init(allocator, otlp_config, sdk.metrics.View.DefaultTemporality);
+    const metric_otlp = try sdk.metrics.OTLPExporter.init(allocator, io, sdk.metrics.View.DefaultTemporality, otlp_config);
     errdefer metric_otlp.deinit();
 
-    const metric_exporter = try sdk.metrics.MetricExporter.new(allocator, &metric_otlp.exporter);
+    const metric_exporter = try sdk.metrics.MetricExporter.new(allocator, io, &metric_otlp.exporter);
 
-    const meter_provider = try sdk.metrics.MeterProvider.init(allocator);
+    const meter_provider = try sdk.metrics.MeterProvider.init(allocator, io);
     errdefer meter_provider.shutdown();
 
-    const metric_reader = try sdk.metrics.MetricReader.init(allocator, metric_exporter);
+    const metric_reader = try sdk.metrics.MetricReader.init(allocator, io, metric_exporter);
     errdefer metric_reader.shutdown();
 
     try meter_provider.addReader(metric_reader);
@@ -289,37 +291,37 @@ pub fn setup(allocator: std.mem.Allocator, cfg: domain.telemetry_config.Telemetr
         "service.version", @as([]const u8, version_info.version),
     });
 
-    const trace_otlp = try ResourceAwareOTLPExporter.init(allocator, otlp_config, resource_attrs);
+    const trace_otlp = try ResourceAwareOTLPExporter.init(allocator, io, otlp_config, resource_attrs);
     errdefer trace_otlp.deinit();
-
-    const tracer_provider = try sdk.trace.TracerProvider.init(
-        allocator,
-        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(std.crypto.random) },
-    );
-    errdefer tracer_provider.shutdown();
-
-    const log_otlp = try sdk.logs.OTLPExporter.init(allocator, otlp_config);
-    errdefer log_otlp.deinit();
-
-    const logger_provider = try sdk.logs.LoggerProvider.init(allocator, null);
-    errdefer logger_provider.deinit();
 
     const providers = try allocator.create(Providers);
     errdefer allocator.destroy(providers);
+    providers.io_rng = std.Random.IoSource{ .io = io };
 
-    providers.* = Providers{
-        .allocator = allocator,
-        .meter_provider = meter_provider,
-        .metric_reader = metric_reader,
-        .metric_otlp = metric_otlp,
-        .tracer_provider = tracer_provider,
-        .trace_processor = sdk.trace.SimpleProcessor.init(allocator, trace_otlp.asSpanExporter()),
-        .trace_otlp = trace_otlp,
-        .logger_provider = logger_provider,
-        .log_processor = sdk.logs.SimpleLogRecordProcessor.init(allocator, log_otlp.asLogRecordExporter()),
-        .log_otlp = log_otlp,
-        .otlp_config = otlp_config,
-    };
+    const tracer_provider = try sdk.trace.TracerProvider.init(
+        allocator,
+        io,
+        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(providers.io_rng.interface()) },
+    );
+    errdefer tracer_provider.shutdown();
+
+    const log_otlp = try sdk.logs.OTLPExporter.init(allocator, io, otlp_config);
+    errdefer log_otlp.deinit();
+
+    const logger_provider = try sdk.logs.LoggerProvider.init(allocator, io, null);
+    errdefer logger_provider.deinit();
+
+    providers.allocator = allocator;
+    providers.meter_provider = meter_provider;
+    providers.metric_reader = metric_reader;
+    providers.metric_otlp = metric_otlp;
+    providers.tracer_provider = tracer_provider;
+    providers.trace_processor = sdk.trace.SimpleProcessor.init(allocator, io, trace_otlp.asSpanExporter());
+    providers.trace_otlp = trace_otlp;
+    providers.logger_provider = logger_provider;
+    providers.log_processor = sdk.logs.SimpleLogRecordProcessor.init(io, log_otlp.asLogRecordExporter());
+    providers.log_otlp = log_otlp;
+    providers.otlp_config = otlp_config;
 
     // Trace and log processors are NOT registered here — they export synchronously
     // via OTLP HTTP which blocks on network I/O. Callers (main.zig) register them
@@ -346,11 +348,13 @@ pub fn createInstruments(meter_provider: *sdk.metrics.MeterProvider, tracer_prov
 }
 
 test "createInstruments succeeds with valid meter and tracer providers" {
-    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator);
+    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator, std.testing.io);
     defer meter_provider.shutdown();
+    const io_rng = std.Random.IoSource{ .io = std.testing.io };
     const tracer_provider = try sdk.trace.TracerProvider.init(
         std.testing.allocator,
-        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(std.crypto.random) },
+        std.testing.io,
+        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(io_rng.interface()) },
     );
     defer tracer_provider.shutdown();
     const instruments = try createInstruments(meter_provider, tracer_provider);
@@ -358,11 +362,13 @@ test "createInstruments succeeds with valid meter and tracer providers" {
 }
 
 test "createInstruments returns callable counter and histogram instruments" {
-    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator);
+    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator, std.testing.io);
     defer meter_provider.shutdown();
+    const io_rng = std.Random.IoSource{ .io = std.testing.io };
     const tracer_provider = try sdk.trace.TracerProvider.init(
         std.testing.allocator,
-        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(std.crypto.random) },
+        std.testing.io,
+        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(io_rng.interface()) },
     );
     defer tracer_provider.shutdown();
     const instruments = try createInstruments(meter_provider, tracer_provider);
@@ -374,11 +380,13 @@ test "createInstruments returns callable counter and histogram instruments" {
 }
 
 test "createInstruments returns callable up-down counter instruments" {
-    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator);
+    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator, std.testing.io);
     defer meter_provider.shutdown();
+    const io_rng = std.Random.IoSource{ .io = std.testing.io };
     const tracer_provider = try sdk.trace.TracerProvider.init(
         std.testing.allocator,
-        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(std.crypto.random) },
+        std.testing.io,
+        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(io_rng.interface()) },
     );
     defer tracer_provider.shutdown();
     const instruments = try createInstruments(meter_provider, tracer_provider);
@@ -395,7 +403,9 @@ test "setup returns null when telemetry is disabled" {
         .service_name = "ztick",
         .flush_interval_ms = 5000,
     };
-    const result = try setup(std.testing.allocator, cfg);
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const result = try setup(std.testing.allocator, cfg, &env_map, std.testing.io);
     try std.testing.expectEqual(@as(?*Providers, null), result);
 }
 
@@ -407,7 +417,9 @@ test "setup returns initialized providers when telemetry is enabled" {
         .service_name = "ztick",
         .flush_interval_ms = 5000,
     };
-    const providers = try setup(std.testing.allocator, cfg);
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const providers = try setup(std.testing.allocator, cfg, &env_map, std.testing.io);
     try std.testing.expect(providers != null);
     providers.?.shutdown();
 }
@@ -420,7 +432,9 @@ test "setup with custom flush interval initializes without error" {
         .service_name = "my-service",
         .flush_interval_ms = 10000,
     };
-    const providers = try setup(std.testing.allocator, cfg);
+    var env_map = std.process.Environ.Map.init(std.testing.allocator);
+    defer env_map.deinit();
+    const providers = try setup(std.testing.allocator, cfg, &env_map, std.testing.io);
     try std.testing.expect(providers != null);
     providers.?.shutdown();
 }

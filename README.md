@@ -19,7 +19,7 @@ Periodic schedulers (cron, systemd timers) trigger work at fixed intervals regar
 
 ### Prerequisites
 
-- [Zig](https://ziglang.org/download/) >= 0.15.2
+- [Zig](https://ziglang.org/download/) >= 0.16.0
 - `libssl-dev` (Debian/Ubuntu) or `openssl-devel` (Fedora/RHEL) for TLS support
 
 ### Install

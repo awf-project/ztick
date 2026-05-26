@@ -1,7 +1,6 @@
 const std = @import("std");
 const domain = @import("../domain.zig");
 
-/// Re-exported from domain layer; defined in domain/shell_config.zig.
 pub const ShellConfig = domain.shell_config.ShellConfig;
 
 pub const LogLevel = enum {
@@ -29,8 +28,8 @@ pub const ConfigError = error{
     InvalidShellPath,
 };
 
-pub fn validate_shell_config(config: ShellConfig) ConfigError!void {
-    std.posix.access(config.path, std.posix.X_OK) catch return ConfigError.InvalidShellPath;
+pub fn validate_shell_config(config: ShellConfig, io: std.Io) ConfigError!void {
+    std.Io.Dir.access(.cwd(), io, config.path, .{ .execute = true }) catch return ConfigError.InvalidShellPath;
 }
 
 pub const Config = struct {
@@ -41,7 +40,6 @@ pub const Config = struct {
     controller_auth_file: ?[]const u8,
     database_fsync_on_persist: bool,
     database_framerate: u16,
-    /// Zig extension: configurable logfile path (Rust reference used hardcoded "logfile").
     database_logfile_path: []const u8,
     database_persistence: PersistenceMode,
     database_compression_interval: u32,
@@ -316,7 +314,7 @@ fn parse_toml_string_array(allocator: std.mem.Allocator, raw: []const u8) (Confi
     }
     const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t");
 
-    var list = std.ArrayListUnmanaged([]const u8){};
+    var list: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (list.items) |item| allocator.free(item);
         list.deinit(allocator);
@@ -372,15 +370,19 @@ fn unquote_and_unescape(allocator: std.mem.Allocator, s: []const u8) (ConfigErro
     return unescape_toml_string(allocator, inner);
 }
 
-pub fn load(allocator: std.mem.Allocator, path: ?[]const u8) !Config {
+pub fn load(allocator: std.mem.Allocator, path: ?[]const u8, io: std.Io) !Config {
     const actual_path = path orelse return parse(allocator, "");
-    const file = std.fs.cwd().openFile(actual_path, .{}) catch |err| return err;
-    defer file.close();
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
-    defer allocator.free(content);
+    const file = std.Io.Dir.cwd().openFile(io, actual_path, .{}) catch |err| return err;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var reader = file.reader(io, &rbuf);
+    var content_list: std.ArrayList(u8) = .empty;
+    defer content_list.deinit(allocator);
+    try reader.interface.appendRemaining(allocator, &content_list, @enumFromInt(1024 * 1024));
+    const content = content_list.items;
     const cfg = try parse(allocator, content);
     errdefer cfg.deinit(allocator);
-    try validate_shell_config(cfg.shell);
+    try validate_shell_config(cfg.shell, io);
     return cfg;
 }
 
@@ -709,12 +711,12 @@ test "parse rejects unknown key in shell section" {
 
 test "shell validate succeeds for existing executable path" {
     const cfg = ShellConfig{ .path = "/bin/sh", .args = &.{} };
-    try validate_shell_config(cfg);
+    try validate_shell_config(cfg, std.testing.io);
 }
 
 test "shell validate returns error for nonexistent path" {
     const cfg = ShellConfig{ .path = "/nonexistent/shell/binary", .args = &.{} };
-    try std.testing.expectError(ConfigError.InvalidShellPath, validate_shell_config(cfg));
+    try std.testing.expectError(ConfigError.InvalidShellPath, validate_shell_config(cfg, std.testing.io));
 }
 
 test "http listen defaults to null when section absent" {

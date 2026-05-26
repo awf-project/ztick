@@ -1,0 +1,14 @@
+{"ts":1779723716,"op":"retract","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_a08c4d5a, 'T001', pending)"}
+{"ts":1779723716,"op":"assert","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_a08c4d5a, 'T001', done)"}
+{"ts":1779723717,"op":"retract","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_40f9993d, 'T002', pending)"}
+{"ts":1779723717,"op":"assert","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_40f9993d, 'T002', done)"}
+{"ts":1779723718,"op":"retract","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_5e15d25c, 'T003', pending)"}
+{"ts":1779723718,"op":"assert","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_5e15d25c, 'T003', done)"}
+{"ts":1779723719,"op":"retract","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_26d31b7a, 'T004', pending)"}
+{"ts":1779723719,"op":"assert","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_26d31b7a, 'T004', done)"}
+{"ts":1779723721,"op":"retract","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_bd72b582, 'T005', pending)"}
+{"ts":1779723721,"op":"assert","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_bd72b582, 'T005', done)"}
+{"ts":1779723722,"op":"retract","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_01dfd53b, 'T006', pending)"}
+{"ts":1779723722,"op":"assert","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_01dfd53b, 'T006', done)"}
+{"ts":1779723722,"op":"retract","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_dbbe1a9b, 'T007', pending)"}
+{"ts":1779723722,"op":"assert","clause":"pr_feature_f024_zig_0152_0160_migration:task(t_dbbe1a9b, 'T007', in_progress)"}

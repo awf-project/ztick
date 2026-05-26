@@ -3,14 +3,14 @@ const domain = @import("../../domain.zig");
 
 const execution = domain.execution;
 
-pub fn execute(allocator: std.mem.Allocator, payload: anytype, request: execution.Request) execution.Response {
-    return execute_inner(allocator, payload.method, payload.url, request) catch {
+pub fn execute(io: std.Io, allocator: std.mem.Allocator, payload: anytype, request: execution.Request) execution.Response {
+    return execute_inner(io, allocator, payload.method, payload.url, request) catch {
         std.log.debug("http runner: {s} {s} connection failed", .{ payload.method, payload.url });
         return .{ .identifier = request.identifier, .success = false };
     };
 }
 
-fn execute_inner(allocator: std.mem.Allocator, method_str: []const u8, url: []const u8, req: execution.Request) !execution.Response {
+fn execute_inner(io: std.Io, allocator: std.mem.Allocator, method_str: []const u8, url: []const u8, req: execution.Request) !execution.Response {
     const method: std.http.Method = if (std.mem.eql(u8, method_str, "GET"))
         .GET
     else if (std.mem.eql(u8, method_str, "POST"))
@@ -41,7 +41,7 @@ fn execute_inner(allocator: std.mem.Allocator, method_str: []const u8, url: []co
     else
         &.{};
 
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     const uri = try std.Uri.parse(url);
@@ -52,16 +52,11 @@ fn execute_inner(allocator: std.mem.Allocator, method_str: []const u8, url: []co
     });
     defer http_req.deinit();
 
-    if (http_req.connection) |conn| {
-        const timeout = std.posix.timeval{ .sec = 30, .usec = 0 };
-        const handle = conn.stream_reader.getStream().handle;
-        std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
-        std.posix.setsockopt(handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
-    }
-
+    var redirect_buf: [4096]u8 = undefined;
     if (payload_buf) |body| {
+        var body_buf: [65536]u8 = undefined;
         http_req.transfer_encoding = .{ .content_length = body.len };
-        var body_writer = try http_req.sendBodyUnflushed(&.{});
+        var body_writer = try http_req.sendBodyUnflushed(&body_buf);
         try body_writer.writer.writeAll(body);
         try body_writer.end();
         try http_req.connection.?.flush();
@@ -69,8 +64,9 @@ fn execute_inner(allocator: std.mem.Allocator, method_str: []const u8, url: []co
         try http_req.sendBodiless();
     }
 
-    var response = try http_req.receiveHead(&.{});
-    const reader = response.reader(&.{});
+    var response = try http_req.receiveHead(&redirect_buf);
+    var transfer_buf: [4096]u8 = undefined;
+    const reader = response.reader(&transfer_buf);
     _ = reader.discardRemaining() catch {};
 
     const status = response.head.status;
@@ -84,12 +80,17 @@ fn execute_inner(allocator: std.mem.Allocator, method_str: []const u8, url: []co
 const SimpleServer = struct {
     response: []const u8,
 
-    fn run(self: @This(), s: *std.net.Server) void {
-        var conn = s.accept() catch return;
-        defer conn.stream.close();
+    fn run(self: @This(), s: *std.Io.net.Server) void {
+        const io = std.testing.io;
+        const conn = s.accept(io) catch return;
+        defer _ = std.os.linux.close(conn.socket.handle);
         var buf: [4096]u8 = undefined;
-        _ = conn.stream.read(&buf) catch {};
-        _ = conn.stream.writeAll(self.response) catch {};
+        const n = blk: {
+            const rc = std.os.linux.read(conn.socket.handle, &buf, buf.len);
+            break :blk if (@as(isize, @bitCast(rc)) < 0) 0 else rc;
+        };
+        _ = n;
+        _ = std.os.linux.write(conn.socket.handle, self.response.ptr, self.response.len);
     }
 };
 
@@ -97,13 +98,15 @@ const CapturePost = struct {
     body: [1024]u8 = undefined,
     body_len: usize = 0,
 
-    fn run(self: *@This(), s: *std.net.Server) void {
-        var conn = s.accept() catch return;
-        defer conn.stream.close();
+    fn run(self: *@This(), s: *std.Io.net.Server) void {
+        const io = std.testing.io;
+        const conn = s.accept(io) catch return;
+        defer _ = std.os.linux.close(conn.socket.handle);
         var buf: [4096]u8 = undefined;
         var total: usize = 0;
         while (total < buf.len) {
-            const n = conn.stream.read(buf[total..]) catch break;
+            const rc = std.os.linux.read(conn.socket.handle, buf[total..].ptr, buf.len - total);
+            const n = if (@as(isize, @bitCast(rc)) < 0) break else rc;
             if (n == 0) break;
             total += n;
             if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |he| {
@@ -114,16 +117,18 @@ const CapturePost = struct {
                 break;
             }
         }
-        _ = conn.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch {};
+        const ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        _ = std.os.linux.write(conn.socket.handle, ok.ptr, ok.len);
     }
 };
 
 test "http runner reports success for GET request with 2xx response" {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const listen_addr = server.listen_address;
-    defer server.deinit();
-    const port = listen_addr.in.getPort();
+    const io = std.testing.io;
+    var addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true });
+    const listen_addr = server.socket.address;
+    defer server.deinit(io);
+    const port = listen_addr.getPort();
 
     const srv = SimpleServer{ .response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" };
     const t = try std.Thread.spawn(.{}, SimpleServer.run, .{ srv, &server });
@@ -136,8 +141,8 @@ test "http runner reports success for GET request with 2xx response" {
         .job_identifier = "health.check",
         .runner = .{ .http = .{ .method = "GET", .url = url } },
     };
-    const response = execute(std.testing.allocator, request.runner.http, request);
-    if (std.net.tcpConnectToAddress(listen_addr)) |c| c.close() else |_| {}
+    const response = execute(io, std.testing.allocator, request.runner.http, request);
+    if (std.Io.net.IpAddress.connect(&listen_addr, io, .{ .mode = .stream })) |c| _ = std.os.linux.close(c.socket.handle) else |_| {}
     t.join();
 
     try std.testing.expectEqual(@as(u128, 0x3000), response.identifier);
@@ -145,11 +150,12 @@ test "http runner reports success for GET request with 2xx response" {
 }
 
 test "http runner sends json body for POST request and reports success on 2xx response" {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const listen_addr = server.listen_address;
-    defer server.deinit();
-    const port = listen_addr.in.getPort();
+    const io = std.testing.io;
+    var addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true });
+    const listen_addr = server.socket.address;
+    defer server.deinit(io);
+    const port = listen_addr.getPort();
 
     var capture = CapturePost{};
     const t = try std.Thread.spawn(.{}, CapturePost.run, .{ &capture, &server });
@@ -162,8 +168,8 @@ test "http runner sends json body for POST request and reports success on 2xx re
         .job_identifier = "deploy.release.1",
         .runner = .{ .http = .{ .method = "POST", .url = url } },
     };
-    const response = execute(std.testing.allocator, request.runner.http, request);
-    if (std.net.tcpConnectToAddress(listen_addr)) |c| c.close() else |_| {}
+    const response = execute(io, std.testing.allocator, request.runner.http, request);
+    if (std.Io.net.IpAddress.connect(&listen_addr, io, .{ .mode = .stream })) |c| _ = std.os.linux.close(c.socket.handle) else |_| {}
     t.join();
 
     try std.testing.expect(response.success);
@@ -174,11 +180,12 @@ test "http runner sends json body for POST request and reports success on 2xx re
 }
 
 test "http runner reports failure for non-2xx response" {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
-    var server = try addr.listen(.{ .reuse_address = true });
-    const listen_addr = server.listen_address;
-    defer server.deinit();
-    const port = listen_addr.in.getPort();
+    const io = std.testing.io;
+    var addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try std.Io.net.IpAddress.listen(&addr, io, .{ .reuse_address = true });
+    const listen_addr = server.socket.address;
+    defer server.deinit(io);
+    const port = listen_addr.getPort();
 
     const srv = SimpleServer{ .response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" };
     const t = try std.Thread.spawn(.{}, SimpleServer.run, .{ srv, &server });
@@ -191,8 +198,8 @@ test "http runner reports failure for non-2xx response" {
         .job_identifier = "test.job",
         .runner = .{ .http = .{ .method = "GET", .url = url } },
     };
-    const response = execute(std.testing.allocator, request.runner.http, request);
-    if (std.net.tcpConnectToAddress(listen_addr)) |c| c.close() else |_| {}
+    const response = execute(io, std.testing.allocator, request.runner.http, request);
+    if (std.Io.net.IpAddress.connect(&listen_addr, io, .{ .mode = .stream })) |c| _ = std.os.linux.close(c.socket.handle) else |_| {}
     t.join();
 
     try std.testing.expectEqual(@as(u128, 0x3002), response.identifier);
@@ -200,11 +207,12 @@ test "http runner reports failure for non-2xx response" {
 }
 
 test "http runner reports failure when connection refused" {
+    const io = std.testing.io;
     const refused_port: u16 = blk: {
-        const a = try std.net.Address.parseIp4("127.0.0.1", 0);
-        var s = try a.listen(.{ .reuse_address = true });
-        const p = s.listen_address.in.getPort();
-        s.deinit();
+        var a = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        var s = try std.Io.net.IpAddress.listen(&a, io, .{ .reuse_address = true });
+        const p = s.socket.address.getPort();
+        s.deinit(io);
         break :blk p;
     };
     const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/webhook", .{refused_port});
@@ -215,7 +223,7 @@ test "http runner reports failure when connection refused" {
         .job_identifier = "test.job",
         .runner = .{ .http = .{ .method = "GET", .url = url } },
     };
-    const response = execute(std.testing.allocator, request.runner.http, request);
+    const response = execute(io, std.testing.allocator, request.runner.http, request);
 
     try std.testing.expectEqual(@as(u128, 0x3003), response.identifier);
     try std.testing.expect(!response.success);

@@ -64,14 +64,14 @@ pub const QueryHandler = struct {
                     return Response{ .request = request, .success = true };
                 }
 
-                var body_buf = std.ArrayListUnmanaged(u8){};
-                errdefer body_buf.deinit(self.allocator);
+                var aw: std.Io.Writer.Allocating = .init(self.allocator);
+                errdefer aw.deinit();
 
                 for (jobs) |job| {
-                    try body_buf.writer(self.allocator).print("{s} {s} {d}\n", .{ job.identifier, @tagName(job.status), job.execution });
+                    try aw.writer.print("{s} {s} {d}\n", .{ job.identifier, @tagName(job.status), job.execution });
                 }
 
-                const body = try body_buf.toOwnedSlice(self.allocator);
+                const body = try aw.toOwnedSlice();
                 return Response{ .request = request, .success = true, .body = body };
             },
             .remove => |args| blk: {
@@ -93,30 +93,31 @@ pub const QueryHandler = struct {
                     return Response{ .request = request, .success = true };
                 }
 
-                var body_buf = std.ArrayListUnmanaged(u8){};
-                errdefer body_buf.deinit(self.allocator);
+                var aw_rules: std.Io.Writer.Allocating = .init(self.allocator);
+                errdefer aw_rules.deinit();
+                const bw = &aw_rules.writer;
 
                 var it = self.rule_storage.valueIterator();
                 while (it.next()) |rule| {
                     switch (rule.runner) {
-                        .shell => |sh| try body_buf.writer(self.allocator).print("{s} {s} shell {s}\n", .{ rule.identifier, rule.pattern, sh.command }),
-                        .amqp => |mq| try body_buf.writer(self.allocator).print("{s} {s} amqp {s} {s} {s}\n", .{ rule.identifier, rule.pattern, mq.dsn, mq.exchange, mq.routing_key }),
+                        .shell => |sh| try bw.print("{s} {s} shell {s}\n", .{ rule.identifier, rule.pattern, sh.command }),
+                        .amqp => |mq| try bw.print("{s} {s} amqp {s} {s} {s}\n", .{ rule.identifier, rule.pattern, mq.dsn, mq.exchange, mq.routing_key }),
                         .direct => |d| {
-                            try body_buf.writer(self.allocator).print("{s} {s} direct {s}", .{ rule.identifier, rule.pattern, d.executable });
-                            for (d.args) |arg| try body_buf.writer(self.allocator).print(" {s}", .{arg});
-                            try body_buf.writer(self.allocator).writeByte('\n');
+                            try bw.print("{s} {s} direct {s}", .{ rule.identifier, rule.pattern, d.executable });
+                            for (d.args) |arg| try bw.print(" {s}", .{arg});
+                            try bw.writeByte('\n');
                         },
                         .awf => |awf| {
-                            try body_buf.writer(self.allocator).print("{s} {s} awf {s}", .{ rule.identifier, rule.pattern, awf.workflow });
-                            for (awf.inputs) |input| try body_buf.writer(self.allocator).print(" --input {s}", .{input});
-                            try body_buf.writer(self.allocator).writeByte('\n');
+                            try bw.print("{s} {s} awf {s}", .{ rule.identifier, rule.pattern, awf.workflow });
+                            for (awf.inputs) |input| try bw.print(" --input {s}", .{input});
+                            try bw.writeByte('\n');
                         },
-                        .http => |h| try body_buf.writer(self.allocator).print("{s} {s} http {s} {s}\n", .{ rule.identifier, rule.pattern, h.method, h.url }),
-                        .redis => |r| try body_buf.writer(self.allocator).print("{s} {s} redis {s} {s} {s}\n", .{ rule.identifier, rule.pattern, r.url, r.command, r.key }),
+                        .http => |h| try bw.print("{s} {s} http {s} {s}\n", .{ rule.identifier, rule.pattern, h.method, h.url }),
+                        .redis => |r| try bw.print("{s} {s} redis {s} {s} {s}\n", .{ rule.identifier, rule.pattern, r.url, r.command, r.key }),
                     }
                 }
 
-                const body = try body_buf.toOwnedSlice(self.allocator);
+                const body = try aw_rules.toOwnedSlice();
                 return Response{ .request = request, .success = true, .body = body };
             },
             .stat => return Response{ .request = request, .success = false, .error_code = .internal },

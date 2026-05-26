@@ -2,15 +2,15 @@
     .name = .ztick,
     .fingerprint = 0x42ab48a3aed72398,
     .version = "0.3.0",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .opentelemetry = .{
-            .url = "git+https://github.com/zig-o11y/opentelemetry-sdk?ref=v0.1.1#60d797fc6420e3875e61cbb63b6008fcd6e3102a",
-            .hash = "opentelemetry-0.0.1-U_uKJyFJDwDLwd8vv1ulDIoJKWYsLX_hEvebqryQzYdy",
+            .url = "git+https://github.com/zig-o11y/opentelemetry-sdk?ref=v0.2.0#7387349254e4ebe2907bb3446f24a879e92b730a",
+            .hash = "opentelemetry-0.0.1-U_uKJ-oFEAAMJbeKlPjhM9xrYYJq762dezumOev3DlFo",
         },
         .cli = .{
-            .url = "git+https://github.com/sam701/zig-cli?ref=zig-0.15#cb44aade25a3c1eddd8b6f990b50c2189442c1e2",
-            .hash = "cli-0.10.0-2eKe_5kEAQBeHqKxUHNTGnETzu81rqKWwT1WPt1jXBt0",
+            .url = "git+https://github.com/sam701/zig-cli?ref=main#036341c48b32ef355274d66461551772fc1f202d",
+            .hash = "cli-0.11.0-2eKe_6sIAQB1njsE9sfrNvd2HxmQej13ebo-D3kBuFX3",
         },
     },
     .paths = .{

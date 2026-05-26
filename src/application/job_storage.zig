@@ -16,14 +16,14 @@ pub const JobStorage = struct {
     pub fn init(allocator: std.mem.Allocator) JobStorage {
         return .{
             .allocator = allocator,
-            .jobs = .{},
-            .to_execute = std.PriorityQueue(Job, void, job_compare).init(allocator, {}),
+            .jobs = .empty,
+            .to_execute = std.PriorityQueue(Job, void, job_compare).initContext({}),
         };
     }
 
     pub fn deinit(self: *JobStorage) void {
         self.jobs.deinit(self.allocator);
-        self.to_execute.deinit();
+        self.to_execute.deinit(self.allocator);
     }
 
     pub fn get(self: *const JobStorage, identifier: []const u8) ?Job {
@@ -34,7 +34,7 @@ pub const JobStorage = struct {
         var i: usize = 0;
         while (i < self.to_execute.items.len) {
             if (std.mem.eql(u8, self.to_execute.items[i].identifier, identifier)) {
-                _ = self.to_execute.removeIndex(i);
+                _ = self.to_execute.popIndex(i);
                 break;
             }
             i += 1;
@@ -46,25 +46,25 @@ pub const JobStorage = struct {
         self.remove_from_queue(job.identifier);
 
         if (job.status == .planned) {
-            try self.to_execute.add(job);
+            try self.to_execute.push(self.allocator, job);
         }
     }
 
     pub fn get_to_execute(self: *JobStorage, current_time: i64, allocator: std.mem.Allocator) ![]Job {
-        var result = std.ArrayListUnmanaged(Job){};
+        var result: std.ArrayListUnmanaged(Job) = .empty;
         errdefer result.deinit(allocator);
 
         while (self.to_execute.count() > 0) {
             const top = self.to_execute.peek().?;
             if (top.execution > current_time) break;
-            try result.append(allocator, self.to_execute.remove());
+            try result.append(allocator, self.to_execute.pop().?);
         }
 
         return result.toOwnedSlice(allocator);
     }
 
     pub fn get_by_prefix(self: *const JobStorage, prefix: []const u8, allocator: std.mem.Allocator) ![]Job {
-        var result = std.ArrayListUnmanaged(Job){};
+        var result: std.ArrayListUnmanaged(Job) = .empty;
         errdefer result.deinit(allocator);
 
         var it = self.jobs.valueIterator();
@@ -107,7 +107,7 @@ pub const JobStorage = struct {
     }
 
     pub fn get_by_status(self: *const JobStorage, status: JobStatus, allocator: std.mem.Allocator) ![]Job {
-        var result = std.ArrayListUnmanaged(Job){};
+        var result: std.ArrayListUnmanaged(Job) = .empty;
         errdefer result.deinit(allocator);
 
         var it = self.jobs.valueIterator();
