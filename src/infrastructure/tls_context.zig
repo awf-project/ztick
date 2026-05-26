@@ -35,7 +35,7 @@ pub const TlsStream = struct {
         // Single-call shutdown — sufficient for server-initiated close.
         _ = c.SSL_shutdown(self.ssl);
         c.SSL_free(self.ssl);
-        std.posix.close(self.fd);
+        _ = std.os.linux.close(self.fd);
     }
 };
 
@@ -101,24 +101,27 @@ test "create returns CertificateLoadFailed when cert path does not exist" {
 }
 
 test "create returns CertificateLoadFailed when PEM content is invalid" {
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const cert_file = try tmp.dir.createFile("invalid_cert.pem", .{});
-        try cert_file.writeAll("not a valid pem certificate");
-        cert_file.close();
+        const cert_file = try tmp.dir.createFile(io, "invalid_cert.pem", .{});
+        try cert_file.writeStreamingAll(io, "not a valid pem certificate");
+        cert_file.close(io);
     }
     {
-        const key_file = try tmp.dir.createFile("invalid_key.pem", .{});
-        try key_file.writeAll("not a valid pem key");
-        key_file.close();
+        const key_file = try tmp.dir.createFile(io, "invalid_key.pem", .{});
+        try key_file.writeStreamingAll(io, "not a valid pem key");
+        key_file.close(io);
     }
 
-    var cert_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cert_path = try tmp.dir.realpath("invalid_cert.pem", &cert_path_buf);
-    var key_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const key_path = try tmp.dir.realpath("invalid_key.pem", &key_path_buf);
+    var cert_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cert_len = try tmp.dir.realPathFile(io, "invalid_cert.pem", &cert_path_buf);
+    const cert_path = cert_path_buf[0..cert_len];
+    var key_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const key_len = try tmp.dir.realPathFile(io, "invalid_key.pem", &key_path_buf);
+    const key_path = key_path_buf[0..key_len];
 
     const result = TlsContext.create(cert_path, key_path);
     try std.testing.expectError(TlsError.CertificateLoadFailed, result);

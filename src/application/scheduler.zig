@@ -27,6 +27,7 @@ pub fn SchedulerWith(comptime Backend: type) type {
         last_compression_ns: u64,
         instruments: ?app_instruments.Instruments,
         startup_ns: i128,
+        io: std.Io,
         active_connections: ?*std.atomic.Value(usize),
         auth_enabled: bool,
         tls_enabled: bool,
@@ -43,6 +44,7 @@ pub fn SchedulerWith(comptime Backend: type) type {
                 .last_compression_ns = 0,
                 .instruments = null,
                 .startup_ns = 0,
+                .io = std.Io.Threaded.global_single_threaded.io(),
                 .active_connections = null,
                 .auth_enabled = false,
                 .tls_enabled = false,
@@ -54,7 +56,8 @@ pub fn SchedulerWith(comptime Backend: type) type {
             self.instruments = instr;
         }
 
-        pub fn set_stat_context(self: *Self, startup_ns: i128, active_connections: *std.atomic.Value(usize), auth_enabled: bool, tls_enabled: bool, framerate: u16) void {
+        pub fn set_stat_context(self: *Self, io: std.Io, startup_ns: i128, active_connections: *std.atomic.Value(usize), auth_enabled: bool, tls_enabled: bool, framerate: u16) void {
+            self.io = io;
             self.startup_ns = startup_ns;
             self.active_connections = active_connections;
             self.auth_enabled = auth_enabled;
@@ -79,7 +82,7 @@ pub fn SchedulerWith(comptime Backend: type) type {
             }
 
             self.job_storage.jobs.clearRetainingCapacity();
-            while (self.job_storage.to_execute.removeOrNull()) |_| {}
+            while (self.job_storage.to_execute.pop()) |_| {}
             self.rule_storage.rules.clearRetainingCapacity();
 
             const decode_alloc = self.persistence.?.reset_decode_arena(allocator);
@@ -103,7 +106,7 @@ pub fn SchedulerWith(comptime Backend: type) type {
         }
 
         fn handle_stat_request(self: *Self, request: Request) !Response {
-            const uptime_ns = std.time.nanoTimestamp() - self.startup_ns;
+            const uptime_ns = std.Io.Timestamp.now(self.io, .real).nanoseconds - self.startup_ns;
             const connections: usize = if (self.active_connections) |ac| ac.load(.acquire) else 0;
 
             const jobs_total = self.job_storage.count();
@@ -165,7 +168,7 @@ pub fn SchedulerWith(comptime Backend: type) type {
             defer if (span) |*s| {
                 // Set end_time_unix_nano before endSpan because the SDK exports the span
                 // in onSpanEnd (via SimpleProcessor) before its defer calls span.end().
-                s.end_time_unix_nano = @intCast(std.time.nanoTimestamp());
+                s.end_time_unix_nano = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
                 if (self.instruments) |instr| instr.tracer.endSpan(s);
                 s.deinit();
             };
@@ -275,9 +278,9 @@ pub fn SchedulerWith(comptime Backend: type) type {
 }
 
 pub fn format_server_stats(allocator: std.mem.Allocator, stats: ServerStats) ![]const u8 {
-    var buf = std.ArrayListUnmanaged(u8){};
-    errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
     try w.print("uptime_ns {}\n", .{stats.uptime_ns});
     try w.print("connections {}\n", .{stats.connections});
     try w.print("jobs_total {}\n", .{stats.jobs_total});
@@ -293,7 +296,7 @@ pub fn format_server_stats(allocator: std.mem.Allocator, stats: ServerStats) ![]
     try w.print("auth_enabled {}\n", .{@intFromBool(stats.auth_enabled)});
     try w.print("tls_enabled {}\n", .{@intFromBool(stats.tls_enabled)});
     try w.print("framerate {}\n", .{stats.framerate});
-    return buf.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 // ─── Test helpers ──────────────────────────────────────────────────────────────
@@ -413,9 +416,7 @@ test "format_server_stats produces metrics in consistent order" {
 }
 
 test "tick transitions planned job to triggered when rule matches" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -431,9 +432,7 @@ test "tick transitions planned job to triggered when rule matches" {
 }
 
 test "tick transitions planned job to failed when no rule matches" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -448,9 +447,7 @@ test "tick transitions planned job to failed when no rule matches" {
 }
 
 test "tick marks job as executed after successful execution result" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -473,9 +470,7 @@ test "tick marks job as executed after successful execution result" {
 }
 
 test "handle_query with set instruction stores job" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -495,16 +490,14 @@ test "handle_query with set instruction stores job" {
 }
 
 test "load and handle_query round-trip through logfile" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     {
@@ -513,6 +506,7 @@ test "load and handle_query round-trip through logfile" {
             .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
+            .io = std.testing.io,
         } });
         var scheduler = Scheduler.init(allocator);
         scheduler.persistence = backend_state;
@@ -542,6 +536,7 @@ test "load and handle_query round-trip through logfile" {
             .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
+            .io = std.testing.io,
         } });
         var scheduler = Scheduler.init(allocator);
         scheduler.persistence = backend_state;
@@ -561,9 +556,7 @@ test "load and handle_query round-trip through logfile" {
 }
 
 test "handle_query with get instruction returns success with body for existing job" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -585,9 +578,7 @@ test "handle_query with get instruction returns success with body for existing j
 }
 
 test "handle_query with get instruction returns failure for missing job" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -605,9 +596,7 @@ test "handle_query with get instruction returns failure for missing job" {
 }
 
 test "handle_query with query instruction returns success with matching jobs in body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -631,9 +620,7 @@ test "handle_query with query instruction returns success with matching jobs in 
 }
 
 test "handle_query with query instruction returns success with null body when no jobs match" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -651,16 +638,14 @@ test "handle_query with query instruction returns success with null body when no
 }
 
 test "handle_query with query instruction does not persist to logfile" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     const backend_state = BackendState.init(PersistenceBackend{ .logfile = .{
@@ -668,6 +653,7 @@ test "handle_query with query instruction does not persist to logfile" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -694,16 +680,14 @@ test "handle_query with query instruction does not persist to logfile" {
 }
 
 test "handle_query with get instruction does not persist to logfile" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     const backend_state = BackendState.init(PersistenceBackend{ .logfile = .{
@@ -711,6 +695,7 @@ test "handle_query with get instruction does not persist to logfile" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -737,16 +722,14 @@ test "handle_query with get instruction does not persist to logfile" {
 }
 
 test "double load deinits previous arena without leak" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     {
@@ -755,6 +738,7 @@ test "double load deinits previous arena without leak" {
             .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
+            .io = std.testing.io,
         } });
         var writer = Scheduler.init(allocator);
         defer writer.deinit();
@@ -774,6 +758,7 @@ test "double load deinits previous arena without leak" {
             .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
+            .io = std.testing.io,
         } });
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
@@ -789,16 +774,14 @@ test "double load deinits previous arena without leak" {
 }
 
 test "handle_query with remove instruction persists to logfile" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     const backend_state = BackendState.init(PersistenceBackend{ .logfile = .{
@@ -806,6 +789,7 @@ test "handle_query with remove instruction persists to logfile" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -829,16 +813,14 @@ test "handle_query with remove instruction persists to logfile" {
 }
 
 test "remove job round-trip through logfile" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     {
@@ -847,6 +829,7 @@ test "remove job round-trip through logfile" {
             .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
+            .io = std.testing.io,
         } });
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
@@ -871,6 +854,7 @@ test "remove job round-trip through logfile" {
             .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
+            .io = std.testing.io,
         } });
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
@@ -882,16 +866,14 @@ test "remove job round-trip through logfile" {
 }
 
 test "remove_rule round-trip through logfile" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     {
@@ -900,6 +882,7 @@ test "remove_rule round-trip through logfile" {
             .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
+            .io = std.testing.io,
         } });
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
@@ -928,6 +911,7 @@ test "remove_rule round-trip through logfile" {
             .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
+            .io = std.testing.io,
         } });
         var scheduler = Scheduler.init(allocator);
         defer scheduler.deinit();
@@ -939,16 +923,14 @@ test "remove_rule round-trip through logfile" {
 }
 
 test "handle_query with list_rules instruction does not persist to logfile" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     const backend_state = BackendState.init(PersistenceBackend{ .logfile = .{
@@ -956,6 +938,7 @@ test "handle_query with list_rules instruction does not persist to logfile" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -986,9 +969,7 @@ test "handle_query with list_rules instruction does not persist to logfile" {
 }
 
 test "tick marks job as failed after failed execution result" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1011,9 +992,7 @@ test "tick marks job as failed after failed execution result" {
 }
 
 test "tick processes execution result for unknown job without error" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1034,9 +1013,7 @@ test "tick processes execution result for unknown job without error" {
 }
 
 test "tick updates all job statuses when multiple execution results arrive in single tick" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1064,11 +1041,9 @@ test "tick updates all job statuses when multiple execution results arrive in si
 }
 
 test "load with memory backend on empty backend loads nothing" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
-    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = allocator } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = backend_state;
@@ -1078,11 +1053,9 @@ test "load with memory backend on empty backend loads nothing" {
 }
 
 test "handle_query with set instruction round-trips through memory backend" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
-    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = allocator } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = backend_state;
@@ -1103,11 +1076,9 @@ test "handle_query with set instruction round-trips through memory backend" {
 }
 
 test "load and handle_query round-trip through memory backend" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
-    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = allocator } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = backend_state;
@@ -1143,11 +1114,9 @@ test "load and handle_query round-trip through memory backend" {
 }
 
 test "double load with memory backend works without leak" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
-    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = allocator } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = backend_state;
@@ -1167,17 +1136,16 @@ test "double load with memory backend works without leak" {
     try std.testing.expectEqual(@as(i64, 1000), job.?.execution);
 }
 
-fn get_file_size_in(dir: std.fs.Dir, path: []const u8) !u64 {
-    const file = try dir.openFile(path, .{});
-    defer file.close();
-    const stat = try file.stat();
+fn get_file_size_in(dir: std.Io.Dir, path: []const u8) !u64 {
+    const io = std.testing.io;
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
     return stat.size;
 }
 
 test "fresh scheduler disables compression by default" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1186,9 +1154,7 @@ test "fresh scheduler disables compression by default" {
 }
 
 test "fresh scheduler has no prior compression timestamp" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1197,11 +1163,9 @@ test "fresh scheduler has no prior compression timestamp" {
 }
 
 test "fresh scheduler has no active compression process" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
-    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = allocator } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = backend_state;
@@ -1211,16 +1175,14 @@ test "fresh scheduler has no active compression process" {
 }
 
 test "tick triggers compression after interval elapses for logfile backend" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     const backend_state = BackendState.init(PersistenceBackend{ .logfile = .{
@@ -1228,6 +1190,7 @@ test "tick triggers compression after interval elapses for logfile backend" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1248,16 +1211,14 @@ test "tick triggers compression after interval elapses for logfile backend" {
 }
 
 test "tick renames logfile to .to_compress before spawning compression" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     const backend_state = BackendState.init(PersistenceBackend{ .logfile = .{
@@ -1265,6 +1226,7 @@ test "tick renames logfile to .to_compress before spawning compression" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1280,15 +1242,13 @@ test "tick renames logfile to .to_compress before spawning compression" {
         }
     }
 
-    _ = try tmp.dir.statFile("logfile.to_compress");
+    _ = try tmp.dir.statFile(std.testing.io, "logfile.to_compress", .{});
 }
 
 test "tick skips compression when backend is memory" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
-    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = allocator } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = backend_state;
@@ -1300,16 +1260,14 @@ test "tick skips compression when backend is memory" {
 }
 
 test "tick skips compression when interval is zero" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     const backend_state = BackendState.init(PersistenceBackend{ .logfile = .{
@@ -1317,6 +1275,7 @@ test "tick skips compression when interval is zero" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1329,11 +1288,9 @@ test "tick skips compression when interval is zero" {
 }
 
 test "tick cleans up completed compression process" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
-    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = allocator } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = backend_state;
@@ -1363,16 +1320,14 @@ test "tick cleans up completed compression process" {
 }
 
 test "tick skips compression when process is already running" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     const backend_state = BackendState.init(PersistenceBackend{ .logfile = .{
@@ -1380,6 +1335,7 @@ test "tick skips compression when process is already running" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1387,7 +1343,7 @@ test "tick skips compression when process is already running" {
     scheduler.compression_interval_ns = 1000;
 
     const running_proc = try allocator.create(Process);
-    running_proc.* = .{ .allocator = allocator, .thread = undefined, .result = null, .mutex = .{}, .joined = true };
+    running_proc.* = .{ .allocator = allocator, .thread = undefined, .state = .init(.running), .joined = true };
     scheduler.persistence.?.active_process = running_proc;
 
     try scheduler.tick(1000);
@@ -1404,16 +1360,14 @@ test "tick skips compression when process is already running" {
 }
 
 test "deinit frees active compression process allocation without joining thread" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
-    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = allocator } });
+    const backend_state = BackendState.init(PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = allocator } });
     var scheduler = Scheduler.init(allocator);
     scheduler.persistence = backend_state;
 
     const proc = try allocator.create(Process);
-    proc.* = .{ .allocator = allocator, .thread = undefined, .result = null, .mutex = .{}, .joined = true };
+    proc.* = .{ .allocator = allocator, .thread = undefined, .state = .init(.running), .joined = true };
     scheduler.persistence.?.active_process = proc;
 
     scheduler.deinit();
@@ -1422,16 +1376,14 @@ test "deinit frees active compression process allocation without joining thread"
 }
 
 test "tick logs warning and retains .to_compress when compression fails" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile.to_compress", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile.to_compress", .{});
+        f.close(std.testing.io);
     }
 
     const backend_state = BackendState.init(PersistenceBackend{ .logfile = .{
@@ -1439,21 +1391,21 @@ test "tick logs warning and retains .to_compress when compression fails" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
     scheduler.persistence = backend_state;
     scheduler.compression_interval_ns = 1_000_000_000;
 
-    const TaskResult = testing_background.TaskResult;
     const proc = try allocator.create(Process);
-    proc.* = .{ .allocator = allocator, .thread = undefined, .result = @as(TaskResult, error.Failure), .mutex = .{}, .joined = true };
+    proc.* = .{ .allocator = allocator, .thread = undefined, .state = .init(.failure), .joined = true };
     scheduler.persistence.?.active_process = proc;
 
     try scheduler.tick(500_000_000);
 
     try std.testing.expectEqual(@as(?*Process, null), scheduler.persistence.?.active_process);
-    _ = try tmp.dir.statFile("logfile.to_compress");
+    _ = try tmp.dir.statFile(std.testing.io, "logfile.to_compress", .{});
 }
 
 const TestOtelContext = struct {
@@ -1463,11 +1415,12 @@ const TestOtelContext = struct {
 
     fn init(allocator: std.mem.Allocator) !TestOtelContext {
         const otel = @import("opentelemetry");
-        const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+        const meter_provider = try otel.metrics.MeterProvider.init(allocator, std.testing.io);
         errdefer meter_provider.shutdown();
         const tracer_provider = try otel.trace.TracerProvider.init(
             allocator,
-            otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+            std.testing.io,
+            otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init((std.Random.IoSource{ .io = std.testing.io }).interface()) },
         );
         errdefer tracer_provider.shutdown();
 
@@ -1489,9 +1442,7 @@ const TestOtelContext = struct {
 };
 
 test "handle_query SET with instruments calls jobs_scheduled counter" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var ctx = try TestOtelContext.init(allocator);
     defer ctx.deinit();
@@ -1508,9 +1459,7 @@ test "handle_query SET with instruments calls jobs_scheduled counter" {
 }
 
 test "handle_query REMOVE with instruments calls jobs_removed counter" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var ctx = try TestOtelContext.init(allocator);
     defer ctx.deinit();
@@ -1527,9 +1476,7 @@ test "handle_query REMOVE with instruments calls jobs_removed counter" {
 }
 
 test "handle_query RULE_SET with instruments updates rules_active gauge" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var ctx = try TestOtelContext.init(allocator);
     defer ctx.deinit();
@@ -1550,9 +1497,7 @@ test "handle_query RULE_SET with instruments updates rules_active gauge" {
 }
 
 test "tick increments jobs_executed counter on successful execution result" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var ctx = try TestOtelContext.init(allocator);
     defer ctx.deinit();
@@ -1575,9 +1520,7 @@ test "tick increments jobs_executed counter on successful execution result" {
 }
 
 test "tick records execution duration in histogram for executed job" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var ctx = try TestOtelContext.init(allocator);
     defer ctx.deinit();
@@ -1600,9 +1543,7 @@ test "tick records execution duration in histogram for executed job" {
 }
 
 test "scheduler with null instruments completes operations without error" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1630,15 +1571,13 @@ test "scheduler with null instruments completes operations without error" {
 }
 
 test "handle_query with stat instruction returns success with all metric keys in body" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(1);
-    scheduler.set_stat_context(1_000_000_000, &connections, false, false, 100);
+    scheduler.set_stat_context(std.testing.io, 1_000_000_000, &connections, false, false, 100);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -1668,15 +1607,13 @@ test "handle_query with stat instruction returns success with all metric keys in
 }
 
 test "handle_query with stat instruction reflects pre-populated job counts" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.set_stat_context(0, &connections, false, false, 1);
+    scheduler.set_stat_context(std.testing.io, 0, &connections, false, false, 1);
 
     try scheduler.job_storage.set(Job{ .identifier = "job.1", .execution = 1000, .status = .planned });
     try scheduler.job_storage.set(Job{ .identifier = "job.2", .execution = 2000, .status = .planned });
@@ -1700,15 +1637,13 @@ test "handle_query with stat instruction reflects pre-populated job counts" {
 }
 
 test "handle_query with stat instruction with active instruments does not update any counter" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var ctx = try TestOtelContext.init(allocator);
     defer ctx.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    ctx.scheduler.set_stat_context(0, &connections, false, false, 1);
+    ctx.scheduler.set_stat_context(std.testing.io, 0, &connections, false, false, 1);
 
     const response = try ctx.scheduler.handle_query(Request{
         .client = 1,
@@ -1721,16 +1656,14 @@ test "handle_query with stat instruction with active instruments does not update
 }
 
 test "handle_query with stat instruction does not persist to logfile" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     const backend_state = BackendState.init(PersistenceBackend{ .logfile = .{
@@ -1738,6 +1671,7 @@ test "handle_query with stat instruction does not persist to logfile" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1754,7 +1688,7 @@ test "handle_query with stat instruction does not persist to logfile" {
     try std.testing.expect(size_after_set > 0);
 
     var connections = std.atomic.Value(usize).init(1);
-    scheduler.set_stat_context(0, &connections, false, false, 1);
+    scheduler.set_stat_context(std.testing.io, 0, &connections, false, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 2,
@@ -1767,15 +1701,13 @@ test "handle_query with stat instruction does not persist to logfile" {
 }
 
 test "handle_query with stat instruction reports active_connections value from atomic" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(7);
-    scheduler.set_stat_context(0, &connections, false, false, 1);
+    scheduler.set_stat_context(std.testing.io, 0, &connections, false, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -1789,15 +1721,13 @@ test "handle_query with stat instruction reports active_connections value from a
 }
 
 test "handle_query with stat instruction reports auth_enabled and tls_enabled as 1 when configured" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(1);
-    scheduler.set_stat_context(0, &connections, true, true, 1);
+    scheduler.set_stat_context(std.testing.io, 0, &connections, true, true, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,
@@ -1812,15 +1742,13 @@ test "handle_query with stat instruction reports auth_enabled and tls_enabled as
 }
 
 test "handle_query with stat instruction reports framerate and rules_total values" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.set_stat_context(0, &connections, false, false, 512);
+    scheduler.set_stat_context(std.testing.io, 0, &connections, false, false, 512);
 
     try scheduler.rule_storage.set(Rule{ .identifier = "rule.1", .pattern = "backup.", .runner = .{ .shell = .{ .command = "echo" } } });
     try scheduler.rule_storage.set(Rule{ .identifier = "rule.2", .pattern = "deploy.", .runner = .{ .shell = .{ .command = "echo" } } });
@@ -1838,16 +1766,14 @@ test "handle_query with stat instruction reports framerate and rules_total value
 }
 
 test "handle_query with stat instruction reports persistence backend type" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("logfile", .{});
-        f.close();
+        const f = try tmp.dir.createFile(std.testing.io, "logfile", .{});
+        f.close(std.testing.io);
     }
 
     const backend_state = BackendState.init(PersistenceBackend{ .logfile = .{
@@ -1855,6 +1781,7 @@ test "handle_query with stat instruction reports persistence backend type" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } });
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -1862,7 +1789,7 @@ test "handle_query with stat instruction reports persistence backend type" {
     try scheduler.load(allocator);
 
     var connections = std.atomic.Value(usize).init(0);
-    scheduler.set_stat_context(0, &connections, false, false, 1);
+    scheduler.set_stat_context(std.testing.io, 0, &connections, false, false, 1);
 
     const response = try scheduler.handle_query(Request{
         .client = 1,

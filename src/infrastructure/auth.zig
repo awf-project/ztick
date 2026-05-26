@@ -51,7 +51,7 @@ fn flush_token(
 }
 
 pub fn parse(allocator: std.mem.Allocator, content: []const u8) (AuthParseError || std.mem.Allocator.Error)![]Token {
-    var tokens = std.ArrayListUnmanaged(Token){};
+    var tokens: std.ArrayList(Token) = .empty;
     errdefer {
         for (tokens.items) |t| {
             allocator.free(t.name);
@@ -123,13 +123,11 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) (AuthParseError 
     return tokens.toOwnedSlice(allocator);
 }
 
-pub fn load(allocator: std.mem.Allocator, path: []const u8) ![]Token {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+pub fn load(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]Token {
+    const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         else => return err,
     };
-    defer file.close();
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
     defer allocator.free(content);
     return parse(allocator, content);
 }
@@ -230,5 +228,5 @@ test "parse valid auth file returns correct token fields" {
 }
 
 test "load returns error for nonexistent file path" {
-    try std.testing.expectError(error.FileNotFound, load(std.testing.allocator, "/nonexistent/auth.toml"));
+    try std.testing.expectError(error.FileNotFound, load(std.testing.io, std.testing.allocator, "/nonexistent/auth.toml"));
 }

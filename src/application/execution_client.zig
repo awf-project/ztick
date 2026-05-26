@@ -18,9 +18,9 @@ pub const ExecutionClient = struct {
     pub fn init(allocator: std.mem.Allocator) ExecutionClient {
         return .{
             .allocator = allocator,
-            .triggered = .{},
-            .pending = .{},
-            .resolved = .{},
+            .triggered = .empty,
+            .pending = .empty,
+            .resolved = .empty,
         };
     }
 
@@ -36,7 +36,7 @@ pub const ExecutionClient = struct {
 
     pub fn trigger(self: *ExecutionClient, job_identifier: []const u8, runner: Runner, job_execution: i64) !void {
         var bytes: [16]u8 = undefined;
-        std.crypto.random.bytes(&bytes);
+        _ = std.os.linux.getrandom(&bytes, bytes.len, 0);
         const identifier = std.mem.readInt(u128, &bytes, .big);
 
         const owned_id = try self.allocator.dupe(u8, job_identifier);
@@ -73,7 +73,7 @@ pub const ExecutionClient = struct {
     }
 
     pub fn pull_results(self: *ExecutionClient, allocator: std.mem.Allocator) ![]ExecutionResult {
-        var results = std.ArrayListUnmanaged(ExecutionResult){};
+        var results: std.ArrayListUnmanaged(ExecutionResult) = .empty;
         errdefer results.deinit(allocator);
 
         for (self.resolved.items) |resp| {
@@ -175,12 +175,10 @@ test "resolve stores result successfully" {
 }
 
 test "resolve returns error on allocation failure" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() == .ok);
 
     // fail_index = 3: allows 3 allocations (dupe + triggered.put + pending.append in trigger)
     // then fails on resolved.append inside resolve
-    var failing = std.testing.FailingAllocator.init(gpa.allocator(), .{ .fail_index = 3 });
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
     var client = ExecutionClient.init(failing.allocator());
     defer client.deinit();
 

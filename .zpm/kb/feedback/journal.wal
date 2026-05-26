@@ -1,0 +1,152 @@
+{"ts":1779657964,"op":"assert","clause":"feedback:rule(rule_hexagonal_layers, architecture, 'Use hexagonal layering: domain (pure data, zero deps), application (state machines, storage), infrastructure (IO adapters), interfaces (CLI, config)', high, claude_md)"}
+{"ts":1779657965,"op":"assert","clause":"feedback:trigger(rule_hexagonal_layers, 'src/', directory)"}
+{"ts":1779657967,"op":"assert","clause":"feedback:rule(rule_barrel_exports, architecture, 'Each layer has a barrel export file; import layers through barrels only — direct cross-layer imports break encapsulation', high, claude_md)"}
+{"ts":1779657968,"op":"assert","clause":"feedback:trigger(rule_barrel_exports, '.zig', file)"}
+{"ts":1779657969,"op":"assert","clause":"feedback:rule(rule_tagged_unions, architecture, 'Use tagged unions for protocol/runner/instruction types; error unions for fallible operations', medium, claude_md)"}
+{"ts":1779657970,"op":"assert","clause":"feedback:trigger(rule_tagged_unions, '.zig', file)"}
+{"ts":1779657974,"op":"assert","clause":"feedback:rule(rule_streaming_dump, architecture, 'Logfile dump must never load entire file into memory; use sequential frame reads for NFR-001', high, claude_md)"}
+{"ts":1779657975,"op":"assert","clause":"feedback:trigger(rule_streaming_dump, 'dump.zig', file)"}
+{"ts":1779657977,"op":"assert","clause":"feedback:rule(rule_process_execute, architecture, 'Use Process.execute() for all background operations; never manually construct Process structs in application layer', medium, claude_md)"}
+{"ts":1779657978,"op":"assert","clause":"feedback:trigger(rule_process_execute, 'application/', directory)"}
+{"ts":1779657980,"op":"assert","clause":"feedback:rule(rule_error_response_before_disconnect, architecture, 'Send ERROR response for all protocol validation failures before disconnecting; never silently close connections', high, claude_md)"}
+{"ts":1779657980,"op":"assert","clause":"feedback:trigger(rule_error_response_before_disconnect, 'tcp_server.zig', file)"}
+{"ts":1779657984,"op":"assert","clause":"feedback:rule(rule_openapi_401_schema, architecture, 'Authenticated HTTP endpoints must include 401 Unauthorized response schemas in OpenAPI specs', medium, claude_md)"}
+{"ts":1779657985,"op":"assert","clause":"feedback:trigger(rule_openapi_401_schema, 'openapi.json', file)"}
+{"ts":1779657986,"op":"assert","clause":"feedback:rule(rule_crud_endpoint_parity, architecture, 'Maintain CRUD endpoint parity in OpenAPI specs; document omissions explicitly in spec comments', medium, claude_md)"}
+{"ts":1779657987,"op":"assert","clause":"feedback:trigger(rule_crud_endpoint_parity, 'openapi.json', file)"}
+{"ts":1779657989,"op":"assert","clause":"feedback:rule(rule_config_before_wiring, architecture, 'Implement config parsing for new subsystems before wiring as threads; verify config sections exist first', medium, claude_md)"}
+{"ts":1779657989,"op":"assert","clause":"feedback:trigger(rule_config_before_wiring, 'config.zig', file)"}
+{"ts":1779657993,"op":"assert","clause":"feedback:rule(rule_tls_fd_accessor, architecture, 'Expose file descriptors from TLS stream wrappers via accessor methods for low-level socket ops', medium, claude_md)"}
+{"ts":1779657994,"op":"assert","clause":"feedback:trigger(rule_tls_fd_accessor, 'tls_context.zig', file)"}
+{"ts":1779657995,"op":"assert","clause":"feedback:rule(rule_auth_as_middleware, architecture, 'Implement connection-level auth as TCP middleware; never add AUTH as Instruction variant', high, claude_md)"}
+{"ts":1779657996,"op":"assert","clause":"feedback:trigger(rule_auth_as_middleware, 'tcp_server.zig', file)"}
+{"ts":1779657998,"op":"assert","clause":"feedback:rule(rule_layer_separation_merges, architecture, 'Maintain strict layer separation during feature merges; keep application-layer code isolated to originating branch', medium, claude_md)"}
+{"ts":1779657998,"op":"assert","clause":"feedback:trigger(rule_layer_separation_merges, '', project)"}
+{"ts":1779658002,"op":"assert","clause":"feedback:rule(rule_no_alloc_hot_path, architecture, 'Zero allocation in hot paths: tick loop, Channel ops, request routing must allocate nothing per-iteration', high, claude_md)"}
+{"ts":1779658003,"op":"assert","clause":"feedback:trigger(rule_no_alloc_hot_path, 'channel.zig', file)"}
+{"ts":1779658004,"op":"assert","clause":"feedback:trigger(rule_no_alloc_hot_path, 'scheduler.zig', file)"}
+{"ts":1779658005,"op":"assert","clause":"feedback:trigger(rule_no_alloc_hot_path, 'main.zig', file)"}
+{"ts":1779658007,"op":"assert","clause":"feedback:rule(rule_batch_over_iterate, architecture, 'Prefer Channel.drain(&buf) over repeated receive() to amortize lock acquisition', medium, claude_md)"}
+{"ts":1779658007,"op":"assert","clause":"feedback:trigger(rule_batch_over_iterate, 'channel.zig', file)"}
+{"ts":1779658011,"op":"assert","clause":"feedback:rule(rule_static_io_buffers, architecture, 'Static buffers for I/O: 64KB persistence read, 8KB HTTP read/write. Never malloc per syscall', high, claude_md)"}
+{"ts":1779658012,"op":"assert","clause":"feedback:trigger(rule_static_io_buffers, '.zig', file)"}
+{"ts":1779658014,"op":"assert","clause":"feedback:rule(rule_drain_nonblocking_first, architecture, 'Drain non-blocking before blocking: try_receive() first to drain stale work, then receive()/timedWait()', medium, claude_md)"}
+{"ts":1779658015,"op":"assert","clause":"feedback:trigger(rule_drain_nonblocking_first, 'channel.zig', file)"}
+{"ts":1779658016,"op":"assert","clause":"feedback:rule(rule_memcpy_over_loops, architecture, 'Use @memcpy over loops for slice copies; std.mem.copyForwards/copyBackwards only for overlapping ranges', medium, claude_md)"}
+{"ts":1779658017,"op":"assert","clause":"feedback:trigger(rule_memcpy_over_loops, '.zig', file)"}
+{"ts":1779658022,"op":"assert","clause":"feedback:rule(rule_big_endian_serialization, architecture, 'Big-endian binary serialization: use std.mem.writeInt/readInt with .big; never build byte sequences manually', medium, claude_md)"}
+{"ts":1779658022,"op":"assert","clause":"feedback:trigger(rule_big_endian_serialization, 'persistence_codec.zig', file)"}
+{"ts":1779658024,"op":"assert","clause":"feedback:rule(rule_release_safe_default, architecture, 'Production builds use ReleaseSafe; use ReleaseFast only when sanitizer + functional tests prove correctness, never for crypto', medium, claude_md)"}
+{"ts":1779658024,"op":"assert","clause":"feedback:trigger(rule_release_safe_default, 'build.zig', file)"}
+{"ts":1779658026,"op":"assert","clause":"feedback:rule(rule_branch_hint_cold, architecture, 'Annotate cold paths with @branchHint(.cold) on error returns and .unlikely on validation failures in hot loops', low, claude_md)"}
+{"ts":1779658027,"op":"assert","clause":"feedback:trigger(rule_branch_hint_cold, '.zig', file)"}
+{"ts":1779658030,"op":"assert","clause":"feedback:rule(rule_inline_only_profiled, architecture, 'Mark single-statement getters inline fn only when profiling shows call overhead; otherwise let compiler decide', low, claude_md)"}
+{"ts":1779658031,"op":"assert","clause":"feedback:trigger(rule_inline_only_profiled, '.zig', file)"}
+{"ts":1779658035,"op":"assert","clause":"feedback:rule(rule_gpa_single_root, architecture, 'GeneralPurposeAllocator for application root; single instance threaded down — never global allocators', high, claude_md)"}
+{"ts":1779658036,"op":"assert","clause":"feedback:trigger(rule_gpa_single_root, 'main.zig', file)"}
+{"ts":1779658039,"op":"assert","clause":"feedback:rule(rule_arena_for_bulk, architecture, 'ArenaAllocator for bulk-load/parse sessions; call reset(.retain_capacity) between batches to keep backing memory hot', medium, claude_md)"}
+{"ts":1779658039,"op":"assert","clause":"feedback:trigger(rule_arena_for_bulk, '.zig', file)"}
+{"ts":1779658041,"op":"assert","clause":"feedback:rule(rule_arraylist_unmanaged, architecture, 'ArrayListUnmanaged(T) is the default; never use ArrayList(T) — it stores an allocator pointer and breaks value-copy semantics', high, claude_md)"}
+{"ts":1779658042,"op":"assert","clause":"feedback:trigger(rule_arraylist_unmanaged, '.zig', file)"}
+{"ts":1779658045,"op":"assert","clause":"feedback:rule(rule_ownership_single_writer, architecture, 'Each allocation has exactly one deinit() call site; document ownership when non-obvious', high, claude_md)"}
+{"ts":1779658046,"op":"assert","clause":"feedback:trigger(rule_ownership_single_writer, '.zig', file)"}
+{"ts":1779658048,"op":"assert","clause":"feedback:rule(rule_errdefer_partial_init, architecture, 'Every multi-step allocation in a constructor uses errdefer to roll back; never leak on partial-init error paths', high, claude_md)"}
+{"ts":1779658049,"op":"assert","clause":"feedback:trigger(rule_errdefer_partial_init, '.zig', file)"}
+{"ts":1779658051,"op":"assert","clause":"feedback:rule(rule_dupe_at_boundaries, architecture, 'TCP/HTTP controllers must allocator.dupe(u8, ...) before sending to request channel; scheduler stores pointers without copying', high, claude_md)"}
+{"ts":1779658052,"op":"assert","clause":"feedback:trigger(rule_dupe_at_boundaries, 'tcp_server.zig', file)"}
+{"ts":1779658054,"op":"assert","clause":"feedback:trigger(rule_dupe_at_boundaries, 'http.zig', file)"}
+{"ts":1779658056,"op":"assert","clause":"feedback:rule(rule_to_owned_slice_transfer, architecture, 'Use toOwnedSlice() to transfer ownership instead of copying; consumer must free with same allocator', medium, claude_md)"}
+{"ts":1779658057,"op":"assert","clause":"feedback:trigger(rule_to_owned_slice_transfer, '.zig', file)"}
+{"ts":1779658059,"op":"assert","clause":"feedback:rule(rule_testing_allocator, architecture, 'Use std.testing.allocator in unit tests — leaks fail the test. Functional tests use fresh GPA with defer deinit', high, claude_md)"}
+{"ts":1779658059,"op":"assert","clause":"feedback:trigger(rule_testing_allocator, '.zig', file)"}
+{"ts":1779658063,"op":"assert","clause":"feedback:rule(rule_four_thread_arch, architecture, 'Four-thread architecture: controller (TCP), database (scheduler tick), processor (job executor), http (REST API — optional)', high, claude_md)"}
+{"ts":1779658064,"op":"assert","clause":"feedback:trigger(rule_four_thread_arch, 'main.zig', file)"}
+{"ts":1779658066,"op":"assert","clause":"feedback:rule(rule_bounded_fifo_channels, architecture, 'Bounded FIFO channels with mutex + condvars for inter-thread comms; capacity 64; circular buffer with head/tail/count', high, claude_md)"}
+{"ts":1779658067,"op":"assert","clause":"feedback:trigger(rule_bounded_fifo_channels, 'channel.zig', file)"}
+{"ts":1779658069,"op":"assert","clause":"feedback:rule(rule_atomic_shutdown, architecture, 'Atomic flag (std.atomic.Value(bool)) for cross-thread shutdown; use .acquire/.release ordering, .monotonic only for counters', high, claude_md)"}
+{"ts":1779658069,"op":"assert","clause":"feedback:trigger(rule_atomic_shutdown, 'main.zig', file)"}
+{"ts":1779658073,"op":"assert","clause":"feedback:rule(rule_shutdown_order, architecture, 'Shutdown order: join controller -> join http -> store false to running -> close request ch -> join database -> close exec ch -> join processor', high, claude_md)"}
+{"ts":1779658074,"op":"assert","clause":"feedback:trigger(rule_shutdown_order, 'main.zig', file)"}
+{"ts":1779658076,"op":"assert","clause":"feedback:rule(rule_no_seq_cst, architecture, 'Never use .seq_cst memory ordering unless explicitly required; .acquire/.release is sufficient for producer/consumer patterns', medium, claude_md)"}
+{"ts":1779658077,"op":"assert","clause":"feedback:trigger(rule_no_seq_cst, '.zig', file)"}
+{"ts":1779658079,"op":"assert","clause":"feedback:rule(rule_clock_timed_wait, architecture, 'Clock pattern: timedWait(mutex, wait_ns) instead of busy-loop polling; external producers can wake early via shared condvar', medium, claude_md)"}
+{"ts":1779658079,"op":"assert","clause":"feedback:trigger(rule_clock_timed_wait, 'clock.zig', file)"}
+{"ts":1779658083,"op":"assert","clause":"feedback:rule(rule_close_channels_before_join, pitfall, 'Close channels before joining threads to prevent deadlocks; document shutdown sequence explicitly', high, claude_md)"}
+{"ts":1779658084,"op":"assert","clause":"feedback:trigger(rule_close_channels_before_join, 'main.zig', file)"}
+{"ts":1779658086,"op":"assert","clause":"feedback:rule(rule_open_before_create, pitfall, 'Try openFile(.write_only) first, fall back to createFile for new logfiles; handles both append and initialization', medium, claude_md)"}
+{"ts":1779658087,"op":"assert","clause":"feedback:trigger(rule_open_before_create, 'backend.zig', file)"}
+{"ts":1779658088,"op":"assert","clause":"feedback:rule(rule_prealloc_thread_tracking, pitfall, 'Pre-allocate capacity in thread tracking list before spawning; ensure append cannot fail due to OOM', high, claude_md)"}
+{"ts":1779658089,"op":"assert","clause":"feedback:trigger(rule_prealloc_thread_tracking, 'main.zig', file)"}
+{"ts":1779658093,"op":"assert","clause":"feedback:rule(rule_remove_thread_handles, pitfall, 'Remove thread handles from tracking list after joining; never accumulate handles indefinitely', medium, claude_md)"}
+{"ts":1779658093,"op":"assert","clause":"feedback:trigger(rule_remove_thread_handles, 'main.zig', file)"}
+{"ts":1779658096,"op":"assert","clause":"feedback:rule(rule_json_std_only, pitfall, 'Use std.json.Stringify for serialization, std.json.parseFromSlice for deserialization; never build JSON manually', medium, claude_md)"}
+{"ts":1779658096,"op":"assert","clause":"feedback:trigger(rule_json_std_only, '.zig', file)"}
+{"ts":1779658098,"op":"assert","clause":"feedback:rule(rule_follow_mode_offset, pitfall, 'Follow mode initial offset: subtract partial-frame bytes from file length, not file length itself', medium, claude_md)"}
+{"ts":1779658098,"op":"assert","clause":"feedback:trigger(rule_follow_mode_offset, 'dump.zig', file)"}
+{"ts":1779658103,"op":"assert","clause":"feedback:rule(rule_no_silent_decode_errors, pitfall, 'Never silently ignore persistence decode errors; emit warnings to stderr with byte offset for debugging', high, claude_md)"}
+{"ts":1779658104,"op":"assert","clause":"feedback:trigger(rule_no_silent_decode_errors, 'persistence_codec.zig', file)"}
+{"ts":1779658106,"op":"assert","clause":"feedback:rule(rule_no_double_free_copy, pitfall, 'When copying structs with ArrayListUnmanaged, only owning copy calls deinit; non-owning copies must be dropped without cleanup', high, claude_md)"}
+{"ts":1779658107,"op":"assert","clause":"feedback:trigger(rule_no_double_free_copy, '.zig', file)"}
+{"ts":1779658109,"op":"assert","clause":"feedback:rule(rule_retain_compress_on_fail, pitfall, 'Retain .to_compress file on failed atomic rename during compression; verify destination non-existence before overwrite', high, claude_md)"}
+{"ts":1779658109,"op":"assert","clause":"feedback:trigger(rule_retain_compress_on_fail, 'backend.zig', file)"}
+{"ts":1779658113,"op":"assert","clause":"feedback:rule(rule_monotonic_compression_interval, pitfall, 'Use monotonic time or atomic counters for compression intervals; wall-clock subtraction wraps on NTP stepback', high, claude_md)"}
+{"ts":1779658114,"op":"assert","clause":"feedback:trigger(rule_monotonic_compression_interval, 'backend.zig', file)"}
+{"ts":1779658115,"op":"assert","clause":"feedback:rule(rule_gitignore_artifacts, pitfall, 'Add generated compression artifacts (.compressed, .to_compress) and build artifacts to .gitignore', medium, claude_md)"}
+{"ts":1779658116,"op":"assert","clause":"feedback:trigger(rule_gitignore_artifacts, '.gitignore', file)"}
+{"ts":1779658118,"op":"assert","clause":"feedback:rule(rule_log_failed_compression, pitfall, 'Always log failed background compression at ERROR level with .to_compress file path for data recovery', medium, claude_md)"}
+{"ts":1779658118,"op":"assert","clause":"feedback:trigger(rule_log_failed_compression, 'backend.zig', file)"}
+{"ts":1779658123,"op":"assert","clause":"feedback:rule(rule_validate_shell_execute_mode, pitfall, 'Validate shell executables with execute mode (.{ .mode = .execute }), not default read-only mode', high, claude_md)"}
+{"ts":1779658123,"op":"assert","clause":"feedback:trigger(rule_validate_shell_execute_mode, 'shell', directory)"}
+{"ts":1779658125,"op":"assert","clause":"feedback:rule(rule_unescape_toml, pitfall, 'Always unescape TOML escape sequences when parsing array values; skipping produces literal backslashes', medium, claude_md)"}
+{"ts":1779658126,"op":"assert","clause":"feedback:trigger(rule_unescape_toml, 'config.zig', file)"}
+{"ts":1779658128,"op":"assert","clause":"feedback:rule(rule_single_source_spec, pitfall, 'Never duplicate specification details across files; maintain single source of truth per spec element', medium, claude_md)"}
+{"ts":1779658128,"op":"assert","clause":"feedback:trigger(rule_single_source_spec, '', project)"}
+{"ts":1779658132,"op":"assert","clause":"feedback:rule(rule_no_stub_barrels, pitfall, 'Never commit stub barrel files without implementation; add @compileError to unimplemented public functions', high, claude_md)"}
+{"ts":1779658133,"op":"assert","clause":"feedback:trigger(rule_no_stub_barrels, '.zig', file)"}
+{"ts":1779658134,"op":"assert","clause":"feedback:rule(rule_auth_timeout, pitfall, 'Enforce 5-second auth timeout using poll-based socket reads; close connection if AUTH not received', high, claude_md)"}
+{"ts":1779658135,"op":"assert","clause":"feedback:trigger(rule_auth_timeout, 'tcp_server.zig', file)"}
+{"ts":1779658137,"op":"assert","clause":"feedback:rule(rule_tls_init_parity, pitfall, 'Initialize TLS contexts identically in test and production; apply identical guard conditions to prevent environment-specific bugs', high, claude_md)"}
+{"ts":1779658138,"op":"assert","clause":"feedback:trigger(rule_tls_init_parity, 'tls_context.zig', file)"}
+{"ts":1779658141,"op":"assert","clause":"feedback:rule(rule_no_reimplement_merged, pitfall, 'Never reimplement logic from merged features; reference existing code via config wiring only', medium, claude_md)"}
+{"ts":1779658142,"op":"assert","clause":"feedback:trigger(rule_no_reimplement_merged, '', project)"}
+{"ts":1779658146,"op":"assert","clause":"feedback:rule(rule_verify_all_planned_files, pitfall, 'Never rely on final-diff for verification; ensure all planned files are modified and build/test complete', medium, claude_md)"}
+{"ts":1779658146,"op":"assert","clause":"feedback:trigger(rule_verify_all_planned_files, '', project)"}
+{"ts":1779658146,"op":"assert","clause":"feedback:rule(rule_scoped_branches, pitfall, 'Keep feature branches scoped to plan; never commit unplanned config changes as scope creep risks team workflows', medium, claude_md)"}
+{"ts":1779658147,"op":"assert","clause":"feedback:trigger(rule_scoped_branches, '', project)"}
+{"ts":1779658152,"op":"assert","clause":"feedback:rule(rule_colocate_unit_tests, test, 'Co-locate unit tests in test blocks within source files; use functional_tests.zig for integration tests', medium, claude_md)"}
+{"ts":1779658153,"op":"assert","clause":"feedback:trigger(rule_colocate_unit_tests, '.zig', file)"}
+{"ts":1779658155,"op":"assert","clause":"feedback:rule(rule_verbose_test_names, test, 'Verbose test names describe behavior (e.g. test \"tick processes query request and routes response\")', medium, claude_md)"}
+{"ts":1779658156,"op":"assert","clause":"feedback:trigger(rule_verbose_test_names, '.zig', file)"}
+{"ts":1779658157,"op":"assert","clause":"feedback:rule(rule_tmpdir_tests, test, 'Use std.testing.tmpDir for test files; never hardcode /tmp paths which create race conditions', high, claude_md)"}
+{"ts":1779658158,"op":"assert","clause":"feedback:trigger(rule_tmpdir_tests, '.zig', file)"}
+{"ts":1779658162,"op":"assert","clause":"feedback:rule(rule_build_test_layer, test, 'Verify tests execute through zig build test-<layer> targets, not just direct zig test; barrel chains may prevent discovery', medium, claude_md)"}
+{"ts":1779658163,"op":"assert","clause":"feedback:trigger(rule_build_test_layer, 'build.zig', file)"}
+{"ts":1779658165,"op":"assert","clause":"feedback:rule(rule_isolated_unit_tests, test, 'Error-handling functions and memory-cleanup helpers require isolated unit tests; integration coverage alone is insufficient', medium, claude_md)"}
+{"ts":1779658165,"op":"assert","clause":"feedback:trigger(rule_isolated_unit_tests, '.zig', file)"}
+{"ts":1779658168,"op":"assert","clause":"feedback:rule(rule_barrel_test_refs, test, 'Module barrel test blocks reference all submodules (_ = domain; _ = application; ...) to force compilation and test discovery', medium, claude_md)"}
+{"ts":1779658168,"op":"assert","clause":"feedback:trigger(rule_barrel_test_refs, '.zig', file)"}
+{"ts":1779658173,"op":"assert","clause":"feedback:rule(rule_sanitizer_before_merge, test, 'Run sanitizer test targets (ThreadSanitizer + heap) before merging changes to channel.zig, scheduler.zig, or main.zig', high, claude_md)"}
+{"ts":1779658173,"op":"assert","clause":"feedback:trigger(rule_sanitizer_before_merge, 'channel.zig', file)"}
+{"ts":1779658174,"op":"assert","clause":"feedback:trigger(rule_sanitizer_before_merge, 'scheduler.zig', file)"}
+{"ts":1779658178,"op":"assert","clause":"feedback:rule(rule_snake_case_normalize, review, 'Normalize all function names to snake_case including private functions; remove dead code completely', medium, claude_md)"}
+{"ts":1779658179,"op":"assert","clause":"feedback:trigger(rule_snake_case_normalize, '.zig', file)"}
+{"ts":1779658180,"op":"assert","clause":"feedback:rule(rule_verify_spec_match, review, 'Verify implementation matches original specification (protocol format, timestamp parsing, command definitions)', high, claude_md)"}
+{"ts":1779658181,"op":"assert","clause":"feedback:trigger(rule_verify_spec_match, '', project)"}
+{"ts":1779658182,"op":"assert","clause":"feedback:rule(rule_test_names_behavior, review, 'Name tests after observable behavior from caller perspective, not implementation internals', medium, claude_md)"}
+{"ts":1779658183,"op":"assert","clause":"feedback:trigger(rule_test_names_behavior, '.zig', file)"}
+{"ts":1779658186,"op":"assert","clause":"feedback:rule(rule_delete_204, review, 'HTTP DELETE returns 204 No Content for successful deletions; return 200 only when response body is present', medium, claude_md)"}
+{"ts":1779658187,"op":"assert","clause":"feedback:trigger(rule_delete_204, 'http.zig', file)"}
+{"ts":1779658189,"op":"assert","clause":"feedback:rule(rule_verify_all_components, review, 'Verify all planned components are implemented before merge; HTTP controller requires routing, json codec, config, and threading', high, claude_md)"}
+{"ts":1779658190,"op":"assert","clause":"feedback:trigger(rule_verify_all_components, '', project)"}
+{"ts":1779658192,"op":"assert","clause":"feedback:rule(rule_dupe_instruction_strings, review, 'Dupe all instruction string identifiers before sending to scheduler via Channel; scheduler stores pointers without copying', high, claude_md)"}
+{"ts":1779658192,"op":"assert","clause":"feedback:trigger(rule_dupe_instruction_strings, 'http.zig', file)"}
+{"ts":1779658197,"op":"assert","clause":"feedback:rule(rule_scope_alignment, review, 'Verify scope alignment before merge; reject PRs that include logic from non-target features', high, claude_md)"}
+{"ts":1779658198,"op":"assert","clause":"feedback:trigger(rule_scope_alignment, '', project)"}
+{"ts":1779658200,"op":"assert","clause":"feedback:rule(rule_planned_docs_only, review, 'Documentation changes must be explicitly planned in task scope; reject PRs with unplanned doc changes', medium, claude_md)"}
+{"ts":1779658201,"op":"assert","clause":"feedback:trigger(rule_planned_docs_only, 'docs/', directory)"}
+{"ts":1779658202,"op":"assert","clause":"feedback:rule(rule_reject_hot_path_alloc, review, 'Reject PRs with per-iteration allocation in hot paths without accompanying micro-benchmark proving necessity', high, claude_md)"}
+{"ts":1779658203,"op":"assert","clause":"feedback:trigger(rule_reject_hot_path_alloc, 'channel.zig', file)"}
+{"ts":1779658208,"op":"assert","clause":"feedback:rule(rule_reject_arraylist_downgrade, review, 'Reject PRs that downgrade ArrayListUnmanaged to ArrayList or introduce std.io.Reader(T)/Writer(T) generic factories', high, claude_md)"}
+{"ts":1779658208,"op":"assert","clause":"feedback:trigger(rule_reject_arraylist_downgrade, '.zig', file)"}
+{"ts":1779658210,"op":"assert","clause":"feedback:rule(rule_reject_seq_cst, review, 'Reject PRs that use .seq_cst memory ordering without justifying why .acquire/.release is insufficient', high, claude_md)"}
+{"ts":1779658211,"op":"assert","clause":"feedback:trigger(rule_reject_seq_cst, '.zig', file)"}

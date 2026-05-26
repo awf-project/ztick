@@ -4,10 +4,15 @@ pub fn Channel(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        mutex: std.Thread.Mutex,
-        not_empty: std.Thread.Condition,
-        not_full: std.Thread.Condition,
-        notify_condition: ?*std.Thread.Condition,
+        io: std.Io,
+        mutex: std.Io.Mutex,
+        not_empty: std.Io.Condition,
+        not_full: std.Io.Condition,
+        /// Optional wake token incremented on every send/try_send/close.
+        /// The Clock thread uses io.futexWaitTimeout on this value so that
+        /// a new request wakes it immediately rather than after the full
+        /// idle timeout.  Set to null if no external waiter is needed.
+        wake_token: ?*std.atomic.Value(u32),
         buffer: []T,
         head: usize,
         tail: usize,
@@ -16,13 +21,14 @@ pub fn Channel(comptime T: type) type {
         allocator: std.mem.Allocator,
         closed: bool,
 
-        pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, capacity: usize) !Self {
             const buffer = try allocator.alloc(T, capacity);
             return Self{
-                .mutex = .{},
-                .not_empty = .{},
-                .not_full = .{},
-                .notify_condition = null,
+                .io = io,
+                .mutex = .init,
+                .not_empty = .init,
+                .not_full = .init,
+                .wake_token = null,
                 .buffer = buffer,
                 .head = 0,
                 .tail = 0,
@@ -40,84 +46,92 @@ pub fn Channel(comptime T: type) type {
         pub const SendError = error{ChannelClosed};
 
         pub fn send(self: *Self, item: T) SendError!void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             while (self.count == self.capacity and !self.closed) {
-                self.not_full.wait(&self.mutex);
+                self.not_full.waitUncancelable(self.io, &self.mutex);
             }
             if (self.closed) return error.ChannelClosed;
             self.buffer[self.tail] = item;
             self.tail = (self.tail + 1) % self.capacity;
             self.count += 1;
-            self.not_empty.signal();
-            if (self.notify_condition) |nc| nc.signal();
+            self.not_empty.signal(self.io);
+            self.notifyWakeToken();
         }
 
         pub fn receive(self: *Self) ?T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             while (self.count == 0) {
                 if (self.closed) return null;
-                self.not_empty.wait(&self.mutex);
+                self.not_empty.waitUncancelable(self.io, &self.mutex);
             }
             const item = self.buffer[self.head];
             self.head = (self.head + 1) % self.capacity;
             self.count -= 1;
-            self.not_full.signal();
+            self.not_full.signal(self.io);
             return item;
         }
 
         pub fn close(self: *Self) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.closed = true;
-            self.not_empty.broadcast();
-            self.not_full.broadcast();
-            if (self.notify_condition) |nc| nc.signal();
+            self.not_empty.broadcast(self.io);
+            self.not_full.broadcast(self.io);
+            self.notifyWakeToken();
         }
 
         pub const TrySendError = error{ ChannelClosed, ChannelFull };
 
         pub fn try_send(self: *Self, item: T) TrySendError!void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             if (self.closed) return error.ChannelClosed;
             if (self.count == self.capacity) return error.ChannelFull;
             self.buffer[self.tail] = item;
             self.tail = (self.tail + 1) % self.capacity;
             self.count += 1;
-            self.not_empty.signal();
-            if (self.notify_condition) |nc| nc.signal();
+            self.not_empty.signal(self.io);
+            self.notifyWakeToken();
         }
 
         pub fn try_receive(self: *Self) ?T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             if (self.count == 0) return null;
             const item = self.buffer[self.head];
             self.head = (self.head + 1) % self.capacity;
             self.count -= 1;
-            self.not_full.signal();
+            self.not_full.signal(self.io);
             return item;
         }
 
         pub fn drain(self: *Self, out: []T) usize {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             const n = @min(self.count, out.len);
             for (0..n) |i| {
                 out[i] = self.buffer[self.head];
                 self.head = (self.head + 1) % self.capacity;
             }
             self.count -= n;
-            if (n > 0) self.not_full.broadcast();
+            if (n > 0) self.not_full.broadcast(self.io);
             return n;
+        }
+
+        /// Increment the wake token and wake one futex waiter if a token is set.
+        fn notifyWakeToken(self: *Self) void {
+            if (self.wake_token) |tok| {
+                _ = tok.fetchAdd(1, .release);
+                self.io.futexWake(u32, &tok.raw, 1);
+            }
         }
     };
 }
 
 test "channel send and receive single item" {
-    var ch = try Channel(u32).init(std.testing.allocator, 4);
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 4);
     defer ch.deinit();
 
     try ch.send(42);
@@ -126,7 +140,7 @@ test "channel send and receive single item" {
 }
 
 test "channel preserves FIFO order" {
-    var ch = try Channel(u32).init(std.testing.allocator, 4);
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 4);
     defer ch.deinit();
 
     try ch.send(1);
@@ -138,7 +152,7 @@ test "channel preserves FIFO order" {
 }
 
 test "channel blocks sender when full then drains" {
-    var ch = try Channel(u32).init(std.testing.allocator, 1);
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 1);
     defer ch.deinit();
 
     try ch.send(99);
@@ -146,7 +160,7 @@ test "channel blocks sender when full then drains" {
 }
 
 test "channel transfers items across threads" {
-    var ch = try Channel(u32).init(std.testing.allocator, 4);
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 4);
     defer ch.deinit();
 
     const sender = try std.Thread.spawn(.{}, struct {
@@ -168,14 +182,14 @@ test "channel transfers items across threads" {
 }
 
 test "try_receive returns null on empty channel" {
-    var ch = try Channel(u32).init(std.testing.allocator, 4);
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 4);
     defer ch.deinit();
 
     try std.testing.expectEqual(@as(?u32, null), ch.try_receive());
 }
 
 test "try_receive returns value after send" {
-    var ch = try Channel(u32).init(std.testing.allocator, 4);
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 4);
     defer ch.deinit();
 
     try ch.send(7);
@@ -186,7 +200,7 @@ test "try_receive returns value after send" {
 }
 
 test "try_receive is non-blocking" {
-    var ch = try Channel(u32).init(std.testing.allocator, 4);
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 4);
     defer ch.deinit();
 
     try std.testing.expectEqual(@as(?u32, null), ch.try_receive());
@@ -195,7 +209,7 @@ test "try_receive is non-blocking" {
 }
 
 test "drain copies all pending items in single call" {
-    var ch = try Channel(u32).init(std.testing.allocator, 8);
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 8);
     defer ch.deinit();
 
     try ch.send(10);
@@ -216,7 +230,7 @@ test "drain copies all pending items in single call" {
 }
 
 test "drain returns zero on empty channel" {
-    var ch = try Channel(u32).init(std.testing.allocator, 4);
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 4);
     defer ch.deinit();
 
     var buf: [4]u32 = undefined;
@@ -226,7 +240,7 @@ test "drain returns zero on empty channel" {
 }
 
 test "drain copies at most out.len items when buffer has more" {
-    var ch = try Channel(u32).init(std.testing.allocator, 8);
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 8);
     defer ch.deinit();
 
     try ch.send(1);
@@ -247,7 +261,7 @@ test "drain copies at most out.len items when buffer has more" {
 }
 
 test "drain signals not_full to unblock senders" {
-    var ch = try Channel(u32).init(std.testing.allocator, 3);
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 3);
     defer ch.deinit();
 
     try ch.send(1);
@@ -262,7 +276,7 @@ test "drain signals not_full to unblock senders" {
         }
     }.run, .{ &ch, &sender_sent });
 
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    nanosleep(10 * std.time.ns_per_ms);
 
     var buf: [3]u32 = undefined;
     _ = ch.drain(&buf);
@@ -270,39 +284,46 @@ test "drain signals not_full to unblock senders" {
     // Safety valve: if drain didn't signal not_full the sender stays blocked forever.
     // Close the channel after a short window to unblock it; sender gets ChannelClosed,
     // returns without setting the flag, and the assertion below catches the failure.
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    nanosleep(30 * std.time.ns_per_ms);
     if (!sender_sent.load(.acquire)) ch.close();
 
     sender.join();
     try std.testing.expect(sender_sent.load(.acquire));
 }
 
-test "send signals notify_condition when set" {
-    var ch = try Channel(u32).init(std.testing.allocator, 4);
+test "send increments wake_token and wakes futex waiter" {
+    var ch = try Channel(u32).init(std.testing.allocator, std.testing.io, 4);
     defer ch.deinit();
 
-    var extra_cond: std.Thread.Condition = .{};
-    var extra_mutex: std.Thread.Mutex = .{};
-    ch.notify_condition = &extra_cond;
+    var token = std.atomic.Value(u32).init(0);
+    ch.wake_token = &token;
 
     var signaled = std.atomic.Value(bool).init(false);
 
     const waiter = try std.Thread.spawn(.{}, struct {
-        fn run(
-            cond: *std.Thread.Condition,
-            mtx: *std.Thread.Mutex,
-            flag: *std.atomic.Value(bool),
-        ) void {
-            mtx.lock();
-            defer mtx.unlock();
-            cond.wait(mtx);
+        fn run(tok: *std.atomic.Value(u32), flag: *std.atomic.Value(bool)) void {
+            // Spin-wait for the token to advance (futexWait may not be available
+            // on all test IO backends, so we poll as a fallback).
+            const initial = tok.load(.acquire);
+            var i: u32 = 0;
+            while (tok.load(.acquire) == initial and i < 10_000) : (i += 1) {
+                nanosleep(std.time.ns_per_ms);
+            }
             flag.store(true, .release);
         }
-    }.run, .{ &extra_cond, &extra_mutex, &signaled });
+    }.run, .{ &token, &signaled });
 
-    std.Thread.sleep(1 * std.time.ns_per_ms);
+    nanosleep(std.time.ns_per_ms);
     try ch.send(42);
 
     waiter.join();
     try std.testing.expect(signaled.load(.acquire));
+}
+
+fn nanosleep(ns: u64) void {
+    const req = std.os.linux.timespec{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    _ = std.os.linux.nanosleep(&req, null);
 }

@@ -8,51 +8,58 @@ pub const CompressionStatus = enum { idle, running, success, failure };
 
 pub const LogfilePersistence = struct {
     logfile_path: ?[]const u8,
-    logfile_dir: ?std.fs.Dir,
+    logfile_dir: ?std.Io.Dir,
     load_arena: ?std.heap.ArenaAllocator,
     fsync_on_persist: bool,
+    io: std.Io,
 
     pub fn append(self: *LogfilePersistence, entry: []const u8) !void {
         const path = self.logfile_path orelse return;
         const dir = self.logfile_dir orelse return;
+        const io = self.io;
 
         var header: [4]u8 = undefined;
         std.mem.writeInt(u32, &header, @intCast(entry.len), .big);
 
-        const file = dir.openFile(path, .{ .mode = .write_only }) catch |err| switch (err) {
-            error.FileNotFound => try dir.createFile(path, .{}),
+        const file = dir.openFile(io, path, .{ .mode = .write_only }) catch |err| switch (err) {
+            error.FileNotFound => try dir.createFile(io, path, .{}),
             else => return err,
         };
-        defer file.close();
-        try file.seekFromEnd(0);
-        try file.writeAll(&header);
-        try file.writeAll(entry);
-        if (self.fsync_on_persist) try file.sync();
+        defer file.close(io);
+
+        const stat = try file.stat(io);
+        const offset = stat.size;
+        _ = try file.writePositional(io, &.{&header}, offset);
+        _ = try file.writePositional(io, &.{entry}, offset + header.len);
+        if (self.fsync_on_persist) try file.sync(io);
     }
 
     pub fn load(self: *LogfilePersistence, allocator: std.mem.Allocator) ![][]u8 {
         const path = self.logfile_path orelse return try allocator.alloc([]u8, 0);
         const dir = self.logfile_dir orelse return try allocator.alloc([]u8, 0);
+        const io = self.io;
 
-        const file = dir.openFile(path, .{}) catch |err| switch (err) {
+        const file = dir.openFile(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => return try allocator.alloc([]u8, 0),
             else => return err,
         };
-        defer file.close();
+        defer file.close(io);
 
-        var entries = std.ArrayListUnmanaged([]u8){};
+        var entries: std.ArrayListUnmanaged([]u8) = .empty;
         errdefer {
             for (entries.items) |e| allocator.free(e);
             entries.deinit(allocator);
         }
 
-        var carry = std.ArrayListUnmanaged(u8){};
+        var carry: std.ArrayListUnmanaged(u8) = .empty;
         defer carry.deinit(allocator);
 
         var read_buf: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
         while (true) {
-            const n = try file.read(&read_buf);
+            const n = try file.readPositionalAll(io, &read_buf, offset);
             if (n == 0) break;
+            offset += n;
             try carry.appendSlice(allocator, read_buf[0..n]);
 
             const parsed = try logfile.parse(allocator, carry.items);
@@ -208,26 +215,28 @@ pub const BackendState = struct {
 
                 const dir = lf.logfile_dir orelse return false;
                 const path = lf.logfile_path orelse return false;
+                const io = lf.io;
 
-                if (dir.statFile("logfile.to_compress")) |_| {
+                if (dir.access(io, "logfile.to_compress", .{})) |_| {
                     std.log.warn("compression: skipping cycle, leftover logfile.to_compress still present", .{});
                     return false;
                 } else |_| {}
 
-                try std.fs.rename(dir, path, dir, "logfile.to_compress");
+                try dir.rename(path, dir, "logfile.to_compress", io);
 
                 const proc = try allocator.create(background.Process);
                 errdefer allocator.destroy(proc);
-                proc.* = .{ .allocator = allocator, .thread = null, .result = null, .mutex = .{}, .joined = false };
+                proc.* = .{ .allocator = allocator, .thread = null, .state = .init(.running), .joined = false };
 
                 proc.thread = try std.Thread.spawn(.{}, struct {
-                    fn run(p: *background.Process, alloc: std.mem.Allocator, compress_dir: std.fs.Dir) void {
-                        const r = background.compress(alloc, compress_dir, .{});
-                        p.mutex.lock();
-                        defer p.mutex.unlock();
-                        p.result = r;
+                    fn run(p: *background.Process, alloc: std.mem.Allocator, compress_io: std.Io, compress_dir: std.Io.Dir) void {
+                        if (background.compress(alloc, compress_io, compress_dir, .{})) {
+                            p.state.store(.success, .release);
+                        } else |_| {
+                            p.state.store(.failure, .release);
+                        }
                     }
-                }.run, .{ proc, allocator, dir });
+                }.run, .{ proc, allocator, io, dir });
 
                 self.active_process = proc;
                 return true;
@@ -255,7 +264,7 @@ pub const BackendState = struct {
 };
 
 test "MemoryPersistence load on empty backend returns empty slice" {
-    var backend = PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = std.testing.allocator } };
+    var backend = PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = std.testing.allocator } };
     defer backend.deinit();
 
     const entries = try backend.load(std.testing.allocator);
@@ -265,7 +274,7 @@ test "MemoryPersistence load on empty backend returns empty slice" {
 }
 
 test "MemoryPersistence append then load returns stored bytes" {
-    var backend = PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = std.testing.allocator } };
+    var backend = PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = std.testing.allocator } };
     defer backend.deinit();
 
     const data = [_]u8{ 0, 0, 4, 116, 111, 116, 111, 22, 71, 187, 92, 238, 225, 80, 0, 0 };
@@ -282,12 +291,7 @@ test "MemoryPersistence append then load returns stored bytes" {
 }
 
 test "LogfilePersistence load on missing file returns empty slice" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -297,6 +301,7 @@ test "LogfilePersistence load on missing file returns empty slice" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } };
     defer backend.deinit();
 
@@ -307,12 +312,7 @@ test "LogfilePersistence load on missing file returns empty slice" {
 }
 
 test "LogfilePersistence append then load returns stored entry" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -322,6 +322,7 @@ test "LogfilePersistence append then load returns stored entry" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } };
     defer backend.deinit();
 
@@ -339,12 +340,7 @@ test "LogfilePersistence append then load returns stored entry" {
 }
 
 test "LogfilePersistence append multiple entries load returns all in order" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer {
-        const status = gpa.deinit();
-        std.debug.assert(status == .ok);
-    }
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -354,6 +350,7 @@ test "LogfilePersistence append multiple entries load returns all in order" {
         .logfile_dir = tmp.dir,
         .load_arena = null,
         .fsync_on_persist = false,
+        .io = std.testing.io,
     } };
     defer backend.deinit();
 
@@ -374,7 +371,7 @@ test "LogfilePersistence append multiple entries load returns all in order" {
 }
 
 test "MemoryPersistence append multiple entries load returns all in order" {
-    var backend = PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = std.testing.allocator } };
+    var backend = PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = std.testing.allocator } };
     defer backend.deinit();
 
     const first = [_]u8{ 0, 0, 4, 116, 111, 116, 111, 22, 71, 187, 92, 238, 225, 80, 0, 0 };
@@ -401,7 +398,7 @@ test "MemoryPersistence stored bytes match encoder output" {
     const encoded = try encoder.encode(std.testing.allocator, .{ .job = job });
     defer std.testing.allocator.free(encoded);
 
-    var backend = PersistenceBackend{ .memory = .{ .entries = .{}, .allocator = std.testing.allocator } };
+    var backend = PersistenceBackend{ .memory = .{ .entries = .empty, .allocator = std.testing.allocator } };
     defer backend.deinit();
 
     try backend.append(encoded);

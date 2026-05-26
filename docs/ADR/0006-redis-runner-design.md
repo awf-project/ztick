@@ -28,7 +28,7 @@ Each decision is documented separately below.
 | Option | Pros | Cons |
 |--------|------|------|
 | **Hand-roll RESP2 codec in stdlib** | Zero new Zig dependencies; NFR-004 compliant; RESP2 wire format is frozen, narrow, and small (~100 LOC for the subset ztick needs) | Byte-level bug risk; incremental cost for future protocol features (RESP3, transactions, scripting) |
-| **Vendor a third-party Zig Redis client** | Less code to write | No maintained Zig 0.15.2-compatible Redis client exists; breaches NFR-004 and ADR-0002 |
+| **Vendor a third-party Zig Redis client** | Less code to write | No maintained Zig 0.16.0-compatible Redis client exists; breaches NFR-004 and ADR-0002 |
 
 ### Decision
 

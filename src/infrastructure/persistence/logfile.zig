@@ -19,7 +19,7 @@ pub const ParseResult = struct {
 };
 
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) (ParseError || std.mem.Allocator.Error)!ParseResult {
-    var entries = std.ArrayListUnmanaged([]u8){};
+    var entries: std.ArrayList([]u8) = .empty;
     errdefer {
         for (entries.items) |e| allocator.free(e);
         entries.deinit(allocator);

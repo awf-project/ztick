@@ -74,7 +74,7 @@ fn print_version(writer: anytype) !void {
 
 /// Inline parser for the implicit-server form (`ztick`, `ztick -c PATH`).
 /// Allocates `config_path` on the supplied allocator so the result outlives
-/// `argv`. The caller is responsible for freeing it (see main.zig).
+/// `argv`. The caller is responsible for freeing it.
 fn parse_implicit_server(allocator: std.mem.Allocator, argv: []const []const u8) !Command {
     var config_path_ref: ?[]const u8 = null;
     var i: usize = 1;
@@ -94,13 +94,11 @@ fn parse_implicit_server(allocator: std.mem.Allocator, argv: []const []const u8)
     return Command{ .server = .{ .config_path = config_dup } };
 }
 
-pub fn parse(allocator: std.mem.Allocator) !Command {
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
-
+pub fn parse(init: *const std.process.Init, allocator: std.mem.Allocator, argv: []const []const u8) !Command {
+    const io = init.io;
     if (is_version_flag(argv)) {
         var buf: [128]u8 = undefined;
-        var w = std.fs.File.stdout().writer(&buf);
+        var w = std.Io.File.stdout().writer(io, &buf);
         print_version(&w.interface) catch {};
         w.interface.flush() catch {};
         std.process.exit(0);
@@ -117,7 +115,7 @@ pub fn parse(allocator: std.mem.Allocator) !Command {
     arg_dump_compact = false;
     arg_dump_follow = false;
 
-    var r = try cli.AppRunner.init(allocator);
+    var r = cli.AppRunner.init(init);
 
     const server_options = try r.allocOptions(&.{
         .{
@@ -248,8 +246,8 @@ test "is_version_flag detects --version and -V at first position" {
 
 test "print_version emits ztick prefix and version with trailing newline" {
     var buf: [64]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try print_version(fbs.writer());
+    var w = std.Io.Writer.fixed(&buf);
+    try print_version(&w);
     const expected = "ztick " ++ version_info.version ++ "\n";
-    try std.testing.expectEqualStrings(expected, fbs.getWritten());
+    try std.testing.expectEqualStrings(expected, buf[0..w.end]);
 }

@@ -7,7 +7,7 @@ This tutorial walks you through building, configuring, and running ztick for the
 
 ## Prerequisites
 
-- **Zig 0.15.2** or later ([download](https://ziglang.org/download/))
+- **Zig 0.16.0** or later ([download](https://ziglang.org/download/))
 - A POSIX shell (bash, zsh, etc.)
 - `socat` for sending TCP commands
 - Basic familiarity with command-line tools

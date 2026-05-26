@@ -1,0 +1,53 @@
+:- module(pr_feature_f024_zig_0152_0160_migration, []).
+% ─── PR Tracking Schema ──────────────────────────────────────────────────────
+% Memory segment: pr_<branch>
+% Lifecycle: created at implement start, gated before commit, archived on merge.
+%
+% Facts (asserted by scan scripts and LLM):
+%   pr_file(Path, ChangeType)        — file in PR scope (changed | added | test)
+%   todo(Id, File, Line, Desc)       — TODO/FIXME found in changed code
+%   stub(Id, File, Symbol)           — stub/placeholder implementation
+%   mock(Id, File, Symbol)           — mock that should be replaced with real impl
+%   not_impl(Id, File, Desc)         — "not yet implemented" marker
+%   resolved(Type, Id)               — marks a tracked issue as resolved
+%   pr_decision(Id, What, Why)       — implementation decisions (queryable history)
+%
+% Dynamic declarations (required by Trealla Prolog for runtime assertion).
+:- dynamic(pr_file/2).
+:- dynamic(todo/4).
+:- dynamic(stub/3).
+:- dynamic(mock/3).
+:- dynamic(not_impl/3).
+:- dynamic(resolved/2).
+:- dynamic(pr_decision/3).
+
+% A blocking issue is any tracked issue that has not been resolved.
+blocking_issue(Id, todo, File, Desc) :-
+    todo(Id, File, _, Desc), \+ resolved(todo, Id).
+blocking_issue(Id, stub, File, Symbol) :-
+    stub(Id, File, Symbol), \+ resolved(stub, Id).
+blocking_issue(Id, mock, File, Symbol) :-
+    mock(Id, File, Symbol), \+ resolved(mock, Id).
+blocking_issue(Id, not_impl, File, Desc) :-
+    not_impl(Id, File, Desc), \+ resolved(not_impl, Id).
+
+% PR is ready ONLY when zero blocking issues remain.
+pr_ready :- \+ blocking_issue(_, _, _, _).
+
+% Health summary — counts by category.
+pr_health(blocking, N) :-
+    findall(I, blocking_issue(I, _, _, _), L), length(L, N).
+pr_health(resolved, N) :-
+    findall(I, resolved(_, I), L), length(L, N).
+pr_health(files, N) :-
+    findall(F, pr_file(F, _), L), length(L, N).
+
+% Coverage gap: source file changed without corresponding test file.
+coverage_gap(File) :-
+    pr_file(File, changed),
+    \+ pr_file(File, test),
+    \+ test_file(File, _).
+
+% List all blocking issues as Id-Type-File-Desc tuples.
+all_blockers(Blockers) :-
+    findall(blocker(Id, Type, File, Desc), blocking_issue(Id, Type, File, Desc), Blockers).

@@ -13,46 +13,56 @@ const query = domain.query;
 const instruction = domain.instruction;
 
 pub const Connection = union(enum) {
-    plain: struct { stream: std.net.Stream },
+    plain: struct { stream: std.Io.net.Stream },
     tls: struct { stream: TlsStream },
 
     pub fn read(self: Connection, buf: []u8) !usize {
         return switch (self) {
-            .plain => |p| p.stream.read(buf),
+            .plain => |p| blk: {
+                const rc = std.os.linux.read(p.stream.socket.handle, buf.ptr, buf.len);
+                if (@as(isize, @bitCast(rc)) < 0) return error.ReadFailed;
+                break :blk rc;
+            },
             .tls => |t| t.stream.read(buf),
         };
     }
 
     pub fn write(self: Connection, buf: []const u8) !usize {
         return switch (self) {
-            .plain => |p| p.stream.write(buf),
+            .plain => |p| blk: {
+                const rc = std.os.linux.write(p.stream.socket.handle, buf.ptr, buf.len);
+                if (@as(isize, @bitCast(rc)) < 0) return error.WriteFailed;
+                break :blk rc;
+            },
             .tls => |t| t.stream.write(buf),
         };
     }
 
     pub fn close(self: Connection) void {
         switch (self) {
-            .plain => |p| p.stream.close(),
+            .plain => |p| _ = std.os.linux.close(p.stream.socket.handle),
             .tls => |t| t.stream.close(),
         }
     }
 
     pub fn fd(self: Connection) std.posix.socket_t {
         return switch (self) {
-            .plain => |p| p.stream.handle,
+            .plain => |p| p.stream.socket.handle,
             .tls => |t| t.stream.fd,
         };
     }
 };
 
 pub const ResponseRouter = struct {
-    mutex: std.Thread.Mutex,
+    io: std.Io,
+    mutex: std.Io.Mutex,
     channels: std.AutoHashMap(query.Client, *Channel(query.Response)),
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) ResponseRouter {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) ResponseRouter {
         return .{
-            .mutex = .{},
+            .io = io,
+            .mutex = .init,
             .channels = std.AutoHashMap(query.Client, *Channel(query.Response)).init(allocator),
             .allocator = allocator,
         };
@@ -63,20 +73,20 @@ pub const ResponseRouter = struct {
     }
 
     pub fn register(self: *ResponseRouter, client_id: query.Client, channel: *Channel(query.Response)) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.channels.put(client_id, channel);
     }
 
     pub fn deregister(self: *ResponseRouter, client_id: query.Client) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         _ = self.channels.remove(client_id);
     }
 
     pub fn route(self: *ResponseRouter, response: query.Response) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.channels.get(response.request.client)) |ch| {
             ch.try_send(response) catch {};
         }
@@ -121,7 +131,7 @@ pub const TcpServer = struct {
 
     pub fn deinit(self: *TcpServer) void {
         if (self.listen_fd) |fd| {
-            std.posix.close(fd);
+            _ = std.os.linux.close(fd);
             self.listen_fd = null;
         }
     }
@@ -132,15 +142,16 @@ pub const TcpServer = struct {
 
     pub fn start(
         self: *TcpServer,
+        io: std.Io,
         request_channel: *Channel(query.Request),
         response_router: *ResponseRouter,
     ) !void {
         const colon = std.mem.lastIndexOf(u8, self.address, ":") orelse return error.InvalidAddress;
         const host = self.address[0..colon];
         const port = try std.fmt.parseInt(u16, self.address[colon + 1 ..], 10);
-        const addr = try std.net.Address.parseIp(host, port);
-        var server = try addr.listen(.{});
-        const raw_fd = server.stream.handle;
+        const addr = try std.Io.net.IpAddress.parse(host, port);
+        var server = try std.Io.net.IpAddress.listen(&addr, io, .{});
+        const raw_fd = server.socket.handle;
         self.listen_fd = raw_fd;
 
         // Publish the fd to the signal handler's atomic so it can close the
@@ -150,7 +161,7 @@ pub const TcpServer = struct {
         var next_client_id: u128 = 0;
 
         while (self.running.load(.acquire)) {
-            const conn = server.accept() catch {
+            const stream = server.accept(io) catch {
                 // Accept failed, likely due to listener being closed from shutdown
                 if (!self.running.load(.acquire)) break;
                 continue;
@@ -165,8 +176,8 @@ pub const TcpServer = struct {
                 self.active_connections,
                 self.instruments,
                 self.allocator,
-                conn.stream,
-                conn.address,
+                io,
+                stream,
                 client_id,
                 request_channel,
                 response_router,
@@ -175,7 +186,7 @@ pub const TcpServer = struct {
             }) catch {
                 _ = self.active_connections.fetchSub(1, .release);
                 if (self.instruments) |instr| instr.connections_active.add(-1, .{}) catch {};
-                conn.stream.close();
+                _ = std.os.linux.close(stream.socket.handle);
                 continue;
             };
             thread.detach();
@@ -191,13 +202,13 @@ pub const TcpServer = struct {
         // Close the listen socket.  The signal handler uses shutdown() (not
         // close()) to unblock accept(), so the fd is still open at this point
         // and exactly one close happens here.
-        std.posix.close(raw_fd);
+        _ = std.os.linux.close(raw_fd);
     }
 
-    pub fn join_all(self: *TcpServer) void {
+    pub fn join_all(self: *TcpServer, io: std.Io) void {
         var attempts: usize = 0;
         while (self.active_connections.load(.acquire) > 0) {
-            std.Thread.sleep(1_000_000); // 1ms
+            std.Io.sleep(io, .{ .nanoseconds = 1_000_000 }, .awake) catch {}; // 1ms
             attempts += 1;
             if (attempts >= 5000) break; // 5s max shutdown wait
         }
@@ -208,8 +219,8 @@ fn connection_worker(
     active_connections: *std.atomic.Value(usize),
     instruments: ?telemetry.Instruments,
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
-    address: std.net.Address,
+    io: std.Io,
+    stream: std.Io.net.Stream,
     client_id: u128,
     request_channel: *Channel(query.Request),
     response_router: *ResponseRouter,
@@ -219,29 +230,29 @@ fn connection_worker(
     defer _ = active_connections.fetchSub(1, .release);
     defer if (instruments) |instr| instr.connections_active.add(-1, .{}) catch {};
     const conn: Connection = if (tls_context) |tls_ctx| blk: {
-        const tls_stream = tls_ctx.accept(stream.handle) catch {
-            stream.close();
+        const tls_stream = tls_ctx.accept(stream.socket.handle) catch {
+            _ = std.os.linux.close(stream.socket.handle);
             return;
         };
         break :blk Connection{ .tls = .{ .stream = tls_stream } };
     } else Connection{ .plain = .{ .stream = stream } };
-    handle_connection(allocator, conn, address, client_id, request_channel, response_router, token_store);
+    handle_connection(allocator, io, conn, client_id, request_channel, response_router, token_store);
 }
 
 fn handle_connection(
     allocator: std.mem.Allocator,
+    io: std.Io,
     conn: Connection,
-    address: std.net.Address,
     client_id: u128,
     request_channel: *Channel(query.Request),
     response_router: *ResponseRouter,
     token_store: ?*TokenStore,
 ) void {
-    std.log.info("client connected: {f}", .{address});
-    defer std.log.info("client disconnected: {f}", .{address});
+    std.log.info("client connected: id={d}", .{client_id});
+    defer std.log.info("client disconnected: id={d}", .{client_id});
     defer conn.close();
 
-    var response_channel = Channel(query.Response).init(allocator, 1) catch return;
+    var response_channel = Channel(query.Response).init(allocator, io, 1) catch return;
     defer response_channel.deinit();
 
     response_router.register(client_id, &response_channel) catch return;
@@ -254,13 +265,20 @@ fn handle_connection(
     var identity: ?domain.auth.ClientIdentity = null;
 
     // FR-010: connections that don't complete AUTH within 5 seconds are closed.
-    // Use a monotonic timer to avoid NTP stepback causing the deadline to extend or wrap.
+    // Use a monotonic clock to avoid NTP stepback causing the deadline to extend or wrap.
     const auth_timeout_ns: u64 = 5_000_000_000;
-    var auth_timer = if (token_store != null) std.time.Timer.start() catch return else null;
+    const auth_start_ns: u64 = if (token_store != null) blk: {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+        break :blk @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    } else 0;
 
     while (true) {
         if (!auth_done) {
-            const elapsed_ns = auth_timer.?.read();
+            var now_ts: std.os.linux.timespec = undefined;
+            _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &now_ts);
+            const now_ns: u64 = @as(u64, @intCast(now_ts.sec)) * 1_000_000_000 + @as(u64, @intCast(now_ts.nsec));
+            const elapsed_ns = now_ns - auth_start_ns;
             if (elapsed_ns >= auth_timeout_ns) return;
             const remaining_ms = @min((auth_timeout_ns - elapsed_ns) / 1_000_000, std.math.maxInt(u31));
             var pfd = [1]std.posix.pollfd{.{
@@ -364,7 +382,7 @@ fn handle_connection(
                     if (response_channel.receive()) |resp| {
                         if (identity) |id| {
                             if (resp.request.instruction == .query and !std.mem.eql(u8, id.namespace, "*")) {
-                                var filtered = std.ArrayListUnmanaged(u8){};
+                                var filtered: std.ArrayListUnmanaged(u8) = .empty;
                                 defer filtered.deinit(allocator);
                                 if (resp.body) |body| {
                                     var iter = std.mem.splitScalar(u8, body, '\n');
@@ -754,10 +772,10 @@ fn write_response(allocator: std.mem.Allocator, conn: Connection, resp: query.Re
 }
 
 test "response router registers and deregisters clients" {
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    var response_ch = try Channel(query.Response).init(std.testing.allocator, 1);
+    var response_ch = try Channel(query.Response).init(std.testing.allocator, std.testing.io, 1);
     defer response_ch.deinit();
 
     const client_id = @as(query.Client, 42);
@@ -872,24 +890,42 @@ test "build_instruction parses QUERY without pattern as empty prefix" {
 
 const SocketPair = struct {
     read_fd: std.posix.socket_t,
-    write_stream: std.net.Stream,
+    write_fd: std.posix.socket_t,
+
+    pub fn writeAll(self: SocketPair, buf: []const u8) !void {
+        var written: usize = 0;
+        while (written < buf.len) {
+            const n = std.os.linux.write(self.write_fd, buf[written..].ptr, buf[written..].len);
+            if (std.os.linux.errno(n) != .SUCCESS) return error.WriteError;
+            written += n;
+        }
+    }
+
+    pub fn close(self: SocketPair) void {
+        _ = std.os.linux.close(self.write_fd);
+    }
 };
+
+fn make_stream(fd: std.posix.socket_t) std.Io.net.Stream {
+    return .{ .socket = .{
+        .handle = fd,
+        .address = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+    } };
+}
 
 fn make_socket_pair() !SocketPair {
     var fds: [2]i32 = undefined;
     const rc = std.os.linux.socketpair(std.os.linux.AF.UNIX, std.os.linux.SOCK.STREAM, 0, &fds);
     try std.testing.expectEqual(@as(usize, 0), rc);
-    const read_fd: std.posix.socket_t = @intCast(fds[0]);
-    const write_fd: std.posix.socket_t = @intCast(fds[1]);
     return .{
-        .read_fd = read_fd,
-        .write_stream = std.net.Stream{ .handle = write_fd },
+        .read_fd = @intCast(fds[0]),
+        .write_fd = @intCast(fds[1]),
     };
 }
 
 test "write_response formats multi-line body with request_id prefix per line" {
     const pair = try make_socket_pair();
-    defer std.posix.close(pair.read_fd);
+    defer _ = std.os.linux.close(pair.read_fd);
 
     const req = query.Request{
         .client = 0,
@@ -902,8 +938,8 @@ test "write_response formats multi-line body with request_id prefix per line" {
         .body = "backup.daily planned 1595586600000000000\nbackup.weekly planned 1595586660000000000\n",
     };
 
-    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
-    pair.write_stream.close();
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = make_stream(pair.write_fd) } }, resp);
+    pair.close();
 
     var buf: [512]u8 = undefined;
     const n = try std.posix.read(pair.read_fd, &buf);
@@ -974,7 +1010,7 @@ test "free_instruction_strings frees REMOVE identifier without leak" {
 
 test "write_response appends body when response body is non-null" {
     const pair = try make_socket_pair();
-    defer std.posix.close(pair.read_fd);
+    defer _ = std.os.linux.close(pair.read_fd);
 
     const req = query.Request{
         .client = 0,
@@ -987,8 +1023,8 @@ test "write_response appends body when response body is non-null" {
         .body = "planned 1595586600000000000",
     };
 
-    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
-    pair.write_stream.close();
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = make_stream(pair.write_fd) } }, resp);
+    pair.close();
 
     var buf: [512]u8 = undefined;
     const n = try std.posix.read(pair.read_fd, &buf);
@@ -1025,7 +1061,7 @@ test "build_instruction parses LISTRULES command ignoring trailing args" {
 
 test "write_response formats list_rules multi-line body with request_id prefix" {
     const pair = try make_socket_pair();
-    defer std.posix.close(pair.read_fd);
+    defer _ = std.os.linux.close(pair.read_fd);
 
     const req = query.Request{
         .client = 0,
@@ -1038,8 +1074,8 @@ test "write_response formats list_rules multi-line body with request_id prefix" 
         .body = "rule.backup backup.* shell /usr/bin/backup.sh\nrule.notify notify.* shell /usr/bin/notify.sh\n",
     };
 
-    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
-    pair.write_stream.close();
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = make_stream(pair.write_fd) } }, resp);
+    pair.close();
 
     var buf: [512]u8 = undefined;
     const n = try std.posix.read(pair.read_fd, &buf);
@@ -1052,19 +1088,18 @@ test "write_response formats list_rules multi-line body with request_id prefix" 
 test "handle_connection exits cleanly when client disconnects immediately" {
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
 
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    pair.write_stream.close();
+    pair.close();
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        addr,
+        std.testing.io,
+        Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         42,
         &req_ch,
         &router,
@@ -1075,28 +1110,27 @@ test "handle_connection exits cleanly when client disconnects immediately" {
 test "handle_connection deregisters client from router on disconnect" {
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
 
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    pair.write_stream.close();
+    pair.close();
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        addr,
+        std.testing.io,
+        Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         77,
         &req_ch,
         &router,
         null,
     );
 
-    router.mutex.lock();
+    router.mutex.lockUncancelable(std.testing.io);
     const count = router.channels.count();
-    router.mutex.unlock();
+    router.mutex.unlock(std.testing.io);
     try std.testing.expectEqual(@as(usize, 0), count);
 }
 
@@ -1255,7 +1289,7 @@ test "build_instruction returns null for SET without timestamp" {
 }
 
 test "response router silently ignores response for unregistered client" {
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
     const req = query.Request{
@@ -1268,10 +1302,10 @@ test "response router silently ignores response for unregistered client" {
 }
 
 test "response router drops response on full channel without crash" {
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    var ch = try Channel(query.Response).init(std.testing.allocator, 1);
+    var ch = try Channel(query.Response).init(std.testing.allocator, std.testing.io, 1);
     defer ch.deinit();
 
     const client_id = @as(query.Client, 5);
@@ -1297,19 +1331,18 @@ test "response router drops response on full channel without crash" {
 test "handle_connection passes peer address and exits cleanly" {
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
 
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    pair.write_stream.close();
+    pair.close();
 
-    const addr = try std.net.Address.parseIp("192.168.1.42", 54321);
     handle_connection(
         std.testing.allocator,
-        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        addr,
+        std.testing.io,
+        Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         99,
         &req_ch,
         &router,
@@ -1319,7 +1352,7 @@ test "handle_connection passes peer address and exits cleanly" {
 
 test "write_response formats list_rules empty result as OK only" {
     const pair = try make_socket_pair();
-    defer std.posix.close(pair.read_fd);
+    defer _ = std.os.linux.close(pair.read_fd);
 
     const req = query.Request{
         .client = 0,
@@ -1332,8 +1365,8 @@ test "write_response formats list_rules empty result as OK only" {
         .body = null,
     };
 
-    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
-    pair.write_stream.close();
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = make_stream(pair.write_fd) } }, resp);
+    pair.close();
 
     var buf: [128]u8 = undefined;
     const n = try std.posix.read(pair.read_fd, &buf);
@@ -1343,14 +1376,14 @@ test "write_response formats list_rules empty result as OK only" {
 test "handle_connection forwards SET instruction to request channel" {
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
 
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    try pair.write_stream.writeAll("r1 SET job.backup 1595586600000000000\n");
-    pair.write_stream.close();
+    try pair.writeAll("r1 SET job.backup 1595586600000000000\n");
+    pair.close();
 
     const Context = struct {
         received_tag: []const u8 = "",
@@ -1370,11 +1403,10 @@ test "handle_connection forwards SET instruction to request channel" {
     var ctx = Context{};
     const t = try std.Thread.spawn(.{}, Context.respond, .{ &ctx, &req_ch, &router });
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        addr,
+        std.testing.io,
+        Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         42,
         &req_ch,
         &router,
@@ -1389,14 +1421,14 @@ test "handle_connection forwards SET instruction to request channel" {
 test "handle_connection forwards LISTRULES instruction to request channel" {
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
 
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    try pair.write_stream.writeAll("r2 LISTRULES\n");
-    pair.write_stream.close();
+    try pair.writeAll("r2 LISTRULES\n");
+    pair.close();
 
     const Context = struct {
         received_tag: []const u8 = "",
@@ -1414,11 +1446,10 @@ test "handle_connection forwards LISTRULES instruction to request channel" {
     var ctx = Context{};
     const t = try std.Thread.spawn(.{}, Context.respond, .{ &ctx, &req_ch, &router });
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        addr,
+        std.testing.io,
+        Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         43,
         &req_ch,
         &router,
@@ -1433,10 +1464,10 @@ test "handle_connection forwards LISTRULES instruction to request channel" {
 test "plain Connection read returns data from underlying socket" {
     const pair = try make_socket_pair();
 
-    try pair.write_stream.writeAll("hello");
-    pair.write_stream.close();
+    try pair.writeAll("hello");
+    pair.close();
 
-    const conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } };
+    const conn = Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } };
     var buf: [16]u8 = undefined;
     const n = try conn.read(&buf);
     try std.testing.expectEqualStrings("hello", buf[0..n]);
@@ -1444,9 +1475,9 @@ test "plain Connection read returns data from underlying socket" {
 
 test "plain Connection write delivers data through socket" {
     const pair = try make_socket_pair();
-    defer std.posix.close(pair.read_fd);
+    defer _ = std.os.linux.close(pair.read_fd);
 
-    const conn = Connection{ .plain = .{ .stream = pair.write_stream } };
+    const conn = Connection{ .plain = .{ .stream = make_stream(pair.write_fd) } };
     _ = try conn.write("world");
     conn.close();
 
@@ -1457,9 +1488,9 @@ test "plain Connection write delivers data through socket" {
 
 test "write_response accepts plain Connection and formats OK response" {
     const pair = try make_socket_pair();
-    defer std.posix.close(pair.read_fd);
+    defer _ = std.os.linux.close(pair.read_fd);
 
-    const conn = Connection{ .plain = .{ .stream = pair.write_stream } };
+    const conn = Connection{ .plain = .{ .stream = make_stream(pair.write_fd) } };
     const req = query.Request{
         .client = 0,
         .identifier = "r1",
@@ -1478,19 +1509,18 @@ test "write_response accepts plain Connection and formats OK response" {
 test "handle_connection accepts plain Connection and exits cleanly" {
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
 
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    pair.write_stream.close();
+    pair.close();
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        addr,
+        std.testing.io,
+        Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         100,
         &req_ch,
         &router,
@@ -1511,11 +1541,12 @@ test "tcp server set_instruments makes instruments non-null" {
     var active = std.atomic.Value(usize).init(0);
     var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active, null);
 
-    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator);
+    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator, std.testing.io);
     defer meter_provider.shutdown();
     const tracer_provider = try sdk.trace.TracerProvider.init(
         std.testing.allocator,
-        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(std.crypto.random) },
+        std.testing.io,
+        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init((std.Random.IoSource{ .io = std.testing.io }).interface()) },
     );
     defer tracer_provider.shutdown();
     const instruments = try telemetry.createInstruments(meter_provider, tracer_provider);
@@ -1528,31 +1559,31 @@ test "connection_worker decrements active_connections on exit" {
     const sdk = @import("opentelemetry");
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
 
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator);
+    const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator, std.testing.io);
     defer meter_provider.shutdown();
     const tracer_provider = try sdk.trace.TracerProvider.init(
         std.testing.allocator,
-        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init(std.crypto.random) },
+        std.testing.io,
+        sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init((std.Random.IoSource{ .io = std.testing.io }).interface()) },
     );
     defer tracer_provider.shutdown();
     const instruments = try telemetry.createInstruments(meter_provider, tracer_provider);
 
     var active = std.atomic.Value(usize).init(1);
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
 
-    pair.write_stream.close();
+    pair.close();
     connection_worker(
         &active,
         instruments,
         std.testing.allocator,
-        std.net.Stream{ .handle = pair.read_fd },
-        addr,
+        std.testing.io,
+        make_stream(pair.read_fd),
         200,
         &req_ch,
         &router,
@@ -1598,7 +1629,7 @@ test "free_instruction_strings does not leak for stat instruction" {
 
 test "write_response formats stat multi-line metrics body with request_id prefix" {
     const pair = try make_socket_pair();
-    defer std.posix.close(pair.read_fd);
+    defer _ = std.os.linux.close(pair.read_fd);
 
     const req = query.Request{
         .client = 0,
@@ -1611,8 +1642,8 @@ test "write_response formats stat multi-line metrics body with request_id prefix
         .body = "uptime_ns 60000000000\nconnections 1\njobs_total 5\n",
     };
 
-    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
-    pair.write_stream.close();
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = make_stream(pair.write_fd) } }, resp);
+    pair.close();
 
     var buf: [512]u8 = undefined;
     const n = try std.posix.read(pair.read_fd, &buf);
@@ -1625,7 +1656,7 @@ test "write_response formats stat multi-line metrics body with request_id prefix
 
 test "write_response formats stat error response as ERROR line" {
     const pair = try make_socket_pair();
-    defer std.posix.close(pair.read_fd);
+    defer _ = std.os.linux.close(pair.read_fd);
 
     const req = query.Request{
         .client = 0,
@@ -1639,8 +1670,8 @@ test "write_response formats stat error response as ERROR line" {
         .error_code = .internal,
     };
 
-    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
-    pair.write_stream.close();
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = make_stream(pair.write_fd) } }, resp);
+    pair.close();
 
     var buf: [64]u8 = undefined;
     const n = try std.posix.read(pair.read_fd, &buf);
@@ -1649,7 +1680,7 @@ test "write_response formats stat error response as ERROR line" {
 
 test "write_response formats error with code and message for single-entity instruction" {
     const pair = try make_socket_pair();
-    defer std.posix.close(pair.read_fd);
+    defer _ = std.os.linux.close(pair.read_fd);
 
     const req = query.Request{
         .client = 0,
@@ -1663,8 +1694,8 @@ test "write_response formats error with code and message for single-entity instr
         .error_message = "job \"x\" does not exist",
     };
 
-    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
-    pair.write_stream.close();
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = make_stream(pair.write_fd) } }, resp);
+    pair.close();
 
     var buf: [128]u8 = undefined;
     const n = try std.posix.read(pair.read_fd, &buf);
@@ -1673,7 +1704,7 @@ test "write_response formats error with code and message for single-entity instr
 
 test "write_response formats error with code only when message is null" {
     const pair = try make_socket_pair();
-    defer std.posix.close(pair.read_fd);
+    defer _ = std.os.linux.close(pair.read_fd);
 
     const req = query.Request{
         .client = 0,
@@ -1687,8 +1718,8 @@ test "write_response formats error with code only when message is null" {
         .error_message = null,
     };
 
-    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = pair.write_stream } }, resp);
-    pair.write_stream.close();
+    try write_response(std.testing.allocator, Connection{ .plain = .{ .stream = make_stream(pair.write_fd) } }, resp);
+    pair.close();
 
     var buf: [64]u8 = undefined;
     const n = try std.posix.read(pair.read_fd, &buf);
@@ -1698,14 +1729,14 @@ test "write_response formats error with code only when message is null" {
 test "handle_connection forwards STAT instruction to request channel" {
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
 
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    try pair.write_stream.writeAll("r3 STAT\n");
-    pair.write_stream.close();
+    try pair.writeAll("r3 STAT\n");
+    pair.close();
 
     const Context = struct {
         received_tag: []const u8 = "",
@@ -1722,11 +1753,10 @@ test "handle_connection forwards STAT instruction to request channel" {
     var ctx = Context{};
     const t = try std.Thread.spawn(.{}, Context.respond, .{ &ctx, &req_ch, &router });
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        addr,
+        std.testing.io,
+        Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         44,
         &req_ch,
         &router,
@@ -1741,22 +1771,21 @@ test "handle_connection forwards STAT instruction to request channel" {
 test "connection_worker with null instruments decrements active_connections on exit" {
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
 
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
     var active = std.atomic.Value(usize).init(1);
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
 
-    pair.write_stream.close();
+    pair.close();
     connection_worker(
         &active,
         null,
         std.testing.allocator,
-        std.net.Stream{ .handle = pair.read_fd },
-        addr,
+        std.testing.io,
+        make_stream(pair.read_fd),
         201,
         &req_ch,
         &router,
@@ -1770,14 +1799,14 @@ test "connection_worker with null instruments decrements active_connections on e
 test "handle_connection forwards stat bypassing namespace authorization without sending error" {
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
 
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    try pair.write_stream.writeAll("r99 STAT\n");
-    pair.write_stream.close();
+    try pair.writeAll("r99 STAT\n");
+    pair.close();
 
     const Context = struct {
         forwarded: bool = false,
@@ -1794,11 +1823,10 @@ test "handle_connection forwards stat bypassing namespace authorization without 
     var ctx = Context{};
     const t = try std.Thread.spawn(.{}, Context.respond, .{ &ctx, &req_ch, &router });
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        addr,
+        std.testing.io,
+        Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         202,
         &req_ch,
         &router,
@@ -2019,14 +2047,14 @@ test "free_instruction_strings frees rule_set http runner strings without leak" 
 test "handle_connection forwards non-stat instruction through namespace authorization check" {
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
 
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    try pair.write_stream.writeAll("r100 QUERY jobs\n");
-    pair.write_stream.close();
+    try pair.writeAll("r100 QUERY jobs\n");
+    pair.close();
 
     const Context = struct {
         forwarded: bool = false,
@@ -2043,11 +2071,10 @@ test "handle_connection forwards non-stat instruction through namespace authoriz
     var ctx = Context{};
     const t = try std.Thread.spawn(.{}, Context.respond, .{ &ctx, &req_ch, &router });
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     handle_connection(
         std.testing.allocator,
-        Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        addr,
+        std.testing.io,
+        Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         203,
         &req_ch,
         &router,
@@ -2072,7 +2099,6 @@ fn poll_for_response(fd: std.posix.socket_t, buf: []u8, timeout_ms: i32) !usize 
 
 const HCThread = struct {
     conn: Connection,
-    addr: std.net.Address,
     client_id: u128,
     req_ch: *Channel(query.Request),
     router: *ResponseRouter,
@@ -2081,8 +2107,8 @@ const HCThread = struct {
     fn run(self: @This()) void {
         handle_connection(
             std.testing.allocator,
+            std.testing.io,
             self.conn,
-            self.addr,
             self.client_id,
             self.req_ch,
             self.router,
@@ -2115,27 +2141,25 @@ test "handle_connection AUTH with valid token responds OK" {
 
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    try pair.write_stream.writeAll("AUTH sk_deploy_abc\n");
+    try pair.writeAll("AUTH sk_deploy_abc\n");
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
-        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        .addr = addr,
+        .conn = Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         .client_id = 300,
         .req_ch = &req_ch,
         .router = &router,
         .store = @as(?*TokenStore, &store),
     }});
     defer t.join();
-    defer pair.write_stream.close();
+    defer pair.close();
 
     var buf: [64]u8 = undefined;
-    const n = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    const n = try poll_for_response(pair.write_fd, &buf, 500);
     try std.testing.expect(n > 0);
     try std.testing.expectEqualStrings("OK\n", buf[0..n]);
 }
@@ -2146,27 +2170,25 @@ test "handle_connection AUTH with invalid token responds ERROR and closes connec
 
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
-    try pair.write_stream.writeAll("AUTH bad_secret_xyz\n");
+    try pair.writeAll("AUTH bad_secret_xyz\n");
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
-        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        .addr = addr,
+        .conn = Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         .client_id = 301,
         .req_ch = &req_ch,
         .router = &router,
         .store = @as(?*TokenStore, &store),
     }});
     defer t.join();
-    defer pair.write_stream.close();
+    defer pair.close();
 
     var buf: [64]u8 = undefined;
-    const n = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    const n = try poll_for_response(pair.write_fd, &buf, 500);
     try std.testing.expect(n > 0);
     try std.testing.expectEqualStrings("ERROR auth_failed\n", buf[0..n]);
 }
@@ -2181,9 +2203,9 @@ test "handle_connection non-AUTH first command responds ERROR and closes connect
 
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
     const sched = EchoScheduler{ .req_ch = &req_ch, .router = &router };
@@ -2191,22 +2213,20 @@ test "handle_connection non-AUTH first command responds ERROR and closes connect
     defer t_sched.join();
     defer req_ch.close();
 
-    try pair.write_stream.writeAll("r1 SET deploy.job 12345\n");
+    try pair.writeAll("r1 SET deploy.job 12345\n");
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
-        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        .addr = addr,
+        .conn = Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         .client_id = 302,
         .req_ch = &req_ch,
         .router = &router,
         .store = @as(?*TokenStore, &store),
     }});
     defer t.join();
-    defer pair.write_stream.close();
+    defer pair.close();
 
     var buf: [64]u8 = undefined;
-    const n = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    const n = try poll_for_response(pair.write_fd, &buf, 500);
     try std.testing.expect(n > 0);
     try std.testing.expectEqualStrings("ERROR auth_required\n", buf[0..n]);
 }
@@ -2221,9 +2241,9 @@ test "handle_connection command within namespace is accepted after AUTH" {
 
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
     const sched = EchoScheduler{ .req_ch = &req_ch, .router = &router };
@@ -2231,29 +2251,27 @@ test "handle_connection command within namespace is accepted after AUTH" {
     defer t_sched.join();
     defer req_ch.close();
 
-    try pair.write_stream.writeAll("AUTH sk_deploy_ns\n");
+    try pair.writeAll("AUTH sk_deploy_ns\n");
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
-        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        .addr = addr,
+        .conn = Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         .client_id = 303,
         .req_ch = &req_ch,
         .router = &router,
         .store = @as(?*TokenStore, &store),
     }});
     defer t.join();
-    defer pair.write_stream.close();
+    defer pair.close();
 
     var buf: [128]u8 = undefined;
-    const n_auth = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    const n_auth = try poll_for_response(pair.write_fd, &buf, 500);
     try std.testing.expect(n_auth > 0);
     try std.testing.expectEqualStrings("OK\n", buf[0..n_auth]);
 
-    try pair.write_stream.writeAll("r1 SET deploy.release.1 12345\n");
+    try pair.writeAll("r1 SET deploy.release.1 12345\n");
 
     var buf2: [64]u8 = undefined;
-    const n_cmd = try poll_for_response(pair.write_stream.handle, &buf2, 500);
+    const n_cmd = try poll_for_response(pair.write_fd, &buf2, 500);
     try std.testing.expect(n_cmd > 0);
     try std.testing.expectEqualStrings("r1 OK\n", buf2[0..n_cmd]);
 }
@@ -2268,9 +2286,9 @@ test "handle_connection command outside namespace responds ERROR after AUTH" {
 
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
     const sched = EchoScheduler{ .req_ch = &req_ch, .router = &router };
@@ -2278,29 +2296,27 @@ test "handle_connection command outside namespace responds ERROR after AUTH" {
     defer t_sched.join();
     defer req_ch.close();
 
-    try pair.write_stream.writeAll("AUTH sk_deploy_ns2\n");
+    try pair.writeAll("AUTH sk_deploy_ns2\n");
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
-        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        .addr = addr,
+        .conn = Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         .client_id = 304,
         .req_ch = &req_ch,
         .router = &router,
         .store = @as(?*TokenStore, &store),
     }});
     defer t.join();
-    defer pair.write_stream.close();
+    defer pair.close();
 
     var buf: [64]u8 = undefined;
-    const n_auth = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    const n_auth = try poll_for_response(pair.write_fd, &buf, 500);
     try std.testing.expect(n_auth > 0);
     try std.testing.expectEqualStrings("OK\n", buf[0..n_auth]);
 
-    try pair.write_stream.writeAll("r2 SET backup.daily 12345\n");
+    try pair.writeAll("r2 SET backup.daily 12345\n");
 
     var buf2: [64]u8 = undefined;
-    const n_cmd = try poll_for_response(pair.write_stream.handle, &buf2, 500);
+    const n_cmd = try poll_for_response(pair.write_fd, &buf2, 500);
     try std.testing.expect(n_cmd > 0);
     try std.testing.expectEqualStrings("r2 ERROR auth_denied insufficient namespace scope\n", buf2[0..n_cmd]);
 }
@@ -2315,9 +2331,9 @@ test "handle_connection QUERY results filtered to client namespace after AUTH" {
 
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
     const QueryScheduler = struct {
@@ -2341,31 +2357,29 @@ test "handle_connection QUERY results filtered to client namespace after AUTH" {
     defer t_sched.join();
     defer req_ch.close();
 
-    try pair.write_stream.writeAll("AUTH sk_deploy_query\n");
+    try pair.writeAll("AUTH sk_deploy_query\n");
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
-        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        .addr = addr,
+        .conn = Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         .client_id = 305,
         .req_ch = &req_ch,
         .router = &router,
         .store = @as(?*TokenStore, &store),
     }});
     defer t.join();
-    defer pair.write_stream.close();
+    defer pair.close();
 
     var buf: [64]u8 = undefined;
-    const n_auth = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    const n_auth = try poll_for_response(pair.write_fd, &buf, 500);
     try std.testing.expect(n_auth > 0);
     try std.testing.expectEqualStrings("OK\n", buf[0..n_auth]);
 
-    try pair.write_stream.writeAll("r3 QUERY *\n");
+    try pair.writeAll("r3 QUERY *\n");
 
     var resp_buf: [512]u8 = undefined;
     var total: usize = 0;
     for (0..10) |_| {
-        const n = try poll_for_response(pair.write_stream.handle, resp_buf[total..], 200);
+        const n = try poll_for_response(pair.write_fd, resp_buf[total..], 200);
         if (n == 0) break;
         total += n;
         if (std.mem.endsWith(u8, resp_buf[0..total], "r3 OK\n")) break;
@@ -2386,9 +2400,9 @@ test "handle_connection RULE SET with identifier in namespace succeeds regardles
 
     const pair = try make_socket_pair();
 
-    var req_ch = try Channel(query.Request).init(std.testing.allocator, 4);
+    var req_ch = try Channel(query.Request).init(std.testing.allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var router = ResponseRouter.init(std.testing.allocator);
+    var router = ResponseRouter.init(std.testing.allocator, std.testing.io);
     defer router.deinit();
 
     const sched = EchoScheduler{ .req_ch = &req_ch, .router = &router };
@@ -2396,29 +2410,27 @@ test "handle_connection RULE SET with identifier in namespace succeeds regardles
     defer t_sched.join();
     defer req_ch.close();
 
-    try pair.write_stream.writeAll("AUTH sk_deploy_rule\n");
+    try pair.writeAll("AUTH sk_deploy_rule\n");
 
-    const addr = try std.net.Address.parseIp("127.0.0.1", 12345);
     const t = try std.Thread.spawn(.{}, HCThread.run, .{HCThread{
-        .conn = Connection{ .plain = .{ .stream = std.net.Stream{ .handle = pair.read_fd } } },
-        .addr = addr,
+        .conn = Connection{ .plain = .{ .stream = make_stream(pair.read_fd) } },
         .client_id = 306,
         .req_ch = &req_ch,
         .router = &router,
         .store = @as(?*TokenStore, &store),
     }});
     defer t.join();
-    defer pair.write_stream.close();
+    defer pair.close();
 
     var buf: [64]u8 = undefined;
-    const n_auth = try poll_for_response(pair.write_stream.handle, &buf, 500);
+    const n_auth = try poll_for_response(pair.write_fd, &buf, 500);
     try std.testing.expect(n_auth > 0);
     try std.testing.expectEqualStrings("OK\n", buf[0..n_auth]);
 
-    try pair.write_stream.writeAll("r4 RULE SET deploy.rule backup. shell echo ok\n");
+    try pair.writeAll("r4 RULE SET deploy.rule backup. shell echo ok\n");
 
     var buf2: [64]u8 = undefined;
-    const n_cmd = try poll_for_response(pair.write_stream.handle, &buf2, 500);
+    const n_cmd = try poll_for_response(pair.write_fd, &buf2, 500);
     try std.testing.expect(n_cmd > 0);
     try std.testing.expectEqualStrings("r4 OK\n", buf2[0..n_cmd]);
 }

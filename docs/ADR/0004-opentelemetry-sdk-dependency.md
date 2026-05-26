@@ -13,21 +13,21 @@ F010 adds OpenTelemetry instrumentation to ztick (metrics, traces, structured lo
 
 ADR-0002 established a zero-external-dependency philosophy (`build.zig.zon dependencies = .{}`). ADR-0003 extended this by noting system libraries (OpenSSL via `@cImport`) don't count as Zig packages. However, F010's OTLP serialization, protobuf encoding, and OTel-spec-compliant data model are substantial enough that hand-rolling them provides no unique value and introduces spec-conformance risk.
 
-The `zig-o11y/opentelemetry-sdk` (v0.1.1) is a community-backed Zig OpenTelemetry SDK originating from an official OTel community proposal. It targets Zig 0.15.2 (matching ztick), is fetchable via `zig fetch --save`, and provides all three signals with OTLP/HTTP JSON and protobuf transport.
+The `zig-o11y/opentelemetry-sdk` (v0.2.0) is a community-backed Zig OpenTelemetry SDK originating from an official OTel community proposal. It targets Zig 0.16.0 (matching ztick), is fetchable via `zig fetch --save`, and provides all three signals with OTLP/HTTP JSON and protobuf transport.
 
 ## Candidates
 
 | Option | Pros | Cons |
 |--------|------|------|
-| **zig-o11y/opentelemetry-sdk** | OTel community-backed; Zig 0.15.2 compatible; fetchable; all 3 signals + OTLP exporters + std.log bridge; MIT license | 3 transitive deps (zig-protobuf, opentelemetry-proto, zlib); alpha (v0.1.1); breaks `dependencies = .{}` |
+| **zig-o11y/opentelemetry-sdk** | OTel community-backed; Zig 0.16.0 compatible; fetchable; all 3 signals + OTLP exporters + std.log bridge; MIT license | 3 transitive deps (zig-protobuf, opentelemetry-proto, zlib); stable (v0.2.0); breaks `dependencies = .{}` |
 | **ibd1279/otel-zig** | All 3 signals; similar scope | Local path dep on zig-protobuf (not fetchable); v0.0.1; 6 stars; single maintainer |
 | **Hand-rolled stdlib-only** | Zero dependencies; full control | High implementation cost (OTLP JSON, protobuf, metric registry, span model); spec-conformance risk; duplicates well-solved problems |
 
 ## Decision
 
-Adopt **zig-o11y/opentelemetry-sdk v0.1.1** as a Zig package dependency for F010.
+Adopt **zig-o11y/opentelemetry-sdk v0.2.0** as a Zig package dependency for F010.
 
-- Add to `build.zig.zon` via `zig fetch --save "git+https://github.com/zig-o11y/opentelemetry-sdk#v0.1.1"`
+- Add to `build.zig.zon` via `zig fetch --save "git+https://github.com/zig-o11y/opentelemetry-sdk#v0.2.0"`
 - Use `sdk.metrics` for Counter, Histogram, Gauge instruments
 - Use `sdk.trace` for Span lifecycle and TracerProvider
 - Use `sdk.logs` with std.log bridge for OTLP log export
@@ -52,8 +52,8 @@ This is the first Zig package dependency in `build.zig.zon`, superseding the zer
 
 ## Trade-offs Accepted
 
-- **Alpha status**: v0.1.1 is explicitly alpha. Mitigated by: pinning to exact version tag; telemetry is non-critical path (ztick functions normally with telemetry disabled); SDK isolatedto infrastructure layer for easy replacement.
-- **Transitive dependencies**: 3 packages added. Mitigated by: all are well-scoped (protobuf codec, proto definitions, compression); zlib targeted for removal in Zig 0.16 (stdlib deflate).
+- **Stable but evolving API**: v0.2.0 is stable. Mitigated by: pinning to exact version tag; telemetry is non-critical path (ztick functions normally with telemetry disabled); SDK isolated to infrastructure layer for easy replacement.
+- **Transitive dependencies**: 3 packages added. Mitigated by: all are well-scoped (protobuf codec, proto definitions, compression).
 - **Breaking ADR-0002**: The zero-dependency invariant served ztick well through F001-F009. OpenTelemetry is a standardized, complex protocol where hand-rolling provides negative value. This is a principled exception, not abandonment of minimalism.
 
 ## Constitution Compliance

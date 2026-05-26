@@ -30,15 +30,14 @@ var runtime_log_level: ?std.log.Level = null;
 
 var global_running: *std.atomic.Value(bool) = undefined;
 var global_listen_fd: std.atomic.Value(std.posix.socket_t) = std.atomic.Value(std.posix.socket_t).init(-1);
+var global_http_listen_fd: std.atomic.Value(std.posix.socket_t) = std.atomic.Value(std.posix.socket_t).init(-1);
 
-fn signal_handler(_: c_int) callconv(.c) void {
+fn signal_handler(_: std.os.linux.SIG) callconv(.c) void {
     global_running.store(false, .release);
-    // shutdown() (not close()) unblocks a thread blocked in accept() on Linux.
-    // close() from a different thread does not reliably interrupt accept().
-    // We load (not swap) the fd because TcpServer.start() owns the close;
-    // we only need to trigger the return from accept().
     const fd = global_listen_fd.load(.acquire);
-    if (fd != -1) std.posix.shutdown(fd, .both) catch {};
+    if (fd != -1) _ = std.os.linux.shutdown(fd, 2);
+    const http_fd = global_http_listen_fd.load(.acquire);
+    if (http_fd != -1) _ = std.os.linux.shutdown(http_fd, 2);
 }
 
 pub const std_options = std.Options{
@@ -65,17 +64,16 @@ fn log_fn_write(
 
 fn log_fn(
     comptime level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: anytype,
     comptime format: []const u8,
     args: anytype,
 ) void {
     _ = scope;
-    std.debug.lockStdErr();
-    defer std.debug.unlockStdErr();
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
-    log_fn_write(&w.interface, level, format, args);
-    w.interface.flush() catch {};
+    var w = std.Io.Writer.fixed(&buf);
+    log_fn_write(&w, level, format, args);
+    const msg = w.buffered();
+    if (msg.len > 0) _ = std.os.linux.write(2, msg.ptr, msg.len);
 }
 
 const Channel = infrastructure_channel.Channel;
@@ -106,6 +104,7 @@ fn log_level_to_std(level: interfaces_config.LogLevel) ?std.log.Level {
 
 const ControllerContext = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     address: []const u8,
     request_ch: *Channel(query.Request),
     response_router: *ResponseRouter,
@@ -121,6 +120,7 @@ const ControllerContext = struct {
 
 const DatabaseContext = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     framerate: u16,
     /// The raw backend is stored here so run_database can wrap it in BackendState.
     backend: persistence_backend.PersistenceBackend,
@@ -139,6 +139,7 @@ const DatabaseContext = struct {
 
 const ProcessorContext = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     exec_request_ch: *Channel(execution.Request),
     exec_response_ch: *Channel(execution.Response),
     shell_config: interfaces_config.ShellConfig,
@@ -146,23 +147,27 @@ const ProcessorContext = struct {
 
 const HttpControllerContext = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     address: []const u8,
     request_ch: *Channel(query.Request),
     response_router: *ResponseRouter,
     running: *std.atomic.Value(bool),
     bearer_token: ?[]const u8,
+    signal_listen_fd: *std.atomic.Value(std.posix.socket_t),
 };
 
 fn run_http_controller(ctx: HttpControllerContext) void {
     var server = infrastructure_http.HttpServer.init(
         ctx.allocator,
+        ctx.io,
         ctx.address,
         ctx.running,
         ctx.request_ch,
         ctx.response_router,
         ctx.bearer_token,
     );
-    server.start() catch |err| {
+    server.signal_listen_fd = ctx.signal_listen_fd;
+    server.start(ctx.io) catch |err| {
         std.log.err("http controller: start failed: {}", .{err});
         return;
     };
@@ -174,23 +179,23 @@ fn run_controller(ctx: ControllerContext) void {
     server.signal_listen_fd = ctx.signal_listen_fd;
     if (ctx.instruments) |instr| server.set_instruments(instr);
     defer server.deinit();
-    server.start(ctx.request_ch, ctx.response_router) catch |err| {
+    server.start(ctx.io, ctx.request_ch, ctx.response_router) catch |err| {
         std.log.err("controller: start failed: {}", .{err});
         return;
     };
-    server.join_all();
+    server.join_all(ctx.io);
 }
 
-pub fn compress_startup_leftover(allocator: std.mem.Allocator, backend: persistence_backend.PersistenceBackend) void {
+pub fn compress_startup_leftover(io: std.Io, allocator: std.mem.Allocator, backend: persistence_backend.PersistenceBackend) void {
     const lf = switch (backend) {
         .logfile => |lf| lf,
         .memory => return,
     };
     const dir = lf.logfile_dir orelse return;
     const filenames = infrastructure_persistence_background.Filenames{};
-    const f = dir.openFile(filenames.source, .{}) catch return;
-    f.close();
-    infrastructure_persistence_background.compress(allocator, dir, filenames) catch {
+    const f = dir.openFile(io, filenames.source, .{}) catch return;
+    f.close(io);
+    infrastructure_persistence_background.compress(allocator, io, dir, filenames) catch {
         std.log.warn("startup: leftover .to_compress compression failed", .{});
     };
 }
@@ -201,30 +206,30 @@ fn run_database(ctx: DatabaseContext) void {
     scheduler.persistence = backend_state;
     scheduler.compression_interval_ns = ctx.compression_interval_ns;
     if (ctx.instruments) |instr| scheduler.set_instruments(instr);
-    scheduler.set_stat_context(ctx.startup_ns, ctx.active_connections, ctx.auth_enabled, ctx.tls_enabled, ctx.framerate);
+    scheduler.set_stat_context(ctx.io, ctx.startup_ns, ctx.active_connections, ctx.auth_enabled, ctx.tls_enabled, ctx.framerate);
     defer scheduler.deinit();
 
     scheduler.load(ctx.allocator) catch |err| {
         std.log.warn("database: load failed: {}", .{err});
     };
 
-    compress_startup_leftover(ctx.allocator, ctx.backend);
+    compress_startup_leftover(ctx.io, ctx.allocator, ctx.backend);
     std.log.info("loaded {d} jobs, {d} rules", .{
         scheduler.job_storage.count(),
         scheduler.rule_storage.count(),
     });
 
-    var wake_mutex = std.Thread.Mutex{};
-    var wake_condition = std.Thread.Condition{};
-    ctx.request_ch.notify_condition = &wake_condition;
-    const clock = Clock.init(ctx.framerate, ctx.running);
+    var wake_mutex: std.Io.Mutex = .init;
+    var wake_token = std.atomic.Value(u32).init(0);
+    ctx.request_ch.wake_token = &wake_token;
+    const clock = Clock.init(ctx.framerate, ctx.running, ctx.io);
     clock.start(TickContext{
         .scheduler = &scheduler,
         .request_ch = ctx.request_ch,
         .response_router = ctx.response_router,
         .exec_request_ch = ctx.exec_request_ch,
         .exec_response_ch = ctx.exec_response_ch,
-    }, TickContext.tick, &wake_mutex, &wake_condition);
+    }, TickContext.tick, &wake_mutex, &wake_token);
 }
 
 const TickContext = struct {
@@ -248,7 +253,9 @@ const TickContext = struct {
             self.response_router.route(response);
         }
 
-        const now: i64 = @intCast(std.time.nanoTimestamp());
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.REALTIME, &ts);
+        const now: i64 = @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
         self.scheduler.tick(now) catch return null;
 
         self.scheduler.execution_client.drain_pending(self.exec_request_ch);
@@ -259,7 +266,7 @@ const TickContext = struct {
 
 fn run_processor(ctx: ProcessorContext) void {
     while (ctx.exec_request_ch.receive()) |req| {
-        const resp = infrastructure_runner.execute(ctx.allocator, ctx.shell_config, req);
+        const resp = infrastructure_runner.execute(ctx.io, ctx.allocator, ctx.shell_config, req);
         ctx.exec_response_ch.send(resp) catch |err| {
             std.log.err("processor: response channel full, dropping response: {}", .{err});
             return;
@@ -290,9 +297,9 @@ test "log output is written when message level meets configured threshold" {
     defer runtime_log_level = saved;
     runtime_log_level = .info;
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    log_fn_write(fbs.writer(), .info, "test message", .{});
-    try std.testing.expect(fbs.getWritten().len > 0);
+    var w = std.Io.Writer.fixed(&buf);
+    log_fn_write(&w, .info, "test message", .{});
+    try std.testing.expect(buf[0..w.end].len > 0);
 }
 
 test "log output uses bracket-level prefix and newline terminator" {
@@ -300,9 +307,9 @@ test "log output uses bracket-level prefix and newline terminator" {
     defer runtime_log_level = saved;
     runtime_log_level = .info;
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    log_fn_write(fbs.writer(), .info, "hello {s}", .{"world"});
-    try std.testing.expectEqualStrings("[INFO] hello world\n", fbs.getWritten());
+    var w = std.Io.Writer.fixed(&buf);
+    log_fn_write(&w, .info, "hello {s}", .{"world"});
+    try std.testing.expectEqualStrings("[INFO] hello world\n", buf[0..w.end]);
 }
 
 test "log output formats error level as [ERROR] prefix" {
@@ -310,9 +317,9 @@ test "log output formats error level as [ERROR] prefix" {
     defer runtime_log_level = saved;
     runtime_log_level = .err;
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    log_fn_write(fbs.writer(), .err, "critical failure", .{});
-    try std.testing.expectEqualStrings("[ERROR] critical failure\n", fbs.getWritten());
+    var w = std.Io.Writer.fixed(&buf);
+    log_fn_write(&w, .err, "critical failure", .{});
+    try std.testing.expectEqualStrings("[ERROR] critical failure\n", buf[0..w.end]);
 }
 
 test "log output is suppressed when message level is below configured threshold" {
@@ -320,9 +327,9 @@ test "log output is suppressed when message level is below configured threshold"
     defer runtime_log_level = saved;
     runtime_log_level = .warn;
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    log_fn_write(fbs.writer(), .info, "should not appear", .{});
-    try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
+    var w = std.Io.Writer.fixed(&buf);
+    log_fn_write(&w, .info, "should not appear", .{});
+    try std.testing.expectEqual(@as(usize, 0), buf[0..w.end].len);
 }
 
 test "startup log shows zero counts on empty database" {
@@ -330,9 +337,9 @@ test "startup log shows zero counts on empty database" {
     defer runtime_log_level = saved;
     runtime_log_level = .info;
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    log_fn_write(fbs.writer(), .info, "loaded {d} jobs, {d} rules", .{ @as(usize, 0), @as(usize, 0) });
-    try std.testing.expectEqualStrings("[INFO] loaded 0 jobs, 0 rules\n", fbs.getWritten());
+    var w = std.Io.Writer.fixed(&buf);
+    log_fn_write(&w, .info, "loaded {d} jobs, {d} rules", .{ @as(usize, 0), @as(usize, 0) });
+    try std.testing.expectEqualStrings("[INFO] loaded 0 jobs, 0 rules\n", buf[0..w.end]);
 }
 
 test "startup log shows actual job and rule counts" {
@@ -340,9 +347,9 @@ test "startup log shows actual job and rule counts" {
     defer runtime_log_level = saved;
     runtime_log_level = .info;
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    log_fn_write(fbs.writer(), .info, "loaded {d} jobs, {d} rules", .{ @as(usize, 3), @as(usize, 2) });
-    try std.testing.expectEqualStrings("[INFO] loaded 3 jobs, 2 rules\n", fbs.getWritten());
+    var w = std.Io.Writer.fixed(&buf);
+    log_fn_write(&w, .info, "loaded {d} jobs, {d} rules", .{ @as(usize, 3), @as(usize, 2) });
+    try std.testing.expectEqualStrings("[INFO] loaded 3 jobs, 2 rules\n", buf[0..w.end]);
 }
 
 test "startup log is suppressed when log level is off" {
@@ -350,16 +357,16 @@ test "startup log is suppressed when log level is off" {
     defer runtime_log_level = saved;
     runtime_log_level = null;
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    log_fn_write(fbs.writer(), .info, "loaded {d} jobs, {d} rules", .{ @as(usize, 5), @as(usize, 3) });
-    try std.testing.expectEqual(@as(usize, 0), fbs.getWritten().len);
+    var w = std.Io.Writer.fixed(&buf);
+    log_fn_write(&w, .info, "loaded {d} jobs, {d} rules", .{ @as(usize, 5), @as(usize, 3) });
+    try std.testing.expectEqual(@as(usize, 0), buf[0..w.end].len);
 }
 
 test "processor thread routes execution request to response channel" {
     const allocator = std.testing.allocator;
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
 
     const req = execution.Request{
@@ -371,6 +378,7 @@ test "processor thread routes execution request to response channel" {
 
     const thread = try std.Thread.spawn(.{}, run_processor, .{ProcessorContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
         .shell_config = .{ .path = "/bin/sh", .args = &.{"-c"} },
@@ -392,14 +400,14 @@ test "run_dump returns FileNotFound for nonexistent logfile" {
         .compact = false,
         .follow = false,
     };
-    try std.testing.expectError(interfaces_dump.DumpError.FileNotFound, interfaces_dump.run_dump(allocator, options));
+    try std.testing.expectError(interfaces_dump.DumpError.FileNotFound, interfaces_dump.run_dump(allocator, options, std.testing.io));
 }
 
 test "processor thread propagates shell failure to response channel" {
     const allocator = std.testing.allocator;
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
 
     const req = execution.Request{
@@ -411,6 +419,7 @@ test "processor thread propagates shell failure to response channel" {
 
     const thread = try std.Thread.spawn(.{}, run_processor, .{ProcessorContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
         .shell_config = .{ .path = "/bin/sh", .args = &.{"-c"} },
@@ -426,9 +435,9 @@ test "processor thread propagates shell failure to response channel" {
 
 test "processor thread uses configured shell path from ProcessorContext" {
     const allocator = std.testing.allocator;
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
 
     // /bin/false as the shell means any command will exit non-zero,
@@ -442,6 +451,7 @@ test "processor thread uses configured shell path from ProcessorContext" {
 
     const thread = try std.Thread.spawn(.{}, run_processor, .{ProcessorContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
         .shell_config = .{ .path = "/bin/false", .args = &.{"-c"} },
@@ -457,9 +467,9 @@ test "processor thread uses configured shell path from ProcessorContext" {
 
 test "processor thread executes direct runner request via ProcessorContext" {
     const allocator = std.testing.allocator;
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
 
     const req = execution.Request{
@@ -471,6 +481,7 @@ test "processor thread executes direct runner request via ProcessorContext" {
 
     const thread = try std.Thread.spawn(.{}, run_processor, .{ProcessorContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .exec_request_ch = &exec_req_ch,
         .exec_response_ch = &exec_resp_ch,
         .shell_config = .{ .path = "/bin/sh", .args = &.{"-c"} },
@@ -486,9 +497,9 @@ test "processor thread executes direct runner request via ProcessorContext" {
 
 test "controller context tls_context is null when no TLS cert is configured" {
     const allocator = std.testing.allocator;
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
     var sig_fd = std.atomic.Value(std.posix.socket_t).init(-1);
@@ -496,6 +507,7 @@ test "controller context tls_context is null when no TLS cert is configured" {
     var active = std.atomic.Value(usize).init(0);
     const ctx = ControllerContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .address = "127.0.0.1:0",
         .request_ch = &req_ch,
         .response_router = &router,
@@ -512,9 +524,9 @@ test "controller context tls_context is null when no TLS cert is configured" {
 
 test "controller context token_store is non-null when auth file is configured" {
     const allocator = std.testing.allocator;
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
     var sig_fd = std.atomic.Value(std.posix.socket_t).init(-1);
@@ -525,6 +537,7 @@ test "controller context token_store is non-null when auth file is configured" {
     var active = std.atomic.Value(usize).init(0);
     const ctx = ControllerContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .address = "127.0.0.1:0",
         .request_ch = &req_ch,
         .response_router = &router,
@@ -546,9 +559,9 @@ test "controller context tls_context is non-null when cert and key are configure
     );
     defer tls_ctx.deinit();
 
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
     var sig_fd = std.atomic.Value(std.posix.socket_t).init(-1);
@@ -556,6 +569,7 @@ test "controller context tls_context is non-null when cert and key are configure
     var active = std.atomic.Value(usize).init(0);
     const ctx = ControllerContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .address = "127.0.0.1:0",
         .request_ch = &req_ch,
         .response_router = &router,
@@ -571,22 +585,23 @@ test "controller context tls_context is non-null when cert and key are configure
 
 test "DatabaseContext instruments field is null when telemetry is disabled" {
     const allocator = std.testing.allocator;
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
     var ac = std.atomic.Value(usize).init(0);
 
     const ctx = DatabaseContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .framerate = 60,
         .backend = persistence_backend.PersistenceBackend{ .memory = .{
-            .entries = .{},
+            .entries = .empty,
             .allocator = allocator,
         } },
         .compression_interval_ns = 0,
@@ -608,32 +623,34 @@ test "DatabaseContext instruments field holds Instruments when telemetry is enab
     const allocator = std.testing.allocator;
 
     const otel = @import("opentelemetry");
-    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+    const meter_provider = try otel.metrics.MeterProvider.init(allocator, std.testing.io);
     defer meter_provider.shutdown();
     const tracer_provider = try otel.trace.TracerProvider.init(
         allocator,
-        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+        std.testing.io,
+        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init((std.Random.IoSource{ .io = std.testing.io }).interface()) },
     );
     defer tracer_provider.shutdown();
 
     const instruments = try infrastructure_telemetry.createInstruments(meter_provider, tracer_provider);
 
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
     var ac = std.atomic.Value(usize).init(0);
 
     const ctx = DatabaseContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .framerate = 60,
         .backend = persistence_backend.PersistenceBackend{ .memory = .{
-            .entries = .{},
+            .entries = .empty,
             .allocator = allocator,
         } },
         .compression_interval_ns = 0,
@@ -655,24 +672,25 @@ test "tick with instrumented scheduler processes SET query and routes success re
     const allocator = std.testing.allocator;
 
     const otel = @import("opentelemetry");
-    const meter_provider = try otel.metrics.MeterProvider.init(allocator);
+    const meter_provider = try otel.metrics.MeterProvider.init(allocator, std.testing.io);
     defer meter_provider.shutdown();
     const tracer_provider = try otel.trace.TracerProvider.init(
         allocator,
-        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init(std.crypto.random) },
+        std.testing.io,
+        otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init((std.Random.IoSource{ .io = std.testing.io }).interface()) },
     );
     defer tracer_provider.shutdown();
 
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var resp_ch = try Channel(query.Response).init(allocator, 4);
+    var resp_ch = try Channel(query.Response).init(allocator, std.testing.io, 4);
     defer resp_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
 
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     try router.register(1, &resp_ch);
 
@@ -703,13 +721,13 @@ test "tick with instrumented scheduler processes SET query and routes success re
 
 test "DatabaseContext carries persistence backend and compression interval" {
     const allocator = std.testing.allocator;
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
 
@@ -719,12 +737,14 @@ test "DatabaseContext carries persistence backend and compression interval" {
 
     const logfile_ctx = DatabaseContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .framerate = 60,
         .backend = persistence_backend.PersistenceBackend{ .logfile = .{
             .logfile_path = "ztick.log",
             .logfile_dir = tmp.dir,
             .load_arena = null,
             .fsync_on_persist = false,
+            .io = std.testing.io,
         } },
         .compression_interval_ns = 3600 * std.time.ns_per_s,
         .running = &running,
@@ -743,9 +763,10 @@ test "DatabaseContext carries persistence backend and compression interval" {
 
     const memory_ctx = DatabaseContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .framerate = 60,
         .backend = persistence_backend.PersistenceBackend{ .memory = .{
-            .entries = .{},
+            .entries = .empty,
             .allocator = allocator,
         } },
         .compression_interval_ns = 0,
@@ -765,13 +786,13 @@ test "DatabaseContext carries persistence backend and compression interval" {
 
 test "DatabaseContext carries startup_ns for STAT uptime calculation" {
     const allocator = std.testing.allocator;
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
     var ac = std.atomic.Value(usize).init(0);
@@ -779,9 +800,10 @@ test "DatabaseContext carries startup_ns for STAT uptime calculation" {
     const boot_ns: i128 = 1_700_000_000_000_000_000;
     const ctx = DatabaseContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .framerate = 512,
         .backend = persistence_backend.PersistenceBackend{ .memory = .{
-            .entries = .{},
+            .entries = .empty,
             .allocator = allocator,
         } },
         .compression_interval_ns = 0,
@@ -802,22 +824,23 @@ test "DatabaseContext carries startup_ns for STAT uptime calculation" {
 
 test "DatabaseContext carries active_connections pointer for STAT connection count" {
     const allocator = std.testing.allocator;
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
     var ac = std.atomic.Value(usize).init(3);
 
     const ctx = DatabaseContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .framerate = 60,
         .backend = persistence_backend.PersistenceBackend{ .memory = .{
-            .entries = .{},
+            .entries = .empty,
             .allocator = allocator,
         } },
         .compression_interval_ns = 0,
@@ -837,22 +860,23 @@ test "DatabaseContext carries active_connections pointer for STAT connection cou
 
 test "DatabaseContext carries auth_enabled and tls_enabled flags for STAT reporting" {
     const allocator = std.testing.allocator;
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     var running = std.atomic.Value(bool).init(false);
     var ac = std.atomic.Value(usize).init(0);
 
     const ctx = DatabaseContext{
         .allocator = allocator,
+        .io = std.testing.io,
         .framerate = 60,
         .backend = persistence_backend.PersistenceBackend{ .memory = .{
-            .entries = .{},
+            .entries = .empty,
             .allocator = allocator,
         } },
         .compression_interval_ns = 0,
@@ -873,20 +897,20 @@ test "DatabaseContext carries auth_enabled and tls_enabled flags for STAT report
 
 test "tick with memory backend persists SET mutation to backend entries" {
     const allocator = std.testing.allocator;
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var resp_ch = try Channel(query.Response).init(allocator, 4);
+    var resp_ch = try Channel(query.Response).init(allocator, std.testing.io, 4);
     defer resp_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     try router.register(1, &resp_ch);
 
     const backend_state = BackendState.init(persistence_backend.PersistenceBackend{ .memory = .{
-        .entries = .{},
+        .entries = .empty,
         .allocator = allocator,
     } });
     var scheduler = Scheduler.init(allocator);
@@ -917,16 +941,16 @@ test "tick with memory backend persists SET mutation to backend entries" {
 
 test "tick processes query request and routes response" {
     const allocator = std.testing.allocator;
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var resp_ch = try Channel(query.Response).init(allocator, 4);
+    var resp_ch = try Channel(query.Response).init(allocator, std.testing.io, 4);
     defer resp_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
 
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
 
     try router.register(1, &resp_ch);
@@ -957,13 +981,13 @@ test "tick processes query request and routes response" {
 
 test "tick returns null when no jobs are scheduled" {
     const allocator = std.testing.allocator;
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     var scheduler = Scheduler.init(allocator);
     defer scheduler.deinit();
@@ -984,15 +1008,15 @@ test "tick returns earliest job execution time after drain processes SET request
     const allocator = std.testing.allocator;
     const future_ns: i64 = 9_000_000_000_000_000_000;
 
-    var req_ch = try Channel(query.Request).init(allocator, 4);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();
-    var resp_ch = try Channel(query.Response).init(allocator, 4);
+    var resp_ch = try Channel(query.Response).init(allocator, std.testing.io, 4);
     defer resp_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     try router.register(1, &resp_ch);
     var scheduler = Scheduler.init(allocator);
@@ -1020,15 +1044,15 @@ test "tick returns earliest job execution time after drain processes SET request
 test "tick drains three concurrent SET requests in a single call and routes all responses" {
     const allocator = std.testing.allocator;
 
-    var req_ch = try Channel(query.Request).init(allocator, 8);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 8);
     defer req_ch.deinit();
-    var resp_ch = try Channel(query.Response).init(allocator, 8);
+    var resp_ch = try Channel(query.Response).init(allocator, std.testing.io, 8);
     defer resp_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     try router.register(1, &resp_ch);
     var scheduler = Scheduler.init(allocator);
@@ -1057,15 +1081,15 @@ test "tick returns earliest of two jobs when both are future-scheduled" {
     const near_ns: i64 = 2_000_000_000_000_000_000;
     const far_ns: i64 = 9_000_000_000_000_000_000;
 
-    var req_ch = try Channel(query.Request).init(allocator, 8);
+    var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 8);
     defer req_ch.deinit();
-    var resp_ch = try Channel(query.Response).init(allocator, 8);
+    var resp_ch = try Channel(query.Response).init(allocator, std.testing.io, 8);
     defer resp_ch.deinit();
-    var exec_req_ch = try Channel(execution.Request).init(allocator, 4);
+    var exec_req_ch = try Channel(execution.Request).init(allocator, std.testing.io, 4);
     defer exec_req_ch.deinit();
-    var exec_resp_ch = try Channel(execution.Response).init(allocator, 4);
+    var exec_resp_ch = try Channel(execution.Response).init(allocator, std.testing.io, 4);
     defer exec_resp_ch.deinit();
-    var router = ResponseRouter.init(allocator);
+    var router = ResponseRouter.init(allocator, std.testing.io);
     defer router.deinit();
     try router.register(1, &resp_ch);
     var scheduler = Scheduler.init(allocator);
@@ -1086,26 +1110,36 @@ test "tick returns earliest of two jobs when both are future-scheduled" {
     try std.testing.expectEqual(@as(?i64, near_ns), result);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-    const command = try interfaces_cli.parse(allocator);
+    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args_iter.deinit();
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    while (args_iter.next()) |arg| {
+        try argv.append(allocator, arg);
+    }
+
+    const command = try interfaces_cli.parse(&init, allocator, argv.items);
 
     if (command == .dump) {
         defer allocator.free(command.dump.options.logfile_path);
-        interfaces_dump.run_dump(allocator, command.dump.options) catch |err| switch (err) {
+        interfaces_dump.run_dump(allocator, command.dump.options, init.io) catch |err| switch (err) {
             error.FileNotFound => {
                 var ebuf: [256]u8 = undefined;
-                var ew = std.fs.File.stderr().writer(&ebuf);
+                var ew = std.Io.File.stderr().writer(init.io, &ebuf);
                 ew.interface.print("error: file not found: {s}\n", .{command.dump.options.logfile_path}) catch {};
                 ew.interface.flush() catch {};
                 std.process.exit(1);
             },
             error.PermissionDenied => {
                 var ebuf: [256]u8 = undefined;
-                var ew = std.fs.File.stderr().writer(&ebuf);
+                var ew = std.Io.File.stderr().writer(init.io, &ebuf);
                 ew.interface.print("error: permission denied: {s}\n", .{command.dump.options.logfile_path}) catch {};
                 ew.interface.flush() catch {};
                 std.process.exit(1);
@@ -1117,7 +1151,7 @@ pub fn main() !void {
 
     const config_path = command.server.config_path;
     defer if (config_path) |p| allocator.free(p);
-    const cfg = try interfaces_config.load(allocator, config_path);
+    const cfg = try interfaces_config.load(allocator, config_path, init.io);
     defer cfg.deinit(allocator);
 
     runtime_log_level = log_level_to_std(cfg.log_level);
@@ -1125,7 +1159,7 @@ pub fn main() !void {
     std.log.info("log level: {s}", .{@tagName(cfg.log_level)});
     std.log.info("listening on {s}", .{cfg.controller_listen});
 
-    const telemetry_providers = try infrastructure_telemetry.setup(allocator, cfg.telemetry);
+    const telemetry_providers = try infrastructure_telemetry.setup(allocator, cfg.telemetry, init.environ_map, init.io);
     defer if (telemetry_providers) |p| p.shutdown();
 
     if (telemetry_providers) |p| {
@@ -1143,21 +1177,21 @@ pub fn main() !void {
     else
         null;
 
-    const startup_ns = std.time.nanoTimestamp();
+    const startup_ns: i128 = std.Io.Timestamp.now(init.io, .awake).nanoseconds;
     var active_connections = std.atomic.Value(usize).init(0);
 
-    const cwd = std.fs.cwd();
+    const cwd = std.Io.Dir.cwd();
 
-    var query_request_ch = try Channel(query.Request).init(allocator, 1024);
+    var query_request_ch = try Channel(query.Request).init(allocator, init.io, 1024);
     defer query_request_ch.deinit();
 
-    var exec_request_ch = try Channel(execution.Request).init(allocator, 64);
+    var exec_request_ch = try Channel(execution.Request).init(allocator, init.io, 64);
     defer exec_request_ch.deinit();
 
-    var exec_response_ch = try Channel(execution.Response).init(allocator, 64);
+    var exec_response_ch = try Channel(execution.Response).init(allocator, init.io, 64);
     defer exec_response_ch.deinit();
 
-    var response_router = ResponseRouter.init(allocator);
+    var response_router = ResponseRouter.init(allocator, init.io);
     defer response_router.deinit();
 
     var running = std.atomic.Value(bool).init(true);
@@ -1181,7 +1215,7 @@ pub fn main() !void {
     var token_store: ?application_token_store.TokenStore = null;
     var auth_tokens: ?[]domain.auth.Token = null;
     if (cfg.controller_auth_file) |auth_file| {
-        auth_tokens = try infrastructure_auth.load(allocator, auth_file);
+        auth_tokens = try infrastructure_auth.load(init.io, allocator, auth_file);
         var store = application_token_store.TokenStore.init(allocator);
         try store.load(auth_tokens.?);
         token_store = store;
@@ -1198,6 +1232,7 @@ pub fn main() !void {
 
     const controller_thread = try std.Thread.spawn(.{}, run_controller, .{ControllerContext{
         .allocator = allocator,
+        .io = init.io,
         .address = cfg.controller_listen,
         .request_ch = &query_request_ch,
         .response_router = &response_router,
@@ -1218,11 +1253,13 @@ pub fn main() !void {
         std.log.info("HTTP listening on {s}", .{http_addr});
         const ht = try std.Thread.spawn(.{}, run_http_controller, .{HttpControllerContext{
             .allocator = allocator,
+            .io = init.io,
             .address = http_addr,
             .request_ch = &query_request_ch,
             .response_router = &response_router,
             .running = &running,
             .bearer_token = cfg.http_bearer_token,
+            .signal_listen_fd = &global_http_listen_fd,
         }});
         break :blk ht;
     } else null;
@@ -1235,15 +1272,17 @@ pub fn main() !void {
             .logfile_dir = cwd,
             .load_arena = null,
             .fsync_on_persist = cfg.database_fsync_on_persist,
+            .io = init.io,
         } },
         .memory => .{ .memory = .{
-            .entries = .{},
+            .entries = .empty,
             .allocator = allocator,
         } },
     };
 
     const database_thread = try std.Thread.spawn(.{}, run_database, .{DatabaseContext{
         .allocator = allocator,
+        .io = init.io,
         .framerate = cfg.database_framerate,
         .backend = backend,
         .compression_interval_ns = @as(u64, cfg.database_compression_interval) * std.time.ns_per_s,
@@ -1266,6 +1305,7 @@ pub fn main() !void {
 
     const processor_thread = try std.Thread.spawn(.{}, run_processor, .{ProcessorContext{
         .allocator = allocator,
+        .io = init.io,
         .exec_request_ch = &exec_request_ch,
         .exec_response_ch = &exec_response_ch,
         .shell_config = cfg.shell,

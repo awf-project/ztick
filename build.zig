@@ -1,9 +1,9 @@
 const std = @import("std");
 
 fn link_openssl(step: *std.Build.Step.Compile) void {
-    step.linkLibC();
-    step.linkSystemLibrary("ssl");
-    step.linkSystemLibrary("crypto");
+    step.root_module.link_libc = true;
+    step.root_module.linkSystemLibrary("ssl", .{});
+    step.root_module.linkSystemLibrary("crypto", .{});
 }
 
 pub fn build(b: *std.Build) void {
@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
 
     // Link OpenSSL only when tls_context.zig is present; plaintext-only builds remain zero-dependency.
     const tls_enabled = blk: {
-        b.build_root.handle.access("src/infrastructure/tls_context.zig", .{}) catch break :blk false;
+        b.build_root.handle.access(b.graph.io, "src/infrastructure/tls_context.zig", .{}) catch break :blk false;
         break :blk true;
     };
 
@@ -31,18 +31,14 @@ pub fn build(b: *std.Build) void {
     const build_options_module = build_options.createModule();
 
     // OpenTelemetry SDK dependency (ADR-0004)
-    const otel_dep = b.dependency("opentelemetry", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    // Decision: pass .{} — Zig 0.16 propagates optimize/target automatically;
+    // passing them explicitly fails when the dependency's build.zig doesn't declare those options.
+    const otel_dep = b.dependency("opentelemetry", .{});
     const otel_module = otel_dep.module("sdk");
 
     // zig-cli dependency (sam701/zig-cli) for argument parsing, --version,
     // --help, and subcommand dispatch.
-    const cli_dep = b.dependency("cli", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const cli_dep = b.dependency("cli", .{});
     const cli_module = cli_dep.module("cli");
 
     // Helper to register the standard module imports on a freshly-created module.

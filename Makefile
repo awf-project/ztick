@@ -8,7 +8,7 @@ INTEGRATION_FLAGS ?= -Damqp-integration -Dredis-integration
 # Usage: $(call run_with_compose,<zig-build-target>,<extra-flags>)
 define run_with_compose
 	docker compose up -d --wait rabbitmq redis
-	zig build $(1) $(2) --summary all; status=$$?; \
+	zig build $(1) $(2) --summary all --test-timeout 30s; status=$$?; \
 		docker compose down rabbitmq redis; \
 		exit $$status
 endef

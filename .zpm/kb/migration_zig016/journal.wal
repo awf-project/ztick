@@ -1,0 +1,51 @@
+{"ts":1779659538,"op":"assert","clause":"migration_zig016:migration(zig016, '0.15.2', '0.16.0', '2026-05-24', planning)"}
+{"ts":1779659540,"op":"assert","clause":"migration_zig016:scope(zig016, project, ztick)"}
+{"ts":1779659543,"op":"assert","clause":"migration_zig016:dependency(ztick, 'zig-o11y/opentelemetry-sdk', '0.1.1', external)"}
+{"ts":1779659549,"op":"assert","clause":"migration_zig016:dependency(ztick, 'sam701/zig-cli', 'zig-0.15', external)"}
+{"ts":1779659551,"op":"assert","clause":"migration_zig016:dependency(ztick, openssl, system, c_interop)"}
+{"ts":1779659622,"op":"assert","clause":"migration_zig016:codebase_api(io_stream, 'src/infrastructure/http.zig', 'stream.reader()/writer() + .interface()', critical)"}
+{"ts":1779659625,"op":"assert","clause":"migration_zig016:codebase_api(io_stream, 'src/infrastructure/tcp_server.zig', 'stream.reader()/writer() + .interface()', critical)"}
+{"ts":1779659634,"op":"assert","clause":"migration_zig016:codebase_api(http_server, 'src/infrastructure/http.zig', 'std.http.Server + receiveHead() + @embedFile + @setEvalBranchQuota(200000)', critical)"}
+{"ts":1779659637,"op":"assert","clause":"migration_zig016:codebase_api(atomics, 'src/main.zig', 'std.atomic.Value(T) with .acquire/.release ordering', high)"}
+{"ts":1779659639,"op":"assert","clause":"migration_zig016:codebase_api(atomics, 'src/infrastructure/channel.zig', 'std.atomic.Value(bool) for thread flags', high)"}
+{"ts":1779659642,"op":"assert","clause":"migration_zig016:codebase_api(threading, 'src/main.zig', 'std.Thread.spawn() with config struct', high)"}
+{"ts":1779659645,"op":"assert","clause":"migration_zig016:codebase_api(threading, 'src/infrastructure/channel.zig', 'std.Thread.Mutex + std.Thread.Condition + timedWait', high)"}
+{"ts":1779659647,"op":"assert","clause":"migration_zig016:codebase_api(c_interop, 'src/infrastructure/tls_context.zig', '@cImport/@cInclude OpenSSL + @ptrCast/@alignCast', high)"}
+{"ts":1779659651,"op":"assert","clause":"migration_zig016:codebase_api(subprocess, 'src/infrastructure/runner/subprocess.zig', 'std.process.Child.init() + spawn/wait', medium)"}
+{"ts":1779659655,"op":"assert","clause":"migration_zig016:codebase_api(json, 'src/infrastructure/http/json.zig', 'std.json.parseFromSlice() + ignore_unknown_fields + Stringify', medium)"}
+{"ts":1779659664,"op":"assert","clause":"migration_zig016:breaking_change(bc01, build_system, 'addExecutable/addTest must use .root_module = b.createModule(...)', high, 'build.zig')"}
+{"ts":1779659667,"op":"assert","clause":"migration_zig016:breaking_change(bc02, build_system, 'build.zig.zon deps need fingerprint field - run zig fetch --save for each', high, 'build.zig.zon')"}
+{"ts":1779659672,"op":"assert","clause":"migration_zig016:breaking_change(bc03, stdlib, 'std.io/std.fs/std.net renamed to std.Io/std.Io.Dir/std.Io.File - pervasive', critical, 'all infrastructure files')"}
+{"ts":1779659675,"op":"assert","clause":"migration_zig016:breaking_change(bc04, stdlib, 'std.time.Instant.now() replaced by std.Io.Timestamp.now(io, .awake)', high, 'src/infrastructure/clock.zig')"}
+{"ts":1779659678,"op":"assert","clause":"migration_zig016:breaking_change(bc05, stdlib, 'heap.ThreadSafeAllocator removed - ArenaAllocator now thread-safe natively', medium, 'verify not used')"}
+{"ts":1779659685,"op":"assert","clause":"migration_zig016:breaking_change(bc06, stdlib, 'std.Thread.Pool removed - replaced by std.Io.Group + io.async', medium, 'verify not used')"}
+{"ts":1779659689,"op":"assert","clause":"migration_zig016:breaking_change(bc07, language, '@intFromFloat removed - use @trunc/@floor/@ceil/@round', low, 'verify not used')"}
+{"ts":1779659692,"op":"assert","clause":"migration_zig016:breaking_change(bc08, language, '@Type() removed - use @Int/@Struct/@Tuple/@Enum/@Union/@Fn/@Pointer', medium, 'check telemetry.zig generics')"}
+{"ts":1779659695,"op":"assert","clause":"migration_zig016:breaking_change(bc09, stdlib, 'std.os.environ and std.process.args() removed - use Juicy Main init param', high, 'src/main.zig + src/interfaces/cli.zig')"}
+{"ts":1779659699,"op":"assert","clause":"migration_zig016:breaking_change(bc10, deprecation, '@cImport deprecated - migrate to b.addTranslateC with arocc backend', low, 'src/infrastructure/tls_context.zig')"}
+{"ts":1779659702,"op":"assert","clause":"migration_zig016:breaking_change(bc11, language, 'Juicy Main: pub fn main(init: std.process.Init) !void - old signature still works but legacy', low, 'src/main.zig')"}
+{"ts":1779659706,"op":"assert","clause":"migration_zig016:migration_risk(dep_otel, high, 'zig-o11y/opentelemetry-sdk v0.1.1 may not have 0.16 compatible release - may need vendoring')"}
+{"ts":1779659709,"op":"assert","clause":"migration_zig016:migration_risk(dep_zigcli, low, 'sam701/zig-cli - switch from zig-0.15 to zig-0.16 branch')"}
+{"ts":1779659712,"op":"assert","clause":"migration_zig016:migration_phase(phase1, 'Build system + dependencies', 'build.zig rewrite with createModule, build.zig.zon fingerprints, dep branch updates')"}
+{"ts":1779659716,"op":"assert","clause":"migration_zig016:migration_phase(phase2, 'Juicy Main + process APIs', 'main.zig signature, CLI args, env vars, GPA from init')"}
+{"ts":1779659720,"op":"assert","clause":"migration_zig016:migration_phase(phase3, 'I/O namespace migration', 'std.io -> std.Io, std.fs -> std.Io.Dir/File, std.net -> std.Io.Net throughout infrastructure')"}
+{"ts":1779659723,"op":"assert","clause":"migration_zig016:migration_phase(phase4, 'Time API migration', 'std.time.Instant -> std.Io.Timestamp, tick loop + clock.zig')"}
+{"ts":1779659732,"op":"assert","clause":"migration_zig016:migration_phase(phase5, 'Language builtins', '@Type -> dedicated builtins, @intFromFloat -> @trunc, @cImport deprecation')"}
+{"ts":1779659738,"op":"assert","clause":"migration_zig016:migration_phase(phase6, 'Testing + CI', 'verify all test targets compile, add --test-timeout, update Makefile flags')"}
+{"ts":1779664623,"op":"assert","clause":"migration_zig016:correction(bc07, '@intFromFloat is NOT removed in 0.16 - still compiles, used in stdlib itself - REMOVED FROM MIGRATION SCOPE')"}
+{"ts":1779664626,"op":"assert","clause":"migration_zig016:correction(bc04, 'Time API path is std.Io.Clock.Timestamp.now(io, clock) NOT std.Io.Timestamp.now(io, .awake)')"}
+{"ts":1779664630,"op":"assert","clause":"migration_zig016:correction(bc03_fixedbuffer, 'fixedBufferStream is fully REMOVED in 0.16 not renamed - replacement is std.Io.Writer.fixed(slice) and std.Io.Reader.fixed(slice)')"}
+{"ts":1779664634,"op":"assert","clause":"migration_zig016:correction(bc03_net, 'std.net namespace is std.Io.net (lowercase n) not std.Io.Net')"}
+{"ts":1779664639,"op":"assert","clause":"migration_zig016:verified_api(fixedbufferstream, removed, 'std.Io.Writer.fixed(slice) for writes, std.Io.Reader.fixed(slice) for reads')"}
+{"ts":1779664646,"op":"assert","clause":"migration_zig016:verified_api(time_instant, removed, 'std.Io.Clock.Timestamp.now(io, clock) replaces std.time.Instant.now()')"}
+{"ts":1779664650,"op":"assert","clause":"migration_zig016:verified_api(intFromFloat, still_valid, '@intFromFloat compiles in 0.16 and is used by stdlib - NOT removed')"}
+{"ts":1779664654,"op":"assert","clause":"migration_zig016:verified_api(net_namespace, renamed, 'std.net is now std.Io.net (lowercase n)')"}
+{"ts":1779723735,"op":"assert","clause":"migration_zig016:correction(bc09_args, 'std.process.Init.args is at init.minimal.args — use Args.Iterator.initAllocator(init.minimal.args, allocator) for cross-platform iteration')"}
+{"ts":1779723737,"op":"assert","clause":"migration_zig016:correction(bc03_writer_duality, 'Writer.fixed() returns Io.Writer directly (no .interface), but File.writer(io, buf) returns File.Writer which HAS .interface field — two different types')"}
+{"ts":1779723738,"op":"assert","clause":"migration_zig016:correction(bc_mutex, 'std.Thread.Mutex/Condition removed — replaced by std.Io.Mutex/Condition which require io param for lock/unlock/wait')"}
+{"ts":1779723740,"op":"assert","clause":"migration_zig016:correction(bc_posix_removed, 'std.posix.read/write/close/shutdown/access all removed — use std.os.linux.* syscalls or std.Io equivalents')"}
+{"ts":1779723742,"op":"assert","clause":"migration_zig016:correction(bc_arraylist, 'std.ArrayList(T) in 0.16 is unmanaged — init with .empty, pass allocator per call, no .writer() method')"}
+{"ts":1779723744,"op":"assert","clause":"migration_zig016:correction(bc_crypto_random, 'std.crypto.random removed — use std.os.linux.getrandom() or std.Random.IoSource with io')"}
+{"ts":1779723745,"op":"assert","clause":"migration_zig016:correction(bc_signal, 'Signal handler type changed: fn(c_int) callconv(.c) void → fn(std.os.linux.SIG) callconv(.c) void')"}
+{"ts":1779723748,"op":"assert","clause":"migration_zig016:verified_api(dep_zigcli, updated, 'sam701/zig-cli main branch is 0.16-compatible (v0.11.0) — AppRunner.init takes *const std.process.Init')"}
+{"ts":1779723749,"op":"assert","clause":"migration_zig016:verified_api(dep_otel, updated, 'zig-o11y/opentelemetry-sdk v0.2.0 is 0.16-compatible — all init() calls now take io param, ConfigOptions.init takes env_map')"}

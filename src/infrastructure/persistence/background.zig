@@ -11,22 +11,25 @@ pub const Status = union(enum) {
     running: struct {},
 };
 
+/// Atomic state used to signal task completion without requiring io in background threads.
+const AtomicState = enum(u8) { running, success, failure };
+
 pub const Process = struct {
     allocator: std.mem.Allocator,
     thread: ?std.Thread,
-    result: ?TaskResult,
-    mutex: std.Thread.Mutex,
+    state: std.atomic.Value(AtomicState),
     joined: bool,
 
     pub fn execute(allocator: std.mem.Allocator, task: anytype) !*Process {
         const proc = try allocator.create(Process);
-        proc.* = .{ .allocator = allocator, .thread = null, .result = null, .mutex = .{}, .joined = false };
+        proc.* = .{ .allocator = allocator, .thread = null, .state = .init(.running), .joined = false };
         proc.thread = try std.Thread.spawn(.{}, struct {
             fn run(p: *Process, t: @TypeOf(task)) void {
-                const r = t();
-                p.mutex.lock();
-                defer p.mutex.unlock();
-                p.result = r;
+                if (t()) {
+                    p.state.store(.success, .release);
+                } else |_| {
+                    p.state.store(.failure, .release);
+                }
             }
         }.run, .{ proc, task });
         return proc;
@@ -40,10 +43,11 @@ pub const Process = struct {
     }
 
     pub fn status(self: *Process) Status {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const r = self.result orelse return .{ .running = .{} };
-        if (r) |_| return .{ .success = .{} } else |err| return .{ .failure = err };
+        return switch (self.state.load(.acquire)) {
+            .running => .{ .running = .{} },
+            .success => .{ .success = .{} },
+            .failure => .{ .failure = error.Failure },
+        };
     }
 };
 
@@ -53,31 +57,33 @@ pub const Filenames = struct {
     dest: []const u8 = "logfile.compressed",
 };
 
-pub fn compress(allocator: std.mem.Allocator, dir: std.fs.Dir, filenames: Filenames) TaskResult {
+pub fn compress(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, filenames: Filenames) TaskResult {
     // Read source file incrementally to avoid loading entire file into memory (NFR-001).
-    const source_file = dir.openFile(filenames.source, .{}) catch |err| {
+    const source_file = dir.openFile(io, filenames.source, .{}) catch |err| {
         std.log.err("compression: failed to open source '{s}': {}", .{ filenames.source, err });
         return error.Failure;
     };
-    defer source_file.close();
+    defer source_file.close(io);
 
-    var all_entries = std.ArrayListUnmanaged([]u8){};
+    var all_entries: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (all_entries.items) |e| allocator.free(e);
         all_entries.deinit(allocator);
     }
 
     {
-        var carry = std.ArrayListUnmanaged(u8){};
+        var carry: std.ArrayListUnmanaged(u8) = .empty;
         defer carry.deinit(allocator);
 
         var read_buf: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
         while (true) {
-            const n = source_file.read(&read_buf) catch |err| {
+            const n = source_file.readPositionalAll(io, &read_buf, offset) catch |err| {
                 std.log.err("compression: read failed on '{s}': {}", .{ filenames.source, err });
                 return error.Failure;
             };
             if (n == 0) break;
+            offset += n;
             carry.appendSlice(allocator, read_buf[0..n]) catch |err| {
                 std.log.err("compression: out of memory reading '{s}': {}", .{ filenames.source, err });
                 return error.Failure;
@@ -115,8 +121,6 @@ pub fn compress(allocator: std.mem.Allocator, dir: std.fs.Dir, filenames: Filena
     }
 
     // First pass: record each ID's last position and flag IDs whose last entry is a removal.
-    // Three structures track this: entry_ids maps index→decoded ID, last_index maps ID→last
-    // position, removed_ids collects IDs whose final entry is a removal type.
     var last_index = std.StringHashMap(usize).init(allocator);
     defer last_index.deinit();
 
@@ -152,7 +156,7 @@ pub fn compress(allocator: std.mem.Allocator, dir: std.fs.Dir, filenames: Filena
     }
 
     // Second pass: emit only entries at their last position whose ID is not flagged as removed.
-    var out = std.ArrayListUnmanaged(u8){};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(allocator);
 
     for (all_entries.items, 0..) |entry, i| {
@@ -174,24 +178,24 @@ pub fn compress(allocator: std.mem.Allocator, dir: std.fs.Dir, filenames: Filena
     }
 
     {
-        const f = dir.createFile(filenames.tmp, .{}) catch |err| {
+        const f = dir.createFile(io, filenames.tmp, .{}) catch |err| {
             std.log.err("compression: failed to create tmp file '{s}': {}", .{ filenames.tmp, err });
             return error.Failure;
         };
-        defer f.close();
-        f.writeAll(out.items) catch |err| {
+        defer f.close(io);
+        f.writeStreamingAll(io, out.items) catch |err| {
             std.log.err("compression: failed to write tmp file '{s}': {}", .{ filenames.tmp, err });
             return error.Failure;
         };
     }
-    if (dir.statFile(filenames.dest)) |_| {
+    if (dir.statFile(io, filenames.dest, .{})) |_| {
         std.log.warn("compression: overwriting existing '{s}'", .{filenames.dest});
     } else |_| {}
-    dir.rename(filenames.tmp, filenames.dest) catch |err| {
+    dir.rename(filenames.tmp, dir, filenames.dest, io) catch |err| {
         std.log.err("compression: failed to rename '{s}' to '{s}': {}", .{ filenames.tmp, filenames.dest, err });
         return error.Failure;
     };
-    dir.deleteFile(filenames.source) catch |err| {
+    dir.deleteFile(io, filenames.source) catch |err| {
         std.log.err("compression: failed to delete source '{s}': {}", .{ filenames.source, err });
         return error.Failure;
     };
@@ -226,7 +230,7 @@ test "status returns running before task completes" {
         var gate = std.atomic.Value(bool).init(false);
         fn task() TaskResult {
             while (!gate.load(.acquire)) {
-                std.Thread.sleep(1_000);
+                std.Thread.yield() catch {};
             }
             return {};
         }
@@ -242,20 +246,22 @@ test "status returns running before task completes" {
 }
 
 test "compress succeeds with empty logfile.to_compress" {
+    const io = std.testing.io;
     const default_filenames: Filenames = .{};
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const f = try tmp.dir.createFile(default_filenames.source, .{});
-    f.close();
+    const f = try tmp.dir.createFile(io, default_filenames.source, .{});
+    f.close(io);
 
-    try compress(std.testing.allocator, tmp.dir, default_filenames);
+    try compress(std.testing.allocator, io, tmp.dir, default_filenames);
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(default_filenames.source));
-    _ = try tmp.dir.statFile(default_filenames.dest);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, default_filenames.source, .{}));
+    _ = try tmp.dir.statFile(io, default_filenames.dest, .{});
 }
 
 test "compress excludes job whose last entry is a removal" {
+    const io = std.testing.io;
     const default_filenames: Filenames = .{};
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -275,15 +281,15 @@ test "compress excludes job whose last entry is a removal" {
     defer std.testing.allocator.free(framed_removal);
 
     {
-        const f = try tmp.dir.createFile(default_filenames.source, .{});
-        defer f.close();
-        try f.writeAll(framed_job);
-        try f.writeAll(framed_removal);
+        const f = try tmp.dir.createFile(io, default_filenames.source, .{});
+        defer f.close(io);
+        _ = try f.writeStreamingAll(io, framed_job);
+        _ = try f.writeStreamingAll(io, framed_removal);
     }
 
-    try compress(std.testing.allocator, tmp.dir, default_filenames);
+    try compress(std.testing.allocator, io, tmp.dir, default_filenames);
 
-    const compressed = try tmp.dir.readFileAlloc(std.testing.allocator, default_filenames.dest, 1024 * 1024);
+    const compressed = try tmp.dir.readFileAlloc(io, default_filenames.dest, std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(compressed);
     const parsed = try logfile.parse(std.testing.allocator, compressed);
     defer {
@@ -294,6 +300,7 @@ test "compress excludes job whose last entry is a removal" {
 }
 
 test "compress excludes rule whose last entry is a removal" {
+    const io = std.testing.io;
     const default_filenames: Filenames = .{};
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -313,15 +320,15 @@ test "compress excludes rule whose last entry is a removal" {
     defer std.testing.allocator.free(framed_removal);
 
     {
-        const f = try tmp.dir.createFile(default_filenames.source, .{});
-        defer f.close();
-        try f.writeAll(framed_rule);
-        try f.writeAll(framed_removal);
+        const f = try tmp.dir.createFile(io, default_filenames.source, .{});
+        defer f.close(io);
+        _ = try f.writeStreamingAll(io, framed_rule);
+        _ = try f.writeStreamingAll(io, framed_removal);
     }
 
-    try compress(std.testing.allocator, tmp.dir, default_filenames);
+    try compress(std.testing.allocator, io, tmp.dir, default_filenames);
 
-    const compressed = try tmp.dir.readFileAlloc(std.testing.allocator, default_filenames.dest, 1024 * 1024);
+    const compressed = try tmp.dir.readFileAlloc(io, default_filenames.dest, std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(compressed);
     const parsed = try logfile.parse(std.testing.allocator, compressed);
     defer {
@@ -332,6 +339,7 @@ test "compress excludes rule whose last entry is a removal" {
 }
 
 test "compress deduplicates entries keeping latest" {
+    const io = std.testing.io;
     const default_filenames: Filenames = .{};
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -355,15 +363,15 @@ test "compress deduplicates entries keeping latest" {
     defer std.testing.allocator.free(framed2);
 
     {
-        const f = try tmp.dir.createFile(default_filenames.source, .{});
-        defer f.close();
-        try f.writeAll(framed1);
-        try f.writeAll(framed2);
+        const f = try tmp.dir.createFile(io, default_filenames.source, .{});
+        defer f.close(io);
+        _ = try f.writeStreamingAll(io, framed1);
+        _ = try f.writeStreamingAll(io, framed2);
     }
 
-    try compress(std.testing.allocator, tmp.dir, default_filenames);
+    try compress(std.testing.allocator, io, tmp.dir, default_filenames);
 
-    const compressed = try tmp.dir.readFileAlloc(std.testing.allocator, default_filenames.dest, 1024 * 1024);
+    const compressed = try tmp.dir.readFileAlloc(io, default_filenames.dest, std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(compressed);
     const parsed = try logfile.parse(std.testing.allocator, compressed);
     defer {

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Zig 0.16.0 migration (F024)** — Bumped `minimum_zig_version` to `0.16.0` and migrated the codebase off deprecated 0.15 APIs. Adopted the Juicy Main signature (`pub fn main(init: std.process.Init) !void`) and routed `init.minimal.args` through `cli.zig` (replacing `std.process.argsAlloc`/`argsFree`). Replaced `@Type(.enum_literal)` with the `@EnumLiteral` builtin. Migrated `std.io`/`std.fs`/`std.net` references to the `std.Io` namespace (including `std.Io.Reader.fixed`/`std.Io.Writer.fixed` in place of the removed `std.io.fixedBufferStream`) and `std.time.Instant`/`Timer` to `std.Io.Clock.Timestamp` — `io` is stored on `Clock` to preserve allocation-free per-tick semantics. Bumped `zig-o11y/opentelemetry-sdk` to v0.2.0 and switched `sam701/zig-cli` to the `zig-0.15` branch hash compatible with 0.16. TCP/HTTP protocols, persistence framing, and OTLP export are unchanged.
+
 ## [0.3.0] - 2026-05-13
 
 ### Changed

@@ -26,7 +26,7 @@ Each decision is documented separately below.
 | Option | Pros | Cons |
 |--------|------|------|
 | **Hand-roll encoder in stdlib** | Zero new Zig dependencies; NFR-001 compliant; AMQP 0-9-1 wire format is frozen and narrow for publish-only use | Byte-level bug risk; incremental cost for future protocol features |
-| **Vendor a third-party Zig AMQP client** | Less code to write | No maintained Zig 0.15.2-compatible library exists; breaches NFR-001 and ADR-0002 |
+| **Vendor a third-party Zig AMQP client** | Less code to write | No maintained Zig 0.16.0-compatible library exists; breaches NFR-001 and ADR-0002 |
 
 ### Decision
 

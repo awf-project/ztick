@@ -166,14 +166,14 @@ fn entry_identifier(entry: Entry) []const u8 {
 
 var follow_running_ptr: std.atomic.Value(?*std.atomic.Value(bool)) = std.atomic.Value(?*std.atomic.Value(bool)).init(null);
 
-fn follow_signal_handler(sig: c_int) callconv(.c) void {
+fn follow_signal_handler(sig: std.os.linux.SIG) callconv(.c) void {
     _ = sig;
     if (follow_running_ptr.load(.acquire)) |ptr| {
         ptr.store(false, .release);
     }
 }
 
-fn follow_loop(allocator: std.mem.Allocator, options: cli.DumpOptions, initial_offset: u64, writer: anytype, running: *std.atomic.Value(bool)) !void {
+fn follow_loop(allocator: std.mem.Allocator, options: cli.DumpOptions, io: std.Io, initial_offset: u64, writer: anytype, running: *std.atomic.Value(bool)) !void {
     running.store(true, .release);
 
     const act = std.posix.Sigaction{
@@ -184,23 +184,25 @@ fn follow_loop(allocator: std.mem.Allocator, options: cli.DumpOptions, initial_o
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 
-    const file = try std.fs.cwd().openFile(options.logfile_path, .{});
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(io, options.logfile_path, .{});
+    defer file.close(io);
 
     var offset = initial_offset;
 
     while (running.load(.acquire)) {
-        const stat = try file.stat();
+        const stat = try file.stat(io);
 
         if (stat.size < offset) {
-            // File was truncated or rotated — reset to beginning
             offset = 0;
         }
 
         if (stat.size > offset) {
-            try file.seekTo(offset);
-            const new_data = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-            defer allocator.free(new_data);
+            var rbuf: [8192]u8 = undefined;
+            var reader = file.reader(io, &rbuf);
+            var new_list: std.ArrayList(u8) = .empty;
+            defer new_list.deinit(allocator);
+            try reader.interface.appendRemaining(allocator, &new_list, .unlimited);
+            const new_data = new_list.items;
 
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
@@ -210,7 +212,7 @@ fn follow_loop(allocator: std.mem.Allocator, options: cli.DumpOptions, initial_o
             for (parse_result.entries, 0..) |frame, i| {
                 const entry = infrastructure.persistence.encoder.decode(arena.allocator(), frame) catch |err| {
                     var ebuf: [256]u8 = undefined;
-                    var ew = std.fs.File.stderr().writer(&ebuf);
+                    var ew = std.Io.File.stderr().writer(io, &ebuf);
                     ew.interface.print("warning: failed to decode frame {d}: {}\n", .{ i, err }) catch {};
                     ew.interface.flush() catch {};
                     continue;
@@ -222,16 +224,17 @@ fn follow_loop(allocator: std.mem.Allocator, options: cli.DumpOptions, initial_o
             offset += new_data.len - parse_result.remaining.len;
         }
 
-        std.Thread.sleep(500_000_000);
+        const req = std.os.linux.timespec{ .sec = 0, .nsec = 500_000_000 };
+        _ = std.os.linux.nanosleep(&req, null);
     }
 }
 
-fn write_compact_entries(writer: anytype, frames: []const []u8, format: cli.Format, arena_allocator: std.mem.Allocator) !void {
-    var entries = std.ArrayListUnmanaged(Entry){};
+fn write_compact_entries(io: std.Io, writer: anytype, frames: []const []u8, format: cli.Format, arena_allocator: std.mem.Allocator) !void {
+    var entries: std.ArrayList(Entry) = .empty;
     for (frames, 0..) |frame, i| {
         const entry = infrastructure.persistence.encoder.decode(arena_allocator, frame) catch |err| {
             var ebuf: [256]u8 = undefined;
-            var ew = std.fs.File.stderr().writer(&ebuf);
+            var ew = std.Io.File.stderr().writer(io, &ebuf);
             ew.interface.print("warning: failed to decode frame {d}: {}\n", .{ i, err }) catch {};
             ew.interface.flush() catch {};
             continue;
@@ -255,16 +258,20 @@ fn write_compact_entries(writer: anytype, frames: []const []u8, format: cli.Form
     }
 }
 
-pub fn run_dump(allocator: std.mem.Allocator, options: cli.DumpOptions) !void {
-    const file = std.fs.cwd().openFile(options.logfile_path, .{}) catch |err| switch (err) {
+pub fn run_dump(allocator: std.mem.Allocator, options: cli.DumpOptions, io: std.Io) !void {
+    const file = std.Io.Dir.cwd().openFile(io, options.logfile_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return DumpError.FileNotFound,
         error.AccessDenied => return DumpError.PermissionDenied,
         else => return err,
     };
-    defer file.close();
+    defer file.close(io);
 
-    const data = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-    defer allocator.free(data);
+    var read_buf: [8192]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    var data_list: std.ArrayList(u8) = .empty;
+    defer data_list.deinit(allocator);
+    try reader.interface.appendRemaining(allocator, &data_list, .unlimited);
+    const data = data_list.items;
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -273,21 +280,21 @@ pub fn run_dump(allocator: std.mem.Allocator, options: cli.DumpOptions) !void {
 
     if (parse_result.remaining.len > 0) {
         var ebuf: [128]u8 = undefined;
-        var ew = std.fs.File.stderr().writer(&ebuf);
+        var ew = std.Io.File.stderr().writer(io, &ebuf);
         ew.interface.print("warning: partial trailing frame ({d} bytes) ignored\n", .{parse_result.remaining.len}) catch {};
         ew.interface.flush() catch {};
     }
 
     var outbuf: [4096]u8 = undefined;
-    var out = std.fs.File.stdout().writer(&outbuf);
+    var out = std.Io.File.stdout().writer(io, &outbuf);
 
     if (options.compact) {
-        try write_compact_entries(&out.interface, parse_result.entries, options.format, arena.allocator());
+        try write_compact_entries(io, &out.interface, parse_result.entries, options.format, arena.allocator());
     } else {
         for (parse_result.entries, 0..) |frame, i| {
             const entry = infrastructure.persistence.encoder.decode(arena.allocator(), frame) catch |err| {
                 var ebuf: [256]u8 = undefined;
-                var ew = std.fs.File.stderr().writer(&ebuf);
+                var ew = std.Io.File.stderr().writer(io, &ebuf);
                 ew.interface.print("warning: failed to decode frame {d}: {}\n", .{ i, err }) catch {};
                 ew.interface.flush() catch {};
                 continue;
@@ -300,278 +307,278 @@ pub fn run_dump(allocator: std.mem.Allocator, options: cli.DumpOptions) !void {
     if (options.follow) {
         var follow_running = std.atomic.Value(bool).init(true);
         follow_running_ptr.store(&follow_running, .release);
-        try follow_loop(allocator, options, data.len - parse_result.remaining.len, &out.interface, &follow_running);
+        try follow_loop(allocator, options, io, data.len - parse_result.remaining.len, &out.interface, &follow_running);
     }
 }
 
 test "format_entry_text writes SET line for job entry" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const job_entry = Entry{ .job = .{ .identifier = "my-job", .execution = 1605457800_000000000, .status = .planned } };
-    try format_entry_text(fbs.writer(), job_entry);
-    try std.testing.expectEqualStrings("SET my-job 1605457800000000000 planned\n", fbs.getWritten());
+    try format_entry_text(&w, job_entry);
+    try std.testing.expectEqualStrings("SET my-job 1605457800000000000 planned\n", buf[0..w.end]);
 }
 
 test "format_entry_text writes RULE SET line for shell runner rule entry" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const rule_entry = Entry{ .rule = .{
         .identifier = "my-rule",
         .pattern = "*/5 * * * *",
         .runner = .{ .shell = .{ .command = "echo hello" } },
     } };
-    try format_entry_text(fbs.writer(), rule_entry);
-    try std.testing.expectEqualStrings("RULE SET my-rule */5 * * * * shell echo hello\n", fbs.getWritten());
+    try format_entry_text(&w, rule_entry);
+    try std.testing.expectEqualStrings("RULE SET my-rule */5 * * * * shell echo hello\n", buf[0..w.end]);
 }
 
 test "format_entry_text writes REMOVE line for job removal entry" {
     var buf: [128]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const removal_entry = Entry{ .job_removal = .{ .identifier = "old-job" } };
-    try format_entry_text(fbs.writer(), removal_entry);
-    try std.testing.expectEqualStrings("REMOVE old-job\n", fbs.getWritten());
+    try format_entry_text(&w, removal_entry);
+    try std.testing.expectEqualStrings("REMOVE old-job\n", buf[0..w.end]);
 }
 
 test "format_entry_text writes REMOVERULE line for rule removal entry" {
     var buf: [128]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const removal_entry = Entry{ .rule_removal = .{ .identifier = "old-rule" } };
-    try format_entry_text(fbs.writer(), removal_entry);
-    try std.testing.expectEqualStrings("REMOVERULE old-rule\n", fbs.getWritten());
+    try format_entry_text(&w, removal_entry);
+    try std.testing.expectEqualStrings("REMOVERULE old-rule\n", buf[0..w.end]);
 }
 
 test "format_entry_json writes set object for job entry" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const job_entry = Entry{ .job = .{ .identifier = "my-job", .execution = 1605457800_000000000, .status = .planned } };
-    try format_entry_json(fbs.writer(), job_entry);
+    try format_entry_json(&w, job_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"set\",\"identifier\":\"my-job\",\"execution\":1605457800000000000,\"status\":\"planned\"}",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }
 
 test "format_entry_json writes rule_set object with shell runner" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const rule_entry = Entry{ .rule = .{
         .identifier = "my-rule",
         .pattern = "*/5 * * * *",
         .runner = .{ .shell = .{ .command = "echo hello" } },
     } };
-    try format_entry_json(fbs.writer(), rule_entry);
+    try format_entry_json(&w, rule_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"rule_set\",\"identifier\":\"my-rule\",\"pattern\":\"*/5 * * * *\",\"runner\":{\"type\":\"shell\",\"command\":\"echo hello\"}}",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }
 
 test "format_entry_json writes rule_set object with amqp runner" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const rule_entry = Entry{ .rule = .{
         .identifier = "amqp-rule",
         .pattern = "notify.",
         .runner = .{ .amqp = .{ .dsn = "amqp://localhost", .exchange = "events", .routing_key = "job.done" } },
     } };
-    try format_entry_json(fbs.writer(), rule_entry);
+    try format_entry_json(&w, rule_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"rule_set\",\"identifier\":\"amqp-rule\",\"pattern\":\"notify.\",\"runner\":{\"type\":\"amqp\",\"dsn\":\"amqp://localhost\",\"exchange\":\"events\",\"routing_key\":\"job.done\"}}",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }
 
 test "format_entry_json writes remove object for job removal" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const removal_entry = Entry{ .job_removal = .{ .identifier = "old-job" } };
-    try format_entry_json(fbs.writer(), removal_entry);
+    try format_entry_json(&w, removal_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"remove\",\"identifier\":\"old-job\"}",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }
 
 test "format_entry_json writes remove_rule object for rule removal" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const removal_entry = Entry{ .rule_removal = .{ .identifier = "old-rule" } };
-    try format_entry_json(fbs.writer(), removal_entry);
+    try format_entry_json(&w, removal_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"remove_rule\",\"identifier\":\"old-rule\"}",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }
 
 test "write_entry with text format writes text line without trailing newline in output" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const entry = Entry{ .job = .{ .identifier = "j1", .execution = 1000000000, .status = .planned } };
-    try write_entry(fbs.writer(), entry, .text);
-    try std.testing.expectEqualStrings("SET j1 1000000000 planned\n", fbs.getWritten());
+    try write_entry(&w, entry, .text);
+    try std.testing.expectEqualStrings("SET j1 1000000000 planned\n", buf[0..w.end]);
 }
 
 test "write_entry with json format writes JSON object with trailing newline" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const entry = Entry{ .job = .{ .identifier = "j1", .execution = 1000000000, .status = .planned } };
-    try write_entry(fbs.writer(), entry, .json);
+    try write_entry(&w, entry, .json);
     try std.testing.expectEqualStrings(
         "{\"type\":\"set\",\"identifier\":\"j1\",\"execution\":1000000000,\"status\":\"planned\"}\n",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }
 
 test "write_entry with json format writes rule entry as NDJSON line" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const entry = Entry{ .rule = .{
         .identifier = "r1",
         .pattern = "* * * * *",
         .runner = .{ .shell = .{ .command = "notify" } },
     } };
-    try write_entry(fbs.writer(), entry, .json);
+    try write_entry(&w, entry, .json);
     try std.testing.expectEqualStrings(
         "{\"type\":\"rule_set\",\"identifier\":\"r1\",\"pattern\":\"* * * * *\",\"runner\":{\"type\":\"shell\",\"command\":\"notify\"}}\n",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }
 
 test "format_entry_text writes RULE SET line for direct runner with no args" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const rule_entry = Entry{ .rule = .{
         .identifier = "direct-rule",
         .pattern = "* * * * *",
         .runner = .{ .direct = .{ .executable = "/usr/bin/notify-send", .args = &.{} } },
     } };
-    try format_entry_text(fbs.writer(), rule_entry);
-    try std.testing.expectEqualStrings("RULE SET direct-rule * * * * * direct /usr/bin/notify-send\n", fbs.getWritten());
+    try format_entry_text(&w, rule_entry);
+    try std.testing.expectEqualStrings("RULE SET direct-rule * * * * * direct /usr/bin/notify-send\n", buf[0..w.end]);
 }
 
 test "format_entry_text writes RULE SET line for direct runner with args" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const args = [_][]const u8{ "-s", "http://example.com" };
     const rule_entry = Entry{ .rule = .{
         .identifier = "curl-rule",
         .pattern = "0 * * * *",
         .runner = .{ .direct = .{ .executable = "/usr/bin/curl", .args = &args } },
     } };
-    try format_entry_text(fbs.writer(), rule_entry);
-    try std.testing.expectEqualStrings("RULE SET curl-rule 0 * * * * direct /usr/bin/curl -s http://example.com\n", fbs.getWritten());
+    try format_entry_text(&w, rule_entry);
+    try std.testing.expectEqualStrings("RULE SET curl-rule 0 * * * * direct /usr/bin/curl -s http://example.com\n", buf[0..w.end]);
 }
 
 test "format_entry_json writes rule_set object with direct runner and no args" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const rule_entry = Entry{ .rule = .{
         .identifier = "direct-rule",
         .pattern = "* * * * *",
         .runner = .{ .direct = .{ .executable = "/usr/bin/notify-send", .args = &.{} } },
     } };
-    try format_entry_json(fbs.writer(), rule_entry);
+    try format_entry_json(&w, rule_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"rule_set\",\"identifier\":\"direct-rule\",\"pattern\":\"* * * * *\",\"runner\":{\"type\":\"direct\",\"executable\":\"/usr/bin/notify-send\",\"args\":[]}}",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }
 
 test "format_entry_json writes rule_set object with direct runner and args" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const args = [_][]const u8{ "-s", "http://example.com" };
     const rule_entry = Entry{ .rule = .{
         .identifier = "curl-rule",
         .pattern = "0 * * * *",
         .runner = .{ .direct = .{ .executable = "/usr/bin/curl", .args = &args } },
     } };
-    try format_entry_json(fbs.writer(), rule_entry);
+    try format_entry_json(&w, rule_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"rule_set\",\"identifier\":\"curl-rule\",\"pattern\":\"0 * * * *\",\"runner\":{\"type\":\"direct\",\"executable\":\"/usr/bin/curl\",\"args\":[\"-s\",\"http://example.com\"]}}",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }
 
 test "format_entry_text writes RULE SET line for awf runner without inputs" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const rule_entry = Entry{ .rule = .{
         .identifier = "awf-rule",
         .pattern = "0 9 * * 1",
         .runner = .{ .awf = .{ .workflow = "code-review", .inputs = &.{} } },
     } };
-    try format_entry_text(fbs.writer(), rule_entry);
-    try std.testing.expectEqualStrings("RULE SET awf-rule 0 9 * * 1 awf code-review\n", fbs.getWritten());
+    try format_entry_text(&w, rule_entry);
+    try std.testing.expectEqualStrings("RULE SET awf-rule 0 9 * * 1 awf code-review\n", buf[0..w.end]);
 }
 
 test "format_entry_text writes RULE SET line for awf runner with inputs" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const inputs = [_][]const u8{ "format=pdf", "target=main" };
     const rule_entry = Entry{ .rule = .{
         .identifier = "report-rule",
         .pattern = "0 8 * * *",
         .runner = .{ .awf = .{ .workflow = "generate-report", .inputs = &inputs } },
     } };
-    try format_entry_text(fbs.writer(), rule_entry);
-    try std.testing.expectEqualStrings("RULE SET report-rule 0 8 * * * awf generate-report --input format=pdf --input target=main\n", fbs.getWritten());
+    try format_entry_text(&w, rule_entry);
+    try std.testing.expectEqualStrings("RULE SET report-rule 0 8 * * * awf generate-report --input format=pdf --input target=main\n", buf[0..w.end]);
 }
 
 test "format_entry_json writes rule_set object with awf runner without inputs" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const rule_entry = Entry{ .rule = .{
         .identifier = "awf-rule",
         .pattern = "0 9 * * 1",
         .runner = .{ .awf = .{ .workflow = "code-review", .inputs = &.{} } },
     } };
-    try format_entry_json(fbs.writer(), rule_entry);
+    try format_entry_json(&w, rule_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"rule_set\",\"identifier\":\"awf-rule\",\"pattern\":\"0 9 * * 1\",\"runner\":{\"type\":\"awf\",\"workflow\":\"code-review\",\"inputs\":[]}}",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }
 
 test "format_entry_json writes rule_set object with awf runner with inputs" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const inputs = [_][]const u8{ "format=pdf", "target=main" };
     const rule_entry = Entry{ .rule = .{
         .identifier = "report-rule",
         .pattern = "0 8 * * *",
         .runner = .{ .awf = .{ .workflow = "generate-report", .inputs = &inputs } },
     } };
-    try format_entry_json(fbs.writer(), rule_entry);
+    try format_entry_json(&w, rule_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"rule_set\",\"identifier\":\"report-rule\",\"pattern\":\"0 8 * * *\",\"runner\":{\"type\":\"awf\",\"workflow\":\"generate-report\",\"inputs\":[\"format=pdf\",\"target=main\"]}}",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }
 
 test "format_entry_text writes RULE SET line for http runner" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const rule_entry = Entry{ .rule = .{
         .identifier = "webhook-rule",
         .pattern = "deploy.",
         .runner = .{ .http = .{ .method = "POST", .url = "https://hooks.example.com/webhook" } },
     } };
-    try format_entry_text(fbs.writer(), rule_entry);
-    try std.testing.expectEqualStrings("RULE SET webhook-rule deploy. http POST https://hooks.example.com/webhook\n", fbs.getWritten());
+    try format_entry_text(&w, rule_entry);
+    try std.testing.expectEqualStrings("RULE SET webhook-rule deploy. http POST https://hooks.example.com/webhook\n", buf[0..w.end]);
 }
 
 test "format_entry_json writes rule_set object with http runner" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var w = std.Io.Writer.fixed(&buf);
     const rule_entry = Entry{ .rule = .{
         .identifier = "webhook-rule",
         .pattern = "deploy.",
         .runner = .{ .http = .{ .method = "POST", .url = "https://hooks.example.com/webhook" } },
     } };
-    try format_entry_json(fbs.writer(), rule_entry);
+    try format_entry_json(&w, rule_entry);
     try std.testing.expectEqualStrings(
         "{\"type\":\"rule_set\",\"identifier\":\"webhook-rule\",\"pattern\":\"deploy.\",\"runner\":{\"type\":\"http\",\"method\":\"POST\",\"url\":\"https://hooks.example.com/webhook\"}}",
-        fbs.getWritten(),
+        buf[0..w.end],
     );
 }

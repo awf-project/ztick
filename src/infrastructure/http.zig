@@ -17,6 +17,7 @@ const json_content_type: http.Header = .{ .name = "content-type", .value = "appl
 
 pub const HttpServer = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     address: []const u8,
     running: *std.atomic.Value(bool),
     request_ch: *Channel(query.Request),
@@ -27,6 +28,7 @@ pub const HttpServer = struct {
     /// Listen socket fd, set by start() and cleared before defer server.deinit()
     /// runs. deinit() closes it to interrupt a blocked accept() during shutdown.
     listen_fd: ?std.posix.socket_t,
+    signal_listen_fd: ?*std.atomic.Value(std.posix.socket_t),
 
     // Comptime substitution: replace the `__VERSION__` placeholder embedded
     // inside `openapi.json` with the canonical version from `build.zig.zon`,
@@ -49,6 +51,7 @@ pub const HttpServer = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
         address: []const u8,
         running: *std.atomic.Value(bool),
         request_ch: *Channel(query.Request),
@@ -57,6 +60,7 @@ pub const HttpServer = struct {
     ) HttpServer {
         return .{
             .allocator = allocator,
+            .io = io,
             .address = address,
             .running = running,
             .request_ch = request_ch,
@@ -65,6 +69,7 @@ pub const HttpServer = struct {
             .bearer_token = bearer_token,
             .active_connections = std.atomic.Value(usize).init(0),
             .listen_fd = null,
+            .signal_listen_fd = null,
         };
     }
 
@@ -75,13 +80,14 @@ pub const HttpServer = struct {
         }
     }
 
-    pub fn start(self: *HttpServer) !void {
+    pub fn start(self: *HttpServer, io: std.Io) !void {
         const listen_addr = parse_address(self.address) orelse return;
-        var server = listen_addr.listen(.{ .reuse_address = true }) catch return;
-        self.listen_fd = server.stream.handle;
+        var server = std.Io.net.IpAddress.listen(&listen_addr, io, .{ .reuse_address = true }) catch return;
+        self.listen_fd = server.socket.handle;
+        if (self.signal_listen_fd) |sig_fd| sig_fd.store(server.socket.handle, .release);
 
         while (self.running.load(.acquire)) {
-            const conn = server.accept() catch |err| switch (err) {
+            const stream = server.accept(io) catch |err| switch (err) {
                 error.SocketNotListening => break,
                 else => {
                     if (!self.running.load(.acquire)) break;
@@ -89,37 +95,36 @@ pub const HttpServer = struct {
                 },
             };
             _ = self.active_connections.fetchAdd(1, .release);
-            const thread = std.Thread.spawn(.{}, http_connection_worker, .{ &self.active_connections, self, conn.stream }) catch {
+            const thread = std.Thread.spawn(.{}, http_connection_worker, .{ &self.active_connections, self, io, stream }) catch {
                 _ = self.active_connections.fetchSub(1, .release);
-                conn.stream.close();
+                stream.close(io);
                 continue;
             };
             thread.detach();
         }
 
-        // Clear listen_fd before server.deinit() closes the underlying fd,
-        // so deinit() does not attempt a second close after start() returns.
+        if (self.signal_listen_fd) |sig_fd| sig_fd.store(-1, .release);
         self.listen_fd = null;
-        server.deinit();
+        server.deinit(io);
     }
 
     pub fn join_all(self: *HttpServer) void {
         var iterations: usize = 0;
         while (self.active_connections.load(.acquire) > 0) {
             if (iterations >= 5000) break;
-            std.Thread.sleep(1_000_000);
+            std.Io.sleep(self.io, .{ .nanoseconds = 1_000_000 }, .awake) catch {};
             iterations += 1;
         }
     }
 
-    fn handle_connection(self: *HttpServer, stream: std.net.Stream) void {
-        defer stream.close();
+    fn handle_connection(self: *HttpServer, io: std.Io, stream: std.Io.net.Stream) void {
+        defer stream.close(io);
 
         var read_buf: [8192]u8 = undefined;
         var write_buf: [8192]u8 = undefined;
-        var net_reader = stream.reader(&read_buf);
-        var net_writer = stream.writer(&write_buf);
-        var srv = http.Server.init(net_reader.interface(), &net_writer.interface);
+        var net_reader = stream.reader(io, &read_buf);
+        var net_writer = stream.writer(io, &write_buf);
+        var srv = http.Server.init(&net_reader.interface, &net_writer.interface);
 
         var request = srv.receiveHead() catch {
             self.send_error_response(&srv, .bad_request, "bad request");
@@ -316,7 +321,7 @@ pub const HttpServer = struct {
 
         if (response.body) |resp_body| {
             defer self.allocator.free(resp_body);
-            var jobs = std.ArrayListUnmanaged(json.JobEntry){};
+            var jobs: std.ArrayListUnmanaged(json.JobEntry) = .empty;
             defer jobs.deinit(self.allocator);
 
             var lines = std.mem.splitScalar(u8, resp_body, '\n');
@@ -436,7 +441,7 @@ pub const HttpServer = struct {
 
         if (response.body) |resp_body| {
             defer self.allocator.free(resp_body);
-            var rules = std.ArrayListUnmanaged(json.RuleEntry){};
+            var rules: std.ArrayListUnmanaged(json.RuleEntry) = .empty;
             defer rules.deinit(self.allocator);
 
             var lines = std.mem.splitScalar(u8, resp_body, '\n');
@@ -478,7 +483,7 @@ pub const HttpServer = struct {
     fn send_query(self: *HttpServer, instr: instruction.Instruction) ?query.Response {
         const client_id = self.next_client_id.fetchAdd(1, .monotonic);
 
-        var resp_ch = Channel(query.Response).init(self.allocator, 1) catch return null;
+        var resp_ch = Channel(query.Response).init(self.allocator, self.io, 1) catch return null;
         defer resp_ch.deinit();
 
         self.response_router.register(client_id, &resp_ch) catch return null;
@@ -494,9 +499,9 @@ pub const HttpServer = struct {
     }
 };
 
-fn http_connection_worker(active_connections: *std.atomic.Value(usize), self: *HttpServer, stream: std.net.Stream) void {
+fn http_connection_worker(active_connections: *std.atomic.Value(usize), self: *HttpServer, io: std.Io, stream: std.Io.net.Stream) void {
     defer _ = active_connections.fetchSub(1, .release);
-    self.handle_connection(stream);
+    self.handle_connection(io, stream);
 }
 
 fn extract_resource_id(path: []const u8, prefix: []const u8) ?[]const u8 {
@@ -521,11 +526,11 @@ fn is_public_path(path: []const u8) bool {
     return std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/openapi.json");
 }
 
-fn parse_address(address: []const u8) ?std.net.Address {
+fn parse_address(address: []const u8) ?std.Io.net.IpAddress {
     const colon = std.mem.lastIndexOfScalar(u8, address, ':') orelse return null;
     const host = address[0..colon];
     const port = std.fmt.parseUnsigned(u16, address[colon + 1 ..], 10) catch return null;
-    return std.net.Address.parseIp(host, port) catch return null;
+    return std.Io.net.IpAddress.parse(host, port) catch return null;
 }
 
 fn build_awf_runner(allocator: std.mem.Allocator, args: []const []const u8) ?runner_mod.Runner {
@@ -688,19 +693,19 @@ test "build_http_runner returns null for invalid url scheme" {
 test "join_all returns immediately when no active connections" {
     const allocator = std.testing.allocator;
     var running = std.atomic.Value(bool).init(false);
-    var request_ch = try Channel(query.Request).init(allocator, 1);
+    var request_ch = try Channel(query.Request).init(allocator, std.testing.io, 1);
     defer request_ch.deinit();
-    var response_router = ResponseRouter.init(allocator);
+    var response_router = ResponseRouter.init(allocator, std.testing.io);
     defer response_router.deinit();
 
-    var server = HttpServer.init(allocator, "127.0.0.1:0", &running, &request_ch, &response_router, null);
+    var server = HttpServer.init(allocator, std.testing.io, "127.0.0.1:0", &running, &request_ch, &response_router, null);
     server.join_all();
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
 }
 
 const SocketPair = struct {
     read_fd: std.posix.socket_t,
-    write_stream: std.net.Stream,
+    write_stream: std.Io.net.Stream,
 };
 
 fn make_socket_pair() !SocketPair {
@@ -709,29 +714,35 @@ fn make_socket_pair() !SocketPair {
     try std.testing.expectEqual(@as(usize, 0), rc);
     const read_fd: std.posix.socket_t = @intCast(fds[0]);
     const write_fd: std.posix.socket_t = @intCast(fds[1]);
+    const dummy_addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
     return .{
         .read_fd = read_fd,
-        .write_stream = std.net.Stream{ .handle = write_fd },
+        .write_stream = std.Io.net.Stream{ .socket = .{ .handle = write_fd, .address = dummy_addr } },
     };
 }
 
-fn decrement_after_delay(counter: *std.atomic.Value(usize)) void {
-    std.Thread.sleep(10_000_000);
-    _ = counter.fetchSub(1, .release);
+const DecrementArgs = struct {
+    counter: *std.atomic.Value(usize),
+    io: std.Io,
+};
+
+fn decrement_after_delay(args: DecrementArgs) void {
+    std.Io.sleep(args.io, .{ .nanoseconds = 10_000_000 }, .awake) catch {};
+    _ = args.counter.fetchSub(1, .release);
 }
 
 test "join_all waits for active connections to drain" {
     const allocator = std.testing.allocator;
     var running = std.atomic.Value(bool).init(false);
-    var request_ch = try Channel(query.Request).init(allocator, 1);
+    var request_ch = try Channel(query.Request).init(allocator, std.testing.io, 1);
     defer request_ch.deinit();
-    var response_router = ResponseRouter.init(allocator);
+    var response_router = ResponseRouter.init(allocator, std.testing.io);
     defer response_router.deinit();
 
-    var server = HttpServer.init(allocator, "127.0.0.1:0", &running, &request_ch, &response_router, null);
+    var server = HttpServer.init(allocator, std.testing.io, "127.0.0.1:0", &running, &request_ch, &response_router, null);
     _ = server.active_connections.fetchAdd(1, .release);
 
-    const t = try std.Thread.spawn(.{}, decrement_after_delay, .{&server.active_connections});
+    const t = try std.Thread.spawn(.{}, decrement_after_delay, .{DecrementArgs{ .counter = &server.active_connections, .io = std.testing.io }});
     defer t.join();
 
     server.join_all();
@@ -741,19 +752,20 @@ test "join_all waits for active connections to drain" {
 test "http_connection_worker decrements active_connections on exit" {
     const allocator = std.testing.allocator;
     var running = std.atomic.Value(bool).init(false);
-    var request_ch = try Channel(query.Request).init(allocator, 1);
+    var request_ch = try Channel(query.Request).init(allocator, std.testing.io, 1);
     defer request_ch.deinit();
-    var response_router = ResponseRouter.init(allocator);
+    var response_router = ResponseRouter.init(allocator, std.testing.io);
     defer response_router.deinit();
 
-    var server = HttpServer.init(allocator, "127.0.0.1:0", &running, &request_ch, &response_router, null);
+    var server = HttpServer.init(allocator, std.testing.io, "127.0.0.1:0", &running, &request_ch, &response_router, null);
     _ = server.active_connections.store(1, .release);
 
     const pair = try make_socket_pair();
-    pair.write_stream.close();
+    pair.write_stream.close(std.testing.io);
 
-    const read_stream = std.net.Stream{ .handle = pair.read_fd };
-    http_connection_worker(&server.active_connections, &server, read_stream);
+    const dummy_addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+    const read_stream = std.Io.net.Stream{ .socket = .{ .handle = pair.read_fd, .address = dummy_addr } };
+    http_connection_worker(&server.active_connections, &server, std.testing.io, read_stream);
 
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
 }
@@ -761,22 +773,23 @@ test "http_connection_worker decrements active_connections on exit" {
 test "http server tracks active connections across worker lifecycle" {
     const allocator = std.testing.allocator;
     var running = std.atomic.Value(bool).init(false);
-    var request_ch = try Channel(query.Request).init(allocator, 1);
+    var request_ch = try Channel(query.Request).init(allocator, std.testing.io, 1);
     defer request_ch.deinit();
-    var response_router = ResponseRouter.init(allocator);
+    var response_router = ResponseRouter.init(allocator, std.testing.io);
     defer response_router.deinit();
 
-    var server = HttpServer.init(allocator, "127.0.0.1:0", &running, &request_ch, &response_router, null);
+    var server = HttpServer.init(allocator, std.testing.io, "127.0.0.1:0", &running, &request_ch, &response_router, null);
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
 
     _ = server.active_connections.fetchAdd(1, .release);
     try std.testing.expectEqual(@as(usize, 1), server.active_connections.load(.acquire));
 
     const pair = try make_socket_pair();
-    pair.write_stream.close();
+    pair.write_stream.close(std.testing.io);
 
-    const read_stream = std.net.Stream{ .handle = pair.read_fd };
-    http_connection_worker(&server.active_connections, &server, read_stream);
+    const dummy_addr = std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+    const read_stream = std.Io.net.Stream{ .socket = .{ .handle = pair.read_fd, .address = dummy_addr } };
+    http_connection_worker(&server.active_connections, &server, std.testing.io, read_stream);
 
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
 }
