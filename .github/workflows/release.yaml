@@ -114,7 +114,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: mv zig-out/bin/ztick "zig-out/bin/ztick-$TARGET"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ztick-${{ matrix.target }}
           path: zig-out/bin/ztick-${{ matrix.target }}
@@ -128,7 +128,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: ztick-*
           merge-multiple: true
@@ -157,7 +157,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: ztick-*
           merge-multiple: true
