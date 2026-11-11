@@ -10,18 +10,18 @@
   },
   "scripts": {
     "create": "hugo new",
-    "dev": "hugo server --disableFastRender --noHTTPCache",
+    "dev": "node scripts/hugo.mjs server --disableFastRender --noHTTPCache",
     "format": "prettier **/** -w -c",
-    "build": "hugo --minify --gc",
+    "build": "node scripts/hugo.mjs --minify --gc",
     "preview": "vite preview --outDir public"
   },
   "dependencies": {
-    "@thulite/doks-core": "^1.9.3",
     "@tabler/icons": "^3.36.1",
+    "@thulite/doks-core": "^1.9.3",
     "@thulite/images": "^3.3.4",
     "@thulite/inline-svg": "^1.2.2",
-    "@thulite/seo": "^2.4.3",
-    "thulite": "^2.6.5"
+    "@thulite/seo": "^2.4.4",
+    "thulite": "^3.0.3"
   },
   "overrides": {
     "minimatch": "^11.0.0",
@@ -29,9 +29,11 @@
   },
   "devDependencies": {
     "prettier": "^3.8.1",
+    "sass-embedded": "^1.108.2",
     "vite": "^8.0.0"
   },
   "engines": {
     "node": ">=24.13.0"
-  }
+  },
+  "type": "module"
 }

@@ -1,0 +1,48 @@
+# Tower indexing is independent of Git. Keep source, documentation and fixtures visible.
+
+# Zig build output
+zig-out/
+zig-cache/
+.zig-cache/
+zig-pkg/
+*.o
+*.a
+
+# Generated site and package output
+node_modules/
+npm-cache/
+dist/
+build/
+out/
+coverage/
+playwright-report/
+test-results/
+site/public/
+site/resources/
+site/hugo_stats.json
+*.tsbuildinfo
+
+# Runtime data and temporary files (do not exclude the test/ source directory)
+*.db
+logfile
+logfile.compressed
+ztick.log
+dump.rdb
+test_timing
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Local environment and private keys
+.env
+.env.*
+*.env
+!.env.example
+*.pem
+*.key
+
+# Additional build output and private directories
+target/
+vendor/
+secrets/
