@@ -94,24 +94,28 @@
 [[mounts]]
   source = "../docs/tutorials"
   target = "content/docs/tutorials"
-  excludeFiles = ["README.md"]
+  files = ["! README.md"]
 
 [[mounts]]
   source = "../docs/user-guide"
   target = "content/docs/user-guide"
-  excludeFiles = ["README.md"]
+  files = ["! README.md"]
 
 [[mounts]]
   source = "../docs/reference"
   target = "content/docs/reference"
-  excludeFiles = ["README.md"]
+  files = ["! README.md"]
 
 [[mounts]]
   source = "../docs/development"
   target = "content/docs/development"
-  excludeFiles = ["README.md"]
+  files = ["! README.md"]
 
 [[mounts]]
   source = "../docs/ADR"
   target = "content/docs/adr"
-  excludeFiles = ["README.md", ".template.md"]
+  files = ["! README.md", "! .template.md"]
+
+[hugoVersion]
+  extended = true
+  min = "0.167.0"

@@ -1,1 +1,4 @@
-data/
+# Local runtime state. Keep mounts.json, Prolog sources and segment WALs versioned:
+# journal.wal can contain knowledge not yet included in a snapshot.
+/data/
+/kb/**/journal.lock

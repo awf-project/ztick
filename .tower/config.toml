@@ -1,0 +1,31 @@
+# Tower local project configuration.
+#
+# [extensions] configures native out-of-process sidecars by manifest name.
+# Add names to `disabled` to prevent those sidecars from being spawned.
+[extensions]
+disabled = []
+#
+# [formatter.tools.<id>] entries are commands run by the host format queue when
+# a file changes. mode = "filter" (default, stdin->stdout) or "inplace".
+# Uninstalled tools are skipped, so you can safely keep entries you do not use.
+
+[formatter.tools.rustfmt]
+argv = ["rustfmt", "--edition", "2021"]
+extensions = ["rs"]
+
+[formatter.tools.gofmt]
+argv = ["gofmt"]
+extensions = ["go"]
+
+[formatter.tools.zigfmt]
+argv = ["zig", "fmt", "--stdin"]
+extensions = ["zig"]
+
+[formatter.tools.prettier]
+argv = ["prettier", "--stdin-filepath", "{path}"]
+extensions = ["ts", "tsx", "js", "jsx"]
+
+[formatter.tools.php-cs-fixer]
+mode = "inplace"
+argv = ["php-cs-fixer", "fix", "{path}"]
+extensions = ["php"]
