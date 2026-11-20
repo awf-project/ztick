@@ -91,11 +91,14 @@ pub fn redact_dsn(dsn: []const u8) []const u8 {
 
 const amqp_scheme = "amqp://";
 const frame_end: u8 = 0xCE;
+const client_frame_max: u32 = 131072;
+const min_frame_max: u32 = 4096; // AMQP 0-9-1 frame-min-size
+const frame_overhead = 8; // Seven header bytes and the frame-end octet.
 
 const Frame = struct {
     frame_type: u8,
     channel: u16,
-    payload: []u8,
+    payload: []const u8,
 };
 
 fn write_frame(writer: anytype, frame_type: u8, channel: u16, payload: []const u8) !void {
@@ -155,14 +158,21 @@ fn encode_connection_start_ok(allocator: std.mem.Allocator, writer: anytype, use
     try write_frame(writer, 0x01, 0, w.buffered());
 }
 
-fn encode_connection_tune_ok(writer: anytype, channel_max: u16, frame_max: u32, heartbeat: u16) !void {
+fn encode_connection_tune_ok(writer: anytype, tune: Frame) !u32 {
+    if (tune.channel != 0 or tune.payload.len != 12) return error.UnexpectedFrame;
+    const offered = std.mem.readInt(u32, tune.payload[6..10], .big);
+    const frame_max = if (offered == 0) client_frame_max else @min(offered, client_frame_max);
+    if (frame_max < min_frame_max) return error.InvalidFrameMax;
+
     var payload: [12]u8 = undefined;
     std.mem.writeInt(u16, payload[0..2], 0x000A, .big);
     std.mem.writeInt(u16, payload[2..4], 0x001F, .big);
-    std.mem.writeInt(u16, payload[4..6], channel_max, .big);
+    // Each execution publishes on channel 1 and closes the connection.
+    std.mem.writeInt(u16, payload[4..6], 1, .big);
     std.mem.writeInt(u32, payload[6..10], frame_max, .big);
-    std.mem.writeInt(u16, payload[10..12], heartbeat, .big);
+    std.mem.writeInt(u16, payload[10..12], 0, .big);
     try write_frame(writer, 0x01, 0, &payload);
+    return frame_max;
 }
 
 fn encode_connection_open(writer: anytype, vhost: []const u8) !void {
@@ -203,7 +213,7 @@ fn encode_channel_open(writer: anytype, channel: u16) !void {
     try write_frame(writer, 0x01, channel, &payload);
 }
 
-fn encode_basic_publish(allocator: std.mem.Allocator, writer: anytype, channel: u16, exchange: []const u8, routing_key: []const u8, body: []const u8) !void {
+fn encode_basic_publish(allocator: std.mem.Allocator, writer: anytype, channel: u16, exchange: []const u8, routing_key: []const u8, body: []const u8, frame_max: u32) !void {
     if (exchange.len > 255) return error.ExchangeNameTooLong;
     if (routing_key.len > 255) return error.RoutingKeyTooLong;
     // === Method frame: Basic.Publish ===
@@ -243,8 +253,12 @@ fn encode_basic_publish(allocator: std.mem.Allocator, writer: anytype, channel: 
     std.mem.writeInt(u16, header_payload[12..14], 0, .big);
     try write_frame(writer, 0x02, channel, &header_payload);
 
-    // === Body frame ===
-    try write_frame(writer, 0x03, channel, body);
+    var remaining = body;
+    while (remaining.len > 0) {
+        const size = @min(remaining.len, frame_max - frame_overhead);
+        try write_frame(writer, 0x03, channel, remaining[0..size]);
+        remaining = remaining[size..];
+    }
 }
 
 fn encode_channel_close(writer: anytype, channel: u16) !void {
@@ -333,14 +347,14 @@ fn flush_buf(fd: std.posix.fd_t, aw: *std.Io.Writer.Allocating) !void {
 // Connection.Close (class=10, method=50), the payload is consumed and
 // error.PeerClose is returned. If the frame's class/method does not
 // match expected, error.UnexpectedFrame is returned.
-fn expect_method(
+fn read_method(
     allocator: std.mem.Allocator,
     reader: anytype,
     expected_class: u16,
     expected_method: u16,
-) !void {
+) !Frame {
     const frame = try read_frame(allocator, reader);
-    defer allocator.free(frame.payload);
+    errdefer allocator.free(frame.payload);
 
     if (frame.frame_type != 0x01 or frame.payload.len < 4) {
         return error.UnexpectedFrame;
@@ -354,6 +368,12 @@ fn expect_method(
     if (class_id != expected_class or method_id != expected_method) {
         return error.UnexpectedFrame;
     }
+    return frame;
+}
+
+fn expect_method(allocator: std.mem.Allocator, reader: anytype, expected_class: u16, expected_method: u16) !void {
+    const frame = try read_method(allocator, reader, expected_class, expected_method);
+    allocator.free(frame.payload);
 }
 
 fn run_handshake(
@@ -380,10 +400,11 @@ fn run_handshake(
     try flush_buf(fd, &aw);
 
     // 4. Receive Connection.Tune (class=10, method=30)
-    try expect_method(allocator, reader, 0x000A, 0x001E);
+    const tune = try read_method(allocator, reader, 0x000A, 0x001E);
+    defer allocator.free(tune.payload);
 
     // 5. Send Connection.TuneOk with conservative client values
-    try encode_connection_tune_ok(&aw.writer, 2047, 131072, 0);
+    const frame_max = try encode_connection_tune_ok(&aw.writer, tune);
     try flush_buf(fd, &aw);
 
     // 6. Send Connection.Open with vhost
@@ -401,7 +422,7 @@ fn run_handshake(
     try expect_method(allocator, reader, 0x0014, 0x000B);
 
     // 10. Send Basic.Publish
-    try encode_basic_publish(allocator, &aw.writer, 1, exchange, routing_key, body);
+    try encode_basic_publish(allocator, &aw.writer, 1, exchange, routing_key, body, frame_max);
     try flush_buf(fd, &aw);
 
     // 11. Send Channel.Close on channel 1
@@ -539,16 +560,24 @@ test "encode_connection_start_ok produces PLAIN auth frame for AMQP 0-9-1 handsh
     try std.testing.expectEqualSlices(u8, &expected, aw.writer.buffered());
 }
 
-test "encode_connection_tune_ok echoes channel_max frame_max and heartbeat as TuneOk frame" {
+test "Connection.TuneOk requests one channel and respects the broker frame limit" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
-    try encode_connection_tune_ok(&aw.writer, 2047, 131072, 60);
+    var offer = [_]u8{ 0, 10, 0, 30, 1, 0, 0, 0, 0x10, 0, 0, 60 };
+    const tune = Frame{ .frame_type = 1, .channel = 0, .payload = &offer };
+    try std.testing.expectEqual(min_frame_max, try encode_connection_tune_ok(&aw.writer, tune));
     const expected = [_]u8{
         0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C,
-        0x00, 0x0A, 0x00, 0x1F, 0x07, 0xFF, 0x00,
-        0x02, 0x00, 0x00, 0x00, 0x3C, 0xCE,
+        0x00, 0x0A, 0x00, 0x1F, 0x00, 0x01, 0x00,
+        0x00, 0x10, 0x00, 0x00, 0x00, 0xCE,
     };
     try std.testing.expectEqualSlices(u8, &expected, aw.writer.buffered());
+    for ([_]u32{ 0, client_frame_max * 2 }) |offered| {
+        std.mem.writeInt(u32, offer[6..10], offered, .big);
+        try std.testing.expectEqual(client_frame_max, try encode_connection_tune_ok(&aw.writer, tune));
+    }
+    std.mem.writeInt(u32, offer[6..10], min_frame_max - 1, .big);
+    try std.testing.expectError(error.InvalidFrameMax, encode_connection_tune_ok(&aw.writer, tune));
 }
 
 test "encode_connection_open produces Connection.Open frame for vhost /" {
@@ -577,7 +606,7 @@ test "encode_channel_open on channel 1 produces Channel.Open frame" {
 test "encode_basic_publish produces method header and body frames with 0xCE sentinels" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
-    try encode_basic_publish(std.testing.allocator, &aw.writer, 1, "jobs", "notifications", "test");
+    try encode_basic_publish(std.testing.allocator, &aw.writer, 1, "jobs", "notifications", "test", client_frame_max);
     const expected = [_]u8{
         0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x1A,
         0x00, 0x3C, 0x00, 0x28, 0x00, 0x00, 0x04,
@@ -591,6 +620,30 @@ test "encode_basic_publish produces method header and body frames with 0xCE sent
         't',  'e',  's',  't',  0xCE,
     };
     try std.testing.expectEqualSlices(u8, &expected, aw.writer.buffered());
+}
+
+test "Basic.Publish splits the body at the negotiated frame boundary" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const capacity = min_frame_max - frame_overhead;
+    const body = "x" ** capacity ++ "y";
+    try encode_basic_publish(std.testing.allocator, &aw.writer, 1, "", "", body, min_frame_max);
+
+    var reader = std.Io.Reader.fixed(aw.writer.buffered());
+    // Skip Basic.Publish and the content header using their on-wire lengths.
+    for (0..2) |_| {
+        try reader.discardAll(3);
+        const length = try reader.takeInt(u32, .big);
+        try reader.discardAll(length + 1);
+    }
+    for ([_][]const u8{ body[0..capacity], "y" }) |chunk| {
+        try std.testing.expectEqual(3, try reader.takeByte());
+        try std.testing.expectEqual(1, try reader.takeInt(u16, .big));
+        try std.testing.expectEqual(chunk.len, try reader.takeInt(u32, .big));
+        try std.testing.expectEqualSlices(u8, chunk, try reader.take(chunk.len));
+        try std.testing.expectEqual(frame_end, try reader.takeByte());
+    }
+    try std.testing.expectError(error.EndOfStream, reader.takeByte());
 }
 
 test "encode_channel_close produces Channel.Close frame with normal closure" {
@@ -628,7 +681,7 @@ test "encode_basic_publish returns error.ExchangeNameTooLong for exchange > 255 
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     const long_exchange = "x" ** 256;
-    try std.testing.expectError(error.ExchangeNameTooLong, encode_basic_publish(std.testing.allocator, &aw.writer, 1, long_exchange, "key", "body"));
+    try std.testing.expectError(error.ExchangeNameTooLong, encode_basic_publish(std.testing.allocator, &aw.writer, 1, long_exchange, "key", "body", client_frame_max));
 }
 
 test "execute returns success=false for malformed DSN without raising" {

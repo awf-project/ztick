@@ -1,5 +1,5 @@
 % base-schema.pl — Shared AWF knowledge-base schema.
-% Loaded automatically from .zpm/kb/default/.
+% Loaded by the default engine from .zpm/kb/ at startup.
 
 % Dynamic declarations — required by Trealla Prolog so that rules referencing
 % these predicates compile even before any facts are asserted at runtime.
@@ -12,12 +12,15 @@
 :- dynamic(test_file/2).
 :- dynamic(source_file/1).
 :- dynamic(adr/3).
+:- dynamic(supersedes/2).
+:- dynamic(task_risk/3).
 :- dynamic(workflow_run/3).
 :- dynamic(impl_note/3).
 :- dynamic(feedback_rule/3).
 :- dynamic(imports/2).
 :- dynamic(layer/2).
 :- dynamic(uses_panic/1).
+:- dynamic(uses_any_type/1).
 :- dynamic(coverage/2).
 :- dynamic(integrity_violation/2).
 
@@ -70,29 +73,15 @@ pipeline_handled(Path) :- nonvar(Path), sub_atom(Path, 0, _, _, 'ADR/').
 % test_file(SourcePath, TestPath).
 % covered_by(Source, Test) :- test_file(Source, Test).
 
-% Decision: wrap test_file/2 in catch/3, same reason as current_decision.
-% Why: ZPM (Scryer Prolog) raises existence_error when a constitution rule
-% evaluates \+ covered_by(File, _) on a fresh KB with zero test_file facts.
-% catch/3 intercepts that error and cleanly fails, so the negation succeeds
-% ("no test covers this source") and missing_test violations derive correctly.
 covered_by(Source, Test) :-
-    catch(test_file(Source, Test), _, fail).
+    test_file(Source, Test).
 
 % --- ADR (written by plan/spec-generate, read by architecture reviews) ---
 % adr(Id, Title, Decision).
 % supersedes(NewId, OldId).
-% current_decision(Decision) :-
-%     adr(Id, _, Decision), \+ supersedes(_, Id).
-
-% Decision: use catch/3 instead of \+/1 for supersedes check.
-% Why: ZPM (Scryer Prolog) raises existence_error when \+ calls an
-% undefined predicate. catch/3 handles both the undefined-predicate case
-% (no supersedes facts yet → succeed) and the normal case (supersedes
-% facts exist → \+ evaluates correctly).
-% Trade-off: slightly less idiomatic Prolog; necessary for ZPM compatibility.
 current_decision(Id, Decision) :-
     adr(Id, _, Decision),
-    catch((\+ supersedes(_, Id)), _, true).
+    \+ supersedes(_, Id).
 
 % --- Feedback rules (written by feedback workflow, read by review agents) ---
 % feedback_rule(Topic, Date, Text).
@@ -165,57 +154,11 @@ observations_by_category(Cat, Ids) :-
 
 decisions_about(Topic, Ids) :-
     findall(Id, (decision(Id, What, _, _), sub_atom(What, _, _, _, Topic)), Ids).
-% constitution-js.pl — JavaScript/TypeScript project integrity rules (Prolog).
-% Loaded automatically from .zpm/kb/ alongside base-schema.pl.
-%
-% Encodes a machine-checkable subset of Project Constitution v1.0.0 (js.md).
-% Rules produce integrity_violation(Kind, File) facts that audit tooling queries.
-%
-% ---  8 Principles (verbatim titles + 1-line summaries from js.md)  -----------
-%
-% P1 — Type Safety First
-%      No `any` types; strict: true in tsconfig; branded types for domain IDs.
-%
-% P2 — Server-First Architecture
-%      No global client state (Zustand/Redux); Server Components by default.
-%
-% P3 — Test-Driven Development
-%      RED → GREEN → REFACTOR; 80% minimum code coverage; Vitest + Playwright.
-%
-% P4 — Colocation
-%      Components next to tests; route-specific components in route dirs.
-%      (Not modelled: structural heuristic without directory-tree facts)
-%
-% P5 — Security First
-%      Validate at API boundaries; no secrets in client code.
-%      (Not modelled: requires data-flow analysis, beyond static ZPM facts)
-%
-% P6 — Minimal Abstraction
-%      No premature optimisation; delete unused code; prefer composition.
-%      (Not modelled: heuristic too weak without AST; no reliable Prolog rule)
-%
-% P7 — Database as Source of Truth
-%      Prisma schema is canonical; migrations append-only; transactions for multi-table ops.
-%      (Not modelled: semantic constraint on Prisma schema, not statically expressible)
-%
-% P8 — Docker-First Development
-%      All development in containers; never run npm/npx on host.
-%      (Not modelled: environment/infra constraint, not source-file checkable)
-%
-% ---------------------------------------------------------------------------
-%
-% FACT SCHEMA (asserted by callers, e.g. via zpm-assert.sh):
-%
-%   layer(File, Layer)          File belongs to Layer.
-%                               Layer ∈ {domain, application, infrastructure, interfaces}
-%   imports(File, Target)       File depends on Target (path atom or package atom).
-%   source_file(File)           File is a TS/JS source file tracked in the project.
-%   coverage(File, Pct)         File has measured test coverage Pct (integer 0-100).
-%   uses_any_type(File)         File contains an `any` type annotation (P1).
-%
-%   covered_by/2 is defined in base-schema.pl via test_file/2 — do NOT redefine here.
-%
-% ---------------------------------------------------------------------------
+
+% Project integrity checks use facts supplied by the workflows.
+% layer/2 and imports/2 describe dependencies between the four ztick layers.
+% test_file/2 can link a Zig source file to itself for colocated test blocks.
+% uses_any_type/1 and the client-state checks are for JS/TS inputs.
 
 % layer_index/2: numeric order of layers, inner (low) → outer (high).
 % Used to detect when a lower-indexed layer imports a higher-indexed layer.
@@ -295,24 +238,3 @@ integrity_violation(global_client_state, File) :-
 integrity_violation(low_coverage, File) :-
     coverage(File, Pct),
     Pct < 80.
-
-% --- Skipped rules ----------------------------------------------------------
-%
-% P4 — colocation:
-%   Requires directory-tree facts to check that Button.tsx and Button.test.tsx
-%   are siblings. No reliable Prolog rule without tree topology facts.
-%
-% P5 — security:
-%   Detecting secrets in source or missing Zod validation at API routes
-%   requires data-flow analysis. Beyond static ZPM facts.
-%
-% P6 — minimal abstraction:
-%   Heuristic (e.g. class hierarchy depth, duplicate code) needs AST metrics.
-%   No reliable static rule.
-%
-% P7 — Prisma as source of truth:
-%   Semantic constraint on schema consistency. Not expressible without
-%   Prisma schema parser output.
-%
-% P8 — Docker-first:
-%   Environment/infra rule. Not a source-file integrity check.

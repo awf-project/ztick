@@ -740,6 +740,22 @@ const TestServer = struct {
         };
     }
 
+    /// Connect to the listener reported by this child when configured with port zero.
+    fn connect_controller(self: *TestServer) !std.Io.net.Stream {
+        const io = std.testing.io;
+        var buffer: [2048]u8 = undefined;
+        var stderr = self.child.stderr.?.readerStreaming(io, &buffer);
+        const prefix = "[INFO] listening on ";
+        while (try stderr.interface.takeDelimiter('\n')) |line| {
+            if (std.mem.startsWith(u8, line, prefix)) {
+                const address = try std.Io.net.IpAddress.parseLiteral(line[prefix.len..]);
+                return std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
+            }
+            if (std.mem.startsWith(u8, line, "[ERROR]")) return error.ServerStartFailed;
+        }
+        return error.ServerStartFailed;
+    }
+
     fn stop(self: *TestServer) void {
         self.child.kill(std.testing.io);
         self.allocator.free(self.config_path);
@@ -5033,157 +5049,144 @@ test "multiple concurrent HTTP connections all complete before shutdown" {
 // Feature: F023
 
 test "F023: GET for non-existent job returns not_found error code" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
         allocator,
-        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:20001\"\n\n[database]\npersistence = \"memory\"\n",
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n",
     );
     defer server.stop();
 
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20001) catch unreachable;
-    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    const stream = try server.connect_controller();
     defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = sock_write(stream.socket.handle, "r1 GET nonexistent.job\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "r1 GET nonexistent.job\n");
 
     var buf: [128]u8 = undefined;
-    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
+    const n = try std.posix.read(stream.socket.handle, &buf);
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "r1 ERROR not_found") != null);
 }
 
 test "F023: REMOVE for non-existent job returns not_found error code" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
         allocator,
-        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:20002\"\n\n[database]\npersistence = \"memory\"\n",
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n",
     );
     defer server.stop();
 
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20002) catch unreachable;
-    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    const stream = try server.connect_controller();
     defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = sock_write(stream.socket.handle, "r1 REMOVE nonexistent.job\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "r1 REMOVE nonexistent.job\n");
 
     var buf: [128]u8 = undefined;
-    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
+    const n = try std.posix.read(stream.socket.handle, &buf);
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "r1 ERROR not_found") != null);
 }
 
 test "F023: REMOVERULE for non-existent rule returns not_found error code" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
         allocator,
-        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:20003\"\n\n[database]\npersistence = \"memory\"\n",
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n",
     );
     defer server.stop();
 
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20003) catch unreachable;
-    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    const stream = try server.connect_controller();
     defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = sock_write(stream.socket.handle, "r1 REMOVERULE nonexistent.rule\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "r1 REMOVERULE nonexistent.rule\n");
 
     var buf: [128]u8 = undefined;
-    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
+    const n = try std.posix.read(stream.socket.handle, &buf);
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "r1 ERROR not_found") != null);
 }
 
 test "F023: SET without timestamp returns invalid_args error code" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
         allocator,
-        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:20004\"\n\n[database]\npersistence = \"memory\"\n",
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n",
     );
     defer server.stop();
 
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20004) catch unreachable;
-    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    const stream = try server.connect_controller();
     defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = sock_write(stream.socket.handle, "r1 SET job.1\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "r1 SET job.1\n");
 
     var buf: [128]u8 = undefined;
-    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
+    const n = try std.posix.read(stream.socket.handle, &buf);
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "r1 ERROR invalid_args") != null);
 }
 
 test "F023: GET without identifier returns invalid_args error code" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
         allocator,
-        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:20005\"\n\n[database]\npersistence = \"memory\"\n",
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n",
     );
     defer server.stop();
 
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20005) catch unreachable;
-    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    const stream = try server.connect_controller();
     defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = sock_write(stream.socket.handle, "r1 GET\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "r1 GET\n");
 
     var buf: [128]u8 = undefined;
-    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
+    const n = try std.posix.read(stream.socket.handle, &buf);
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "r1 ERROR invalid_args") != null);
 }
 
 test "F023: RULE SET without required args returns invalid_args error code" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
         allocator,
-        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:20006\"\n\n[database]\npersistence = \"memory\"\n",
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n",
     );
     defer server.stop();
 
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20006) catch unreachable;
-    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    const stream = try server.connect_controller();
     defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = sock_write(stream.socket.handle, "r1 RULE SET rule.1\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "r1 RULE SET rule.1\n");
 
     var buf: [128]u8 = undefined;
-    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
+    const n = try std.posix.read(stream.socket.handle, &buf);
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "ERROR invalid_args") != null);
 }
 
 test "F023: non-AUTH command before authentication returns auth_required" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -5191,7 +5194,7 @@ test "F023: non-AUTH command before authentication returns auth_required" {
 
     const config_content = try std.fmt.allocPrint(
         allocator,
-        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:20007\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
         .{auth.valid},
     );
     defer allocator.free(config_content);
@@ -5199,23 +5202,21 @@ test "F023: non-AUTH command before authentication returns auth_required" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20007) catch unreachable;
-    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    const stream = try server.connect_controller();
     defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = sock_write(stream.socket.handle, "r1 SET job.1 12345\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "r1 SET job.1 12345\n");
 
     var buf: [64]u8 = undefined;
-    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
+    const n = try std.posix.read(stream.socket.handle, &buf);
 
     try std.testing.expectEqualStrings("ERROR auth_required\n", buf[0..n]);
 }
 
 test "F023: AUTH with invalid token returns auth_failed" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -5223,7 +5224,7 @@ test "F023: AUTH with invalid token returns auth_failed" {
 
     const config_content = try std.fmt.allocPrint(
         allocator,
-        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:20008\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
         .{auth.valid},
     );
     defer allocator.free(config_content);
@@ -5231,23 +5232,21 @@ test "F023: AUTH with invalid token returns auth_failed" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20008) catch unreachable;
-    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    const stream = try server.connect_controller();
     defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = sock_write(stream.socket.handle, "AUTH bad_token\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "AUTH bad_token\n");
 
     var buf: [64]u8 = undefined;
-    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
+    const n = try std.posix.read(stream.socket.handle, &buf);
 
     try std.testing.expectEqualStrings("ERROR auth_failed\n", buf[0..n]);
 }
 
 test "F023: command outside namespace scope returns auth_denied" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
@@ -5255,7 +5254,7 @@ test "F023: command outside namespace scope returns auth_denied" {
 
     const config_content = try std.fmt.allocPrint(
         allocator,
-        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:20009\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
         .{auth.valid},
     );
     defer allocator.free(config_content);
@@ -5263,60 +5262,57 @@ test "F023: command outside namespace scope returns auth_denied" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20009) catch unreachable;
-    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    const stream = try server.connect_controller();
     defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = sock_write(stream.socket.handle, "AUTH sk_deploy_a1b2c3d4e5f6\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "AUTH sk_deploy_a1b2c3d4e5f6\n");
 
     var auth_buf: [16]u8 = undefined;
-    const auth_n = std.posix.read(stream.socket.handle, &auth_buf) catch return error.SkipZigTest;
+    const auth_n = try std.posix.read(stream.socket.handle, &auth_buf);
     try std.testing.expectEqualStrings("OK\n", auth_buf[0..auth_n]);
 
-    _ = sock_write(stream.socket.handle, "r1 SET backup.job 12345\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "r1 SET backup.job 12345\n");
 
     var buf: [128]u8 = undefined;
-    const n = std.posix.read(stream.socket.handle, &buf) catch return error.SkipZigTest;
+    const n = try std.posix.read(stream.socket.handle, &buf);
 
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "ERROR auth_denied") != null);
 }
 
 test "F023: existing SET-GET-REMOVE flow still works" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     var server = try TestServer.start(
         allocator,
-        "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:20010\"\n\n[database]\npersistence = \"memory\"\n",
+        "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\n\n[database]\npersistence = \"memory\"\n",
     );
     defer server.stop();
 
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 20010) catch unreachable;
-    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    const stream = try server.connect_controller();
     defer sock_close(stream.socket.handle);
 
     const recv_timeout = std.posix.timeval{ .sec = 2, .usec = 0 };
     std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&recv_timeout)) catch {};
 
-    _ = sock_write(stream.socket.handle, "r1 SET compat.job 1595586600000000000\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "r1 SET compat.job 1595586600000000000\n");
 
     var set_buf: [64]u8 = undefined;
-    const set_n = std.posix.read(stream.socket.handle, &set_buf) catch return error.SkipZigTest;
+    const set_n = try std.posix.read(stream.socket.handle, &set_buf);
     try std.testing.expect(std.mem.indexOf(u8, set_buf[0..set_n], "OK") != null);
 
-    _ = sock_write(stream.socket.handle, "r2 GET compat.job\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "r2 GET compat.job\n");
 
     var get_buf: [64]u8 = undefined;
-    const get_n = std.posix.read(stream.socket.handle, &get_buf) catch return error.SkipZigTest;
+    const get_n = try std.posix.read(stream.socket.handle, &get_buf);
     try std.testing.expect(std.mem.indexOf(u8, get_buf[0..get_n], "OK") != null);
 
-    _ = sock_write(stream.socket.handle, "r3 REMOVE compat.job\n") catch return error.SkipZigTest;
+    try sock_write(stream.socket.handle, "r3 REMOVE compat.job\n");
 
     var rem_buf: [64]u8 = undefined;
-    const rem_n = std.posix.read(stream.socket.handle, &rem_buf) catch return error.SkipZigTest;
+    const rem_n = try std.posix.read(stream.socket.handle, &rem_buf);
     try std.testing.expect(std.mem.indexOf(u8, rem_buf[0..rem_n], "OK") != null);
 }
 

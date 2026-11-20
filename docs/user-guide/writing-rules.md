@@ -212,7 +212,7 @@ echo 'r1 RULE SET rule.notify notify. amqp amqp://guest:guest@localhost:5672/ jo
 **Characteristics**:
 - AMQP 0-9-1 protocol over plaintext TCP (default port 5672)
 - DSN format: `amqp://[user[:password]@]host[:port][/vhost]` — credentials are redacted from logs
-- Each execution opens a new TCP connection, performs the handshake, publishes one `basic.publish` frame, then closes cleanly
+- Each execution opens a new TCP connection, requests one channel, publishes the message, then closes the connection. The runner splits the body across frames when it exceeds the negotiated frame payload size.
 - Message body is the job identifier (u128 hex string); richer payloads are a future addition
 - Connect/send/receive timeout: 30 seconds — broker latency cannot starve the processor thread
 - Fire-and-forget: success means the publish frame was accepted by the broker at TCP level (no publisher confirms in v1)
