@@ -356,7 +356,7 @@ fn handle_connection(
                     };
                     if (!allowed) {
                         free_instruction_strings(allocator, instr);
-                        const msg = std.fmt.allocPrint(allocator, "{s} ERROR auth_denied insufficient namespace scope\n", .{result.command}) catch {
+                        const msg = allocator.print("{s} ERROR auth_denied insufficient namespace scope\n", .{result.command}) catch {
                             allocator.free(result.command);
                             return;
                         };
@@ -435,7 +435,7 @@ fn handle_connection(
                     break :blk null;
                 };
                 if (invalid_args_reason) |reason| {
-                    const msg = std.fmt.allocPrint(allocator, "{s} ERROR invalid_args {s}\n", .{ result.command, reason }) catch {
+                    const msg = allocator.print("{s} ERROR invalid_args {s}\n", .{ result.command, reason }) catch {
                         result.deinit(allocator);
                         return;
                     };
@@ -739,9 +739,9 @@ fn write_response(allocator: std.mem.Allocator, conn: Connection, resp: query.Re
     if (!resp.success) {
         const code = resp.error_code orelse .internal;
         const msg = if (resp.error_message) |m|
-            try std.fmt.allocPrint(allocator, "{s} ERROR {s} {s}\n", .{ resp.request.identifier, @tagName(code), m })
+            try allocator.print("{s} ERROR {s} {s}\n", .{ resp.request.identifier, @tagName(code), m })
         else
-            try std.fmt.allocPrint(allocator, "{s} ERROR {s}\n", .{ resp.request.identifier, @tagName(code) });
+            try allocator.print("{s} ERROR {s}\n", .{ resp.request.identifier, @tagName(code) });
         defer allocator.free(msg);
         _ = try conn.write(msg);
         return;
@@ -752,20 +752,20 @@ fn write_response(allocator: std.mem.Allocator, conn: Connection, resp: query.Re
                 var iter = std.mem.splitScalar(u8, body, '\n');
                 while (iter.next()) |line| {
                     if (line.len == 0) continue;
-                    const msg = try std.fmt.allocPrint(allocator, "{s} {s}\n", .{ resp.request.identifier, line });
+                    const msg = try allocator.print("{s} {s}\n", .{ resp.request.identifier, line });
                     defer allocator.free(msg);
                     _ = try conn.write(msg);
                 }
             }
-            const ok_line = try std.fmt.allocPrint(allocator, "{s} OK\n", .{resp.request.identifier});
+            const ok_line = try allocator.print("{s} OK\n", .{resp.request.identifier});
             defer allocator.free(ok_line);
             _ = try conn.write(ok_line);
         },
         else => {
             const msg = if (resp.body) |body|
-                try std.fmt.allocPrint(allocator, "{s} OK {s}\n", .{ resp.request.identifier, body })
+                try allocator.print("{s} OK {s}\n", .{ resp.request.identifier, body })
             else
-                try std.fmt.allocPrint(allocator, "{s} OK\n", .{resp.request.identifier});
+                try allocator.print("{s} OK\n", .{resp.request.identifier});
             defer allocator.free(msg);
             _ = try conn.write(msg);
         },
@@ -1543,13 +1543,13 @@ test "tcp server set_instruments makes instruments non-null" {
     var server = TcpServer.init(std.testing.allocator, "127.0.0.1:5678", &running, null, &active, null);
 
     const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator, std.testing.io);
-    defer meter_provider.shutdown();
+    defer meter_provider.deinit();
     const tracer_provider = try sdk.trace.TracerProvider.init(
         std.testing.allocator,
         std.testing.io,
         sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init((std.Random.IoSource{ .io = std.testing.io }).interface()) },
     );
-    defer tracer_provider.shutdown();
+    defer tracer_provider.deinit();
     const instruments = try telemetry.createInstruments(meter_provider, tracer_provider);
 
     server.set_instruments(instruments);
@@ -1567,13 +1567,13 @@ test "connection_worker decrements active_connections on exit" {
     defer router.deinit();
 
     const meter_provider = try sdk.metrics.MeterProvider.init(std.testing.allocator, std.testing.io);
-    defer meter_provider.shutdown();
+    defer meter_provider.deinit();
     const tracer_provider = try sdk.trace.TracerProvider.init(
         std.testing.allocator,
         std.testing.io,
         sdk.trace.IDGenerator{ .Random = sdk.trace.RandomIDGenerator.init((std.Random.IoSource{ .io = std.testing.io }).interface()) },
     );
-    defer tracer_provider.shutdown();
+    defer tracer_provider.deinit();
     const instruments = try telemetry.createInstruments(meter_provider, tracer_provider);
 
     var active = std.atomic.Value(usize).init(1);

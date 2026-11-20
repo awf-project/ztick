@@ -306,7 +306,7 @@ test "execute returns success=false on connection refused without raising" {
         s.deinit(io);
         break :blk p;
     };
-    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://127.0.0.1:{d}/0", .{refused_port});
+    const url = try std.testing.allocator.print("redis://127.0.0.1:{d}/0", .{refused_port});
     defer std.testing.allocator.free(url);
     const request = execution.Request{
         .identifier = 0xBEEF5678,
@@ -393,7 +393,7 @@ test "execute with RPUSH command pushes job identifier to redis list" {
 
     const t = try std.Thread.spawn(.{}, redis_peer_stub, .{ io, &server, ":1\r\n" });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://127.0.0.1:{d}/0", .{port});
+    const url = try std.testing.allocator.print("redis://127.0.0.1:{d}/0", .{port});
     defer std.testing.allocator.free(url);
     const request = execution.Request{
         .identifier = 0xBBBB_1111,
@@ -419,7 +419,7 @@ test "execute with LPUSH command prepends job identifier to redis list" {
 
     const t = try std.Thread.spawn(.{}, redis_peer_stub, .{ io, &server, ":1\r\n" });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://127.0.0.1:{d}/0", .{port});
+    const url = try std.testing.allocator.print("redis://127.0.0.1:{d}/0", .{port});
     defer std.testing.allocator.free(url);
     const request = execution.Request{
         .identifier = 0xCCCC_2222,
@@ -445,7 +445,7 @@ test "execute returns success=false when server replies with RESP error on queue
 
     const t = try std.Thread.spawn(.{}, redis_peer_stub, .{ io, &server, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n" });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://127.0.0.1:{d}/0", .{port});
+    const url = try std.testing.allocator.print("redis://127.0.0.1:{d}/0", .{port});
     defer std.testing.allocator.free(url);
     const request = execution.Request{
         .identifier = 0xDDDD_3333,
@@ -471,7 +471,7 @@ test "execute with two-arg AUTH sends credentials and command successfully" {
 
     const t = try std.Thread.spawn(.{}, redis_multi_stub_2, .{ io, &server, "+OK\r\n", ":1\r\n" });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://alice:s3cr3t@127.0.0.1:{d}/0", .{port});
+    const url = try std.testing.allocator.print("redis://alice:s3cr3t@127.0.0.1:{d}/0", .{port});
     defer std.testing.allocator.free(url);
     const request = execution.Request{
         .identifier = 0xAA11_0001,
@@ -497,7 +497,7 @@ test "execute with single-arg AUTH sends password only and command successfully"
 
     const t = try std.Thread.spawn(.{}, redis_multi_stub_2, .{ io, &server, "+OK\r\n", ":1\r\n" });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://:s3cr3t@127.0.0.1:{d}/0", .{port});
+    const url = try std.testing.allocator.print("redis://:s3cr3t@127.0.0.1:{d}/0", .{port});
     defer std.testing.allocator.free(url);
     const request = execution.Request{
         .identifier = 0xAA11_0002,
@@ -523,7 +523,7 @@ test "execute returns success=false when AUTH is rejected by server" {
 
     const t = try std.Thread.spawn(.{}, redis_peer_stub, .{ io, &server, "-WRONGPASS invalid username-password pair or user is disabled.\r\n" });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://alice:wrongpass@127.0.0.1:{d}/0", .{port});
+    const url = try std.testing.allocator.print("redis://alice:wrongpass@127.0.0.1:{d}/0", .{port});
     defer std.testing.allocator.free(url);
     const request = execution.Request{
         .identifier = 0xAA11_0003,
@@ -549,7 +549,7 @@ test "execute sends SELECT when db is non-zero and command succeeds" {
 
     const t = try std.Thread.spawn(.{}, redis_multi_stub_2, .{ io, &server, "+OK\r\n", ":1\r\n" });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://127.0.0.1:{d}/3", .{port});
+    const url = try std.testing.allocator.print("redis://127.0.0.1:{d}/3", .{port});
     defer std.testing.allocator.free(url);
     const request = execution.Request{
         .identifier = 0xAA11_0004,
@@ -575,7 +575,7 @@ test "execute returns success=false when SELECT is rejected by server" {
 
     const t = try std.Thread.spawn(.{}, redis_peer_stub, .{ io, &server, "-ERR DB index is out of range\r\n" });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://127.0.0.1:{d}/16", .{port});
+    const url = try std.testing.allocator.print("redis://127.0.0.1:{d}/16", .{port});
     defer std.testing.allocator.free(url);
     const request = execution.Request{
         .identifier = 0xAA11_0005,
@@ -601,7 +601,7 @@ test "execute with credentials and non-zero db sends AUTH then SELECT then comma
 
     const t = try std.Thread.spawn(.{}, redis_multi_stub_3, .{ io, &server, "+OK\r\n", "+OK\r\n", ":1\r\n" });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://alice:s3cr3t@127.0.0.1:{d}/3", .{port});
+    const url = try std.testing.allocator.print("redis://alice:s3cr3t@127.0.0.1:{d}/3", .{port});
     defer std.testing.allocator.free(url);
     const request = execution.Request{
         .identifier = 0xAA11_0006,

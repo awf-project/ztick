@@ -697,9 +697,9 @@ const TlsPaths = struct {
         const cwd_len = try std.Io.Dir.cwd().realPathFile(std.testing.io, ".", &cwd_buf);
         const cwd = try allocator.dupe(u8, cwd_buf[0..cwd_len]);
         errdefer allocator.free(cwd);
-        const cert = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/tls/cert.pem", .{cwd});
+        const cert = try allocator.print("{s}/test/fixtures/tls/cert.pem", .{cwd});
         errdefer allocator.free(cert);
-        const key = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/tls/key.pem", .{cwd});
+        const key = try allocator.print("{s}/test/fixtures/tls/key.pem", .{cwd});
         return .{ .cwd = cwd, .cert = cert, .key = key };
     }
 
@@ -1103,8 +1103,7 @@ test "TLS-enabled server accepts encrypted connections and processes SET command
     const tls = try TlsPaths.resolve(allocator);
     defer tls.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19884\"\ntls_cert = \"{s}\"\ntls_key = \"{s}\"\n\n[database]\nlogfile_path = \"test_tls_encrypted.db\"\n",
         .{ tls.cert, tls.key },
     );
@@ -1186,8 +1185,7 @@ test "failed TLS handshake closes offending connection without crashing server" 
     const tls = try TlsPaths.resolve(allocator);
     defer tls.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:19883\"\ntls_cert = \"{s}\"\ntls_key = \"{s}\"\n\n[database]\nlogfile_path = \"test_tls_bad_handshake.db\"\n",
         .{ tls.cert, tls.key },
     );
@@ -1240,8 +1238,7 @@ test "server recovers after client disconnects during TLS handshake" {
     const tls = try TlsPaths.resolve(allocator);
     defer tls.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:19885\"\ntls_cert = \"{s}\"\ntls_key = \"{s}\"\n\n[database]\nlogfile_path = \"test_tls_mid_handshake.db\"\n",
         .{ tls.cert, tls.key },
     );
@@ -2213,7 +2210,7 @@ test "telemetry enabled exports metrics to collector endpoint" {
 
     const port = mock_server.socket.address.getPort();
 
-    const endpoint_buf = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
+    const endpoint_buf = try std.testing.allocator.print("http://127.0.0.1:{d}", .{port});
     defer std.testing.allocator.free(endpoint_buf);
 
     const cfg = interfaces_config.TelemetryConfig{
@@ -2299,7 +2296,7 @@ test "scheduler SET and tick exports metrics through OTLP to mock collector" {
 
     const port = mock_server.socket.address.getPort();
 
-    const endpoint_buf = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
+    const endpoint_buf = try std.testing.allocator.print("http://127.0.0.1:{d}", .{port});
     defer std.testing.allocator.free(endpoint_buf);
 
     const cfg = interfaces_config.TelemetryConfig{
@@ -2390,7 +2387,7 @@ test "trace spans exported to collector on job execution" {
 
     const port = mock_server.socket.address.getPort();
 
-    const endpoint_buf = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}", .{port});
+    const endpoint_buf = try std.testing.allocator.print("http://127.0.0.1:{d}", .{port});
     defer std.testing.allocator.free(endpoint_buf);
 
     const cfg = interfaces_config.TelemetryConfig{
@@ -2414,7 +2411,7 @@ test "trace spans exported to collector on job execution" {
 
     const TraceCapture = struct {
         paths: [4][64]u8 = undefined,
-        path_lens: [4]usize = [_]usize{0} ** 4,
+        path_lens: [4]usize = @splat(0),
         count: usize = 0,
 
         fn acceptN(self: *@This(), server: *std.Io.net.Server, n: usize) void {
@@ -2451,7 +2448,7 @@ test "trace spans exported to collector on job execution" {
     };
 
     // Mock server must be accepting BEFORE any spans are created, because
-    // SimpleProcessor exports synchronously on endSpan via OTLP HTTP.
+    // SimpleProcessor exports synchronously when the span ends via OTLP HTTP.
     var capture = TraceCapture{};
     const t = try std.Thread.spawn(.{}, TraceCapture.acceptN, .{ &capture, &mock_server, 1 });
     nanosleep(1_000_000);
@@ -2788,7 +2785,7 @@ test "stat command over TCP rejects unauthenticated client when auth is enabled"
     const tokens_path = try tmp_dir.dir.realPathFileAlloc(io, "tokens.toml", allocator);
     defer allocator.free(tokens_path);
 
-    const config = try std.fmt.allocPrint(allocator, "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19888\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n", .{tokens_path});
+    const config = try allocator.print("[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19888\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n", .{tokens_path});
     defer allocator.free(config);
 
     var server = try TestServer.start(allocator, config);
@@ -2872,9 +2869,9 @@ const AuthPaths = struct {
         const cwd_dir = std.Io.Dir.cwd();
         const cwd = try cwd_dir.realPathFileAlloc(io, ".", allocator);
         defer allocator.free(cwd);
-        const valid = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/auth/valid.toml", .{cwd});
+        const valid = try allocator.print("{s}/test/fixtures/auth/valid.toml", .{cwd});
         errdefer allocator.free(valid);
-        const wildcard = try std.fmt.allocPrint(allocator, "{s}/test/fixtures/auth/wildcard.toml", .{cwd});
+        const wildcard = try allocator.print("{s}/test/fixtures/auth/wildcard.toml", .{cwd});
         return .{ .valid = valid, .wildcard = wildcard };
     }
 
@@ -2891,8 +2888,7 @@ test "F011: valid AUTH followed by SET command succeeds" {
     const auth = try AuthPaths.resolve(allocator);
     defer auth.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19881\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_valid_set.db\"\n",
         .{auth.valid},
     );
@@ -2939,8 +2935,7 @@ test "F011: invalid AUTH closes connection" {
     const auth = try AuthPaths.resolve(allocator);
     defer auth.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19882\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_invalid.db\"\n",
         .{auth.valid},
     );
@@ -2984,8 +2979,7 @@ test "F011: namespace deny rejects SET outside namespace, allow within namespace
     const auth = try AuthPaths.resolve(allocator);
     defer auth.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19909\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_ns_deny.db\"\n",
         .{auth.valid},
     );
@@ -3067,8 +3061,7 @@ test "F011: wildcard namespace allows commands targeting any identifier" {
     const auth = try AuthPaths.resolve(allocator);
     defer auth.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19885\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_wildcard.db\"\n",
         .{auth.wildcard},
     );
@@ -3115,8 +3108,7 @@ test "F011: QUERY filters results to client namespace" {
     const auth = try AuthPaths.resolve(allocator);
     defer auth.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19886\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_query_filter.db\"\n",
         .{auth.valid},
     );
@@ -3191,8 +3183,7 @@ test "F011: RULE SET namespace enforcement rejects pattern outside namespace, al
     const auth = try AuthPaths.resolve(allocator);
     defer auth.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19887\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_rule_set_ns.db\"\n",
         .{auth.valid},
     );
@@ -3235,15 +3226,13 @@ test "F011: RULE SET namespace enforcement rejects pattern outside namespace, al
 }
 
 test "F011: connection closed when no AUTH data received within timeout" {
-    const io = std.testing.io;
     const allocator = std.testing.allocator;
 
     const auth = try AuthPaths.resolve(allocator);
     defer auth.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
-        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:19888\"\nauth_file = \"{s}\"\n\n[database]\nlogfile_path = \"test_auth_timeout.db\"\n",
+    const config_content = try allocator.print(
+        "[log]\nlevel = \"debug\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
         .{auth.valid},
     );
     defer allocator.free(config_content);
@@ -3251,8 +3240,7 @@ test "F011: connection closed when no AUTH data received within timeout" {
     var server = try TestServer.start(allocator, config_content);
     defer server.stop();
 
-    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 19888) catch unreachable;
-    const stream = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    const stream = try server.connect_controller();
     defer sock_close(stream.socket.handle);
 
     // Connect but send no data; server must close the connection after auth timeout (FR-010: 5 seconds)
@@ -3261,13 +3249,11 @@ test "F011: connection closed when no AUTH data received within timeout" {
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
-    const ready = std.posix.poll(&pfd, 6000) catch return error.SkipZigTest;
+    const ready = try std.posix.poll(&pfd, 6000);
     try std.testing.expect(ready > 0);
     var buf: [1]u8 = undefined;
     const n = std.posix.read(stream.socket.handle, &buf) catch 0;
     try std.testing.expectEqual(@as(usize, 0), n);
-
-    server.tmp_dir.dir.deleteFile(std.testing.io, "test_auth_timeout.db") catch {};
 }
 
 // Feature: F013
@@ -4265,8 +4251,7 @@ test "stat command over TCP reports auth_enabled 1 when auth_file is configured"
     const auth = try AuthPaths.resolve(allocator);
     defer auth.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19924\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
         .{auth.wildcard},
     );
@@ -4325,8 +4310,7 @@ test "stat command succeeds for namespace-scoped authenticated client" {
     defer auth.deinit(allocator);
 
     // valid.toml has deploy token scoped to "deploy." namespace
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"off\"\n\n[controller]\nlisten = \"127.0.0.1:19925\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
         .{auth.valid},
     );
@@ -4480,7 +4464,7 @@ test "shell runner dispatches AMQP runner without raising when broker unreachabl
         s.deinit(io);
         break :blk p;
     };
-    const dsn = try std.fmt.allocPrint(std.testing.allocator, "amqp://guest:guest@127.0.0.1:{d}/", .{refused_port});
+    const dsn = try std.testing.allocator.print("amqp://guest:guest@127.0.0.1:{d}/", .{refused_port});
     defer std.testing.allocator.free(dsn);
 
     const shell_config = interfaces_config.ShellConfig{ .path = "/bin/sh", .args = &.{"-c"} };
@@ -4596,7 +4580,7 @@ test "runner dispatches Redis runner without raising when broker unreachable" {
         s.deinit(io);
         break :blk p;
     };
-    const url = try std.fmt.allocPrint(std.testing.allocator, "redis://127.0.0.1:{d}/0", .{refused_port});
+    const url = try std.testing.allocator.print("redis://127.0.0.1:{d}/0", .{refused_port});
     defer std.testing.allocator.free(url);
 
     const shell_config = interfaces_config.ShellConfig{ .path = "/bin/sh", .args = &.{"-c"} };
@@ -5192,8 +5176,7 @@ test "F023: non-AUTH command before authentication returns auth_required" {
     const auth = try AuthPaths.resolve(allocator);
     defer auth.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
         .{auth.valid},
     );
@@ -5222,8 +5205,7 @@ test "F023: AUTH with invalid token returns auth_failed" {
     const auth = try AuthPaths.resolve(allocator);
     defer auth.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
         .{auth.valid},
     );
@@ -5252,8 +5234,7 @@ test "F023: command outside namespace scope returns auth_denied" {
     const auth = try AuthPaths.resolve(allocator);
     defer auth.deinit(allocator);
 
-    const config_content = try std.fmt.allocPrint(
-        allocator,
+    const config_content = try allocator.print(
         "[log]\nlevel = \"info\"\n\n[controller]\nlisten = \"127.0.0.1:0\"\nauth_file = \"{s}\"\n\n[database]\npersistence = \"memory\"\n",
         .{auth.valid},
     );

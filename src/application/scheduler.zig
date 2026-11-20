@@ -166,10 +166,7 @@ pub fn SchedulerWith(comptime Backend: type) type {
                 span.?.setAttribute("ztick.command", .{ .string = command }) catch {};
             }
             defer if (span) |*s| {
-                // Set end_time_unix_nano before endSpan because the SDK exports the span
-                // in onSpanEnd (via SimpleProcessor) before its defer calls span.end().
-                s.end_time_unix_nano = @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds);
-                if (self.instruments) |instr| instr.tracer.endSpan(s);
+                s.end(null);
                 s.deinit();
             };
 
@@ -1416,13 +1413,13 @@ const TestOtelContext = struct {
     fn init(allocator: std.mem.Allocator) !TestOtelContext {
         const otel = @import("opentelemetry");
         const meter_provider = try otel.metrics.MeterProvider.init(allocator, std.testing.io);
-        errdefer meter_provider.shutdown();
+        errdefer meter_provider.deinit();
         const tracer_provider = try otel.trace.TracerProvider.init(
             allocator,
             std.testing.io,
             otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init((std.Random.IoSource{ .io = std.testing.io }).interface()) },
         );
-        errdefer tracer_provider.shutdown();
+        errdefer tracer_provider.deinit();
 
         var scheduler = Scheduler.init(allocator);
         scheduler.set_instruments(try testing_telemetry.createInstruments(meter_provider, tracer_provider));
@@ -1436,8 +1433,8 @@ const TestOtelContext = struct {
 
     fn deinit(self: *TestOtelContext) void {
         self.scheduler.deinit();
-        self.tracer_provider.shutdown();
-        self.meter_provider.shutdown();
+        self.tracer_provider.deinit();
+        self.meter_provider.deinit();
     }
 };
 

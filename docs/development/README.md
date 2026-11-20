@@ -43,7 +43,7 @@ Start with [Architecture](architecture.md):
 Follow these rules:
 1. Keep dependencies flowing inward
 2. Write tests alongside code
-3. Run `zig fmt .` before committing
+3. Run `make fmt` before committing
 4. Use descriptive commit messages
 
 ### 4. Test
@@ -51,7 +51,7 @@ Follow these rules:
 ```bash
 zig build test                    # All tests
 zig build test --test-filter domain  # Layer-specific
-zig fmt --check .                 # Format check
+make lint                 # Format check
 ```
 
 ### 5. Submit PR
@@ -95,7 +95,7 @@ build.zig.zon        # Version and dependencies
 1. Create a feature branch: `git checkout -b feature/my-feature`
 2. Edit code in `src/`
 3. Run tests: `zig build test`
-4. Format: `zig fmt .`
+4. Format: `make fmt`
 5. Commit: `git commit -m "feat: description"`
 6. Push and open PR
 
@@ -112,7 +112,7 @@ zig build test --test-filter domain
 zig build test-functional
 
 # Format check
-zig fmt --check .
+make lint
 ```
 
 ### Debugging
@@ -174,7 +174,7 @@ ztick is designed to be lean:
 Profile with:
 
 ```bash
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=safe
 valgrind --tool=callgrind ./zig-out/bin/ztick
 
 # View results

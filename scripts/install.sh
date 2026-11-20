@@ -18,7 +18,6 @@ map_platform() {
     os=$(detect_os)
     arch=$(detect_arch)
     case "${os}-${arch}" in
-        darwin-arm64)    echo "ztick-darwin-arm64" ;;
         linux-x86_64)    echo "ztick-linux-x86_64" ;;
         linux-aarch64)   echo "ztick-linux-arm64" ;;
         *)

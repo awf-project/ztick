@@ -56,7 +56,7 @@ make lint
 
 ### Prerequisites
 
-- Zig 0.16.0+
+- Zig 0.17.1+
 - OpenSSL development headers (for TLS support)
 - Make
 

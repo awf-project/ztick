@@ -6,12 +6,15 @@ Guide to compiling, testing, and packaging ztick from source.
 
 ## Prerequisites
 
-- **Zig 0.16.0** ([download](https://ziglang.org/download/))
+- **Zig 0.17.1** ([download](https://ziglang.org/download/))
 - **libssl-dev** (Debian/Ubuntu) or **openssl-devel** (Fedora/RHEL) — required for TLS support
 - **git** (optional, for cloning the repository)
 
-Zig package dependencies (fetched automatically by `zig build`):
-- **zig-o11y/opentelemetry-sdk** v0.2.0 — OpenTelemetry instrumentation ([ADR-0004](../ADR/0004-opentelemetry-sdk-dependency.md))
+The build fetches these Zig packages.
+
+- **open-telemetry/opentelemetry-zig** — OpenTelemetry instrumentation ([ADR-0004](../ADR/0004-opentelemetry-sdk-dependency.md))
+- **sam701/zig-cli** handles command-line parsing.
+- **ziglang/translate-c** generates the OpenSSL bindings.
 
 ## Build Variants
 
@@ -23,33 +26,33 @@ zig build
 
 Produces an unoptimized executable with debug symbols. Best for development.
 
-**Output**: `zig-cache/bin/ztick`
+**Output**: `zig-out/bin/ztick`
 
 **Use case**: Development, debugging, testing
 
 ### Release Build (Optimized)
 
 ```bash
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=safe
 ```
 
 Produces an optimized executable with safety checks. Recommended for production.
 
-**Output**: `zig-cache/bin/ztick`
+**Output**: `zig-out/bin/ztick`
 
 **Performance**: 2-3x faster than debug builds
 
 **Use case**: Production deployment
 
-### Release (Unsafe)
+### Release Build (Fast)
 
 ```bash
-zig build -Doptimize=ReleaseUnsafe
+zig build -Doptimize=fast
 ```
 
 Strips all safety checks for maximum speed. Use only if you're confident the code is correct.
 
-**Output**: `zig-cache/bin/ztick`
+**Output**: `zig-out/bin/ztick`
 
 **Use case**: Benchmarking, extreme performance requirements
 
@@ -102,7 +105,7 @@ To verify coverage, review test blocks in each source file (co-located tests).
 Verify code follows Zig style guide:
 
 ```bash
-zig fmt --check .
+make lint
 ```
 
 ### Auto-Format
@@ -110,7 +113,7 @@ zig fmt --check .
 Fix formatting issues:
 
 ```bash
-zig fmt .
+make fmt
 ```
 
 ## Build Configuration
@@ -126,7 +129,7 @@ cat build.zig  # View build configuration
 You can pass additional flags:
 
 ```bash
-zig build -Doptimize=ReleaseSafe -Dstrip=true
+zig build -Doptimize=safe -p ./release
 ```
 
 ## Cross-Compilation
@@ -162,7 +165,7 @@ This installs the `ztick` binary to `/usr/local/bin/`.
 **Alternative**: Copy the binary manually
 
 ```bash
-cp zig-cache/bin/ztick /usr/local/bin/ztick
+cp zig-out/bin/ztick /usr/local/bin/ztick
 chmod +x /usr/local/bin/ztick
 ```
 
@@ -175,7 +178,7 @@ Zig is not installed or not in PATH. Install from [ziglang.org](https://ziglang.
 Verify installation:
 
 ```bash
-zig version  # Should print 0.16.0
+zig version  # Should print 0.17.1
 ```
 
 ### "error: MemoryOutOfBounds"
@@ -202,7 +205,7 @@ Ensure the binary was built successfully:
 
 ```bash
 zig build
-ls -la zig-cache/bin/ztick
+ls -la zig-out/bin/ztick
 ```
 
 ## Development Workflow
@@ -228,7 +231,7 @@ zig build test --test-filter domain
 Keep code style consistent:
 
 ```bash
-zig fmt .
+make fmt
 ```
 
 ### 4. Build Project
@@ -244,7 +247,7 @@ zig build
 Start the scheduler:
 
 ```bash
-./zig-cache/bin/ztick --config config.toml
+./zig-out/bin/ztick --config config.toml
 ```
 
 Test with protocol commands:
@@ -262,7 +265,7 @@ ztick's database thread is optimized for high throughput at scale. The following
 **Single-Worker Latency** (baseline):
 ```bash
 # Build release version
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=safe
 
 # Run with optimized framerate
 echo '[database]
@@ -270,7 +273,7 @@ framerate = 1024
 [database.persistence]
 mode = "memory"' > bench.toml
 
-./zig-cache/bin/ztick --config bench.toml &
+./zig-out/bin/ztick --config bench.toml &
 
 # In another terminal, run benchmark
 ./scripts/bench/bench-write.sh WORKERS_TCP=1 DURATION=30
@@ -297,13 +300,13 @@ To measure scheduler evaluation without network I/O:
 
 ```bash
 # Build release version
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=safe
 
 # Run with framerate set high
 echo '[database]
 framerate = 100' > bench.toml
 
-./zig-cache/bin/ztick --config bench.toml
+./zig-out/bin/ztick --config bench.toml
 ```
 
 Monitor CPU usage and latency with system tools:
@@ -317,13 +320,13 @@ watch -n 1 'ps aux | grep ztick'
 Check memory consumption:
 
 ```bash
-valgrind --leak-check=full ./zig-cache/bin/ztick --config config.toml
+valgrind --leak-check=full ./zig-out/bin/ztick --config config.toml
 ```
 
 Or on macOS:
 
 ```bash
-leaks -atExit -- ./zig-cache/bin/ztick --config config.toml
+leaks -atExit -- ./zig-out/bin/ztick --config config.toml
 ```
 
 ## Release Checklist
@@ -331,7 +334,7 @@ leaks -atExit -- ./zig-cache/bin/ztick --config config.toml
 Before releasing a new version:
 
 - [ ] All tests pass: `zig build test`
-- [ ] Code is formatted: `zig fmt --check .`
+- [ ] Code is formatted: `make lint`
 - [ ] No compiler warnings
 - [ ] Documentation is up-to-date
 - [ ] Version number bumped in `build.zig.zon`

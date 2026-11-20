@@ -71,7 +71,7 @@ fn execute_inner(io: std.Io, allocator: std.mem.Allocator, method_str: []const u
 
     const status = response.head.status;
     if (status.class() != .success) {
-        std.log.debug("http runner: {s} {s} returned {d}", .{ method_str, url, @intFromEnum(status) });
+        std.log.debug("http runner: {s} {s} returned {d}", .{ method_str, url, @backingInt(status) });
     }
 
     return .{ .identifier = req.identifier, .success = status.class() == .success };
@@ -133,7 +133,7 @@ test "http runner reports success for GET request with 2xx response" {
     const srv = SimpleServer{ .response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" };
     const t = try std.Thread.spawn(.{}, SimpleServer.run, .{ srv, &server });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/webhook", .{port});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/webhook", .{port});
     defer std.testing.allocator.free(url);
 
     const request = execution.Request{
@@ -160,7 +160,7 @@ test "http runner sends json body for POST request and reports success on 2xx re
     var capture = CapturePost{};
     const t = try std.Thread.spawn(.{}, CapturePost.run, .{ &capture, &server });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/notify", .{port});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/notify", .{port});
     defer std.testing.allocator.free(url);
 
     const request = execution.Request{
@@ -190,7 +190,7 @@ test "http runner reports failure for non-2xx response" {
     const srv = SimpleServer{ .response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n" };
     const t = try std.Thread.spawn(.{}, SimpleServer.run, .{ srv, &server });
 
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/hook", .{port});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/hook", .{port});
     defer std.testing.allocator.free(url);
 
     const request = execution.Request{
@@ -215,7 +215,7 @@ test "http runner reports failure when connection refused" {
         s.deinit(io);
         break :blk p;
     };
-    const url = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/webhook", .{refused_port});
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/webhook", .{refused_port});
     defer std.testing.allocator.free(url);
 
     const request = execution.Request{

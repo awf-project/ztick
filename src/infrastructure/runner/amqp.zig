@@ -626,7 +626,8 @@ test "Basic.Publish splits the body at the negotiated frame boundary" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     const capacity = min_frame_max - frame_overhead;
-    const body = "x" ** capacity ++ "y";
+    const prefix: [capacity]u8 = @splat('x');
+    const body = prefix ++ "y";
     try encode_basic_publish(std.testing.allocator, &aw.writer, 1, "", "", body, min_frame_max);
 
     var reader = std.Io.Reader.fixed(aw.writer.buffered());
@@ -673,15 +674,15 @@ test "encode_connection_close produces Connection.Close frame with normal closur
 test "encode_connection_open returns error.VhostTooLong for vhost > 255 bytes" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
-    const long_vhost = "a" ** 256;
-    try std.testing.expectError(error.VhostTooLong, encode_connection_open(&aw.writer, long_vhost));
+    const long_vhost: [256]u8 = @splat('a');
+    try std.testing.expectError(error.VhostTooLong, encode_connection_open(&aw.writer, &long_vhost));
 }
 
 test "encode_basic_publish returns error.ExchangeNameTooLong for exchange > 255 bytes" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
-    const long_exchange = "x" ** 256;
-    try std.testing.expectError(error.ExchangeNameTooLong, encode_basic_publish(std.testing.allocator, &aw.writer, 1, long_exchange, "key", "body", client_frame_max));
+    const long_exchange: [256]u8 = @splat('x');
+    try std.testing.expectError(error.ExchangeNameTooLong, encode_basic_publish(std.testing.allocator, &aw.writer, 1, &long_exchange, "key", "body", client_frame_max));
 }
 
 test "execute returns success=false for malformed DSN without raising" {
@@ -704,7 +705,7 @@ test "execute returns success=false on connection refused without raising" {
         s.deinit(io);
         break :blk p;
     };
-    const dsn = try std.fmt.allocPrint(std.testing.allocator, "amqp://guest:guest@127.0.0.1:{d}/", .{refused_port});
+    const dsn = try std.testing.allocator.print("amqp://guest:guest@127.0.0.1:{d}/", .{refused_port});
     defer std.testing.allocator.free(dsn);
     const request = execution.Request{
         .identifier = 0xBEEF5678,
@@ -773,7 +774,7 @@ test "execute returns success=false when peer closes connection mid-handshake" {
 
     const t = try std.Thread.spawn(.{}, PeerCloseStub.run, .{ io, &server });
 
-    const dsn = try std.fmt.allocPrint(std.testing.allocator, "amqp://baduser:badpass@127.0.0.1:{d}/", .{port});
+    const dsn = try std.testing.allocator.print("amqp://baduser:badpass@127.0.0.1:{d}/", .{port});
     defer std.testing.allocator.free(dsn);
 
     const request = execution.Request{

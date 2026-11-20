@@ -474,7 +474,7 @@ pub const HttpServer = struct {
         defer self.allocator.free(body);
         const phrase = status.phrase() orelse "";
         srv.out.print("{s} {d} {s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{
-            @tagName(http.Version.@"HTTP/1.1"), @intFromEnum(status), phrase, body.len,
+            @tagName(http.Version.@"HTTP/1.1"), @backingInt(status), phrase, body.len,
         }) catch return;
         srv.out.writeAll(body) catch return;
         srv.out.flush() catch return;

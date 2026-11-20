@@ -2,15 +2,19 @@
     .name = .ztick,
     .fingerprint = 0x42ab48a3aed72398,
     .version = "0.3.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .opentelemetry = .{
-            .url = "git+https://github.com/zig-o11y/opentelemetry-sdk?ref=v0.2.0#7387349254e4ebe2907bb3446f24a879e92b730a",
-            .hash = "opentelemetry-0.0.1-U_uKJ-oFEAAMJbeKlPjhM9xrYYJq762dezumOev3DlFo",
+            .url = "git+https://github.com/open-telemetry/opentelemetry-zig#682d2ecb9ffa0432d0851affc10f802ee9287c08",
+            .hash = "opentelemetry-0.0.1-U_uKJ5yaKwC1tcuszq7-Bu8-eOZkKXj3EZuaoR1mq8G_",
         },
         .cli = .{
-            .url = "git+https://github.com/sam701/zig-cli?ref=main#036341c48b32ef355274d66461551772fc1f202d",
-            .hash = "cli-0.11.0-2eKe_6sIAQB1njsE9sfrNvd2HxmQej13ebo-D3kBuFX3",
+            .url = "git+https://github.com/sam701/zig-cli#40736aff15cb86b8a1f2e9c9a0c848de8d907ea2",
+            .hash = "cli-0.12.0-2eKe__kOAQC6VETttxaViKBGYMCGU3qGilpD78MenETi",
+        },
+        .translate_c = .{
+            .url = "git+https://codeberg.org/ziglang/translate-c?ref=zig-0.17.x#cfac21f3199b2b02ce3fd7db652aa456421fe4ab",
+            .hash = "translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx",
         },
     },
     .paths = .{

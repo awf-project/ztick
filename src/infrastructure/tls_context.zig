@@ -1,9 +1,6 @@
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("openssl/ssl.h");
-    @cInclude("openssl/err.h");
-});
+const c = @import("openssl");
 
 pub const TlsError = error{
     ContextInitFailed,

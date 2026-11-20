@@ -52,7 +52,7 @@ fn log_fn_write(
     args: anytype,
 ) void {
     const threshold = runtime_log_level orelse return;
-    if (@intFromEnum(level) > @intFromEnum(threshold)) return;
+    if (@backingInt(level) > @backingInt(threshold)) return;
     const level_name = comptime switch (level) {
         .err => "ERROR",
         .warn => "WARN",
@@ -624,13 +624,13 @@ test "DatabaseContext instruments field holds Instruments when telemetry is enab
 
     const otel = @import("opentelemetry");
     const meter_provider = try otel.metrics.MeterProvider.init(allocator, std.testing.io);
-    defer meter_provider.shutdown();
+    defer meter_provider.deinit();
     const tracer_provider = try otel.trace.TracerProvider.init(
         allocator,
         std.testing.io,
         otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init((std.Random.IoSource{ .io = std.testing.io }).interface()) },
     );
-    defer tracer_provider.shutdown();
+    defer tracer_provider.deinit();
 
     const instruments = try infrastructure_telemetry.createInstruments(meter_provider, tracer_provider);
 
@@ -673,13 +673,13 @@ test "tick with instrumented scheduler processes SET query and routes success re
 
     const otel = @import("opentelemetry");
     const meter_provider = try otel.metrics.MeterProvider.init(allocator, std.testing.io);
-    defer meter_provider.shutdown();
+    defer meter_provider.deinit();
     const tracer_provider = try otel.trace.TracerProvider.init(
         allocator,
         std.testing.io,
         otel.trace.IDGenerator{ .Random = otel.trace.RandomIDGenerator.init((std.Random.IoSource{ .io = std.testing.io }).interface()) },
     );
-    defer tracer_provider.shutdown();
+    defer tracer_provider.deinit();
 
     var req_ch = try Channel(query.Request).init(allocator, std.testing.io, 4);
     defer req_ch.deinit();

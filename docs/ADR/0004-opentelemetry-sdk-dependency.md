@@ -65,9 +65,13 @@ This is the first Zig package dependency in `build.zig.zon`, superseding the zer
 | Hexagonal Architecture | Compliant | SDK usage isolated in infrastructure layer; application layer uses thin interfaces; domain layer untouched |
 | Build Simplicity | Compliant | Single `zig fetch --save` command; dependency declared in `build.zig.zon`; standard Zig package mechanism |
 
+## Zig 0.17.1 update
+
+ztick now uses the official OpenTelemetry Zig repository. The package manifest pins the upstream commit and its content hash. The trace provider supplies the service name and version to the SDK’s OTLP exporter, which replaces ztick’s custom span encoder. [Upstream SDK revision](https://github.com/open-telemetry/opentelemetry-zig/tree/682d2ecb9ffa0432d0851affc10f802ee9287c08)
+
 ## References
 
-- **SDK**: https://github.com/zig-o11y/opentelemetry-sdk
+- [Official OpenTelemetry Zig SDK](https://github.com/open-telemetry/opentelemetry-zig)
 - **OTel community proposal**: https://github.com/open-telemetry/community/issues/2514
 - **Spec**: `.specify/implementation/F010/spec-content.md`
 - **ADR 0002**: `docs/ADR/0002-zig-language-choice.md` (zero-dependency decision this ADR relaxes)
