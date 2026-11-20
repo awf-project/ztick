@@ -378,7 +378,7 @@ pub fn load(allocator: std.mem.Allocator, path: ?[]const u8, io: std.Io) !Config
     var reader = file.reader(io, &rbuf);
     var content_list: std.ArrayList(u8) = .empty;
     defer content_list.deinit(allocator);
-    try reader.interface.appendRemaining(allocator, &content_list, @enumFromInt(1024 * 1024));
+    try reader.interface.appendRemaining(allocator, &content_list, .limited(1024 * 1024));
     const content = content_list.items;
     const cfg = try parse(allocator, content);
     errdefer cfg.deinit(allocator);

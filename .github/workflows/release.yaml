@@ -1,7 +1,7 @@
 name: Release
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "0.17.1"
 
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       - name: Check Zig formatting
-        run: zig fmt --check .
+        run: make lint
 
   test:
     runs-on: ubuntu-latest
@@ -97,7 +97,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
       - name: Build release binary
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=safe
 
       - name: Stage artifact
         env:

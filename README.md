@@ -19,7 +19,7 @@ Periodic schedulers (cron, systemd timers) trigger work at fixed intervals regar
 
 ### Prerequisites
 
-- [Zig](https://ziglang.org/download/) >= 0.16.0
+- [Zig](https://ziglang.org/download/) >= 0.17.1
 - `libssl-dev` (Debian/Ubuntu) or `openssl-devel` (Fedora/RHEL) for TLS support
 
 ### Install
@@ -36,8 +36,8 @@ Supported platforms: Linux (x86_64, arm64), macOS (universal).
 
 ```bash
 make build         # build the server binary (Debug)
-make release       # ReleaseSafe optimized build
-make install       # install ReleaseSafe binary to $INSTALL_DIR (default ~/.local/bin)
+make release       # optimized build with runtime safety checks
+make install       # install release binary to $INSTALL_DIR (default ~/.local/bin)
 make test          # unit tests with integration brokers
 make test-all      # unit + functional tests
 make lint          # check formatting

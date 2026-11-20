@@ -50,15 +50,15 @@ Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "feedback:ru
 
 ## Build System
 
-- **Zig 0.16.0 exact minimum** (build.zig.zon); no compatibility shims for older versions
-- Minimal dependencies — zig-o11y/opentelemetry-sdk v0.2.0 for telemetry (ADR-0004), system OpenSSL via C bindings for TLS (ADR-0003), sam701/zig-cli (zig-0.16 branch) for argument parsing, stdlib for everything else
+- **Zig 0.17.1 exact minimum** (build.zig.zon); no compatibility shims for older versions
+- Minimal dependencies — open-telemetry/opentelemetry-zig for telemetry (ADR-0004), system OpenSSL via C bindings for TLS (ADR-0003), sam701/zig-cli (zig-0.17 branch) for argument parsing, stdlib for everything else
 - `make build`, `make test`, `make lint` wrap zig build with `--summary all`
 - Layer-specific test targets: `zig build test-domain`, `test-application`, `test-infrastructure`, `test-interfaces`, `test-functional`, `test-all`
 - **Sanitizer test targets** (build.zig:161-206): `.sanitize_c = .full` (heap overflow detection) and `.sanitize_thread = true` (ThreadSanitizer for data races) on dedicated test binaries; run before any concurrency change
 - Version single source of truth: `build.zig.zon` → `build_options` module → `version.zig` re-export → injected into OpenAPI spec at compile time
-- TLS linking is conditional via build_root file probe; wraps `linkLibC()` + `linkSystemLibrary("ssl"/"crypto")` only when src/infrastructure/tls_context.zig exists
+- When the TLS module is present, translate-c generates bindings from the system OpenSSL headers and links libssl and libcrypto.
 
-## Zig 0.16 Idioms
+## Zig 0.17 Idioms
 
 - **`std.Io` namespace for I/O**: Use `std.Io.Reader`, `std.Io.Writer`, `std.Io.File`, `std.Io.Dir` instead of the deprecated `std.io` and `std.fs` modules. Pass `io: std.Io` through context structs; cache `std.Io.Clock.Timestamp` on persistent state to avoid per-call clock construction (clock.zig:37-39 pattern)
 - **Juicy Main pattern**: Replace `pub fn main() !void` with `pub fn main(init: std.process.Init) !void`; source the allocator, args, and I/O context from `init` rather than manual allocation. Route `init.minimal.args` through application code (cli.zig:97-99 pattern)
@@ -69,9 +69,8 @@ Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "feedback:ru
 - **`std.AutoHashMapUnmanaged(K, V)`** for integer/struct keys, **`std.StringHashMapUnmanaged(V)`** for `[]const u8` keys; both prefer Unmanaged variants
 - **Generic via comptime type parameter**: `pub fn Channel(comptime T: type) type` returns an anonymous struct; `pub fn SchedulerWith(comptime Backend: type) type` for storage polymorphism
 - **Comptime callbacks**: pass functions as `comptime callback: fn (@TypeOf(context)) ?i64` (clock.zig:11-17); the compiler monomorphizes per call site, eliminating indirect call overhead
-- **Reflection via @typeInfo()**: walk `.@"union".fields` / `.@"struct".fields` to extract types by name (telemetry.zig:22-52); use this to wire protobuf payloads without boilerplate. Unions/structs are namespaced via `@"union"` literal because they're keywords
 - **Named result blocks**: `const x = if (cond) blk: { …; break :blk value; } else other;` — preferred over chained ternaries for multi-step computation
-- **`@intCast(value)`** for narrowing/widening with safety checks in Debug/ReleaseSafe; **`@as(T, value)`** for explicit type coercion when no checked conversion is needed; **`@enumFromInt`/`@intFromEnum`** for enum boundaries
+- **`@intCast(value)`** for narrowing/widening with safety checks in debug/safe; **`@as(T, value)`** for explicit type coercion when no checked conversion is needed; **`@fromBackingInt`/`@backingInt`** for enum boundaries
 - **`@embedFile()` + comptime processing**: bundle assets at build time and transform them with `@setEvalBranchQuota` for non-trivial compile-time loops (http.zig:34-48)
 - **Optional unpack with capture**: `if (self.persistence) |*p| p.deinit();` — `|*p|` borrows by pointer, `|p|` copies by value; choose based on lifetime needs
 - **Error sets named with `Error` suffix**: `ConfigError`, `SendError`, `ParseError`, `DecodeError`. Combine via `error{...} || OtherError` rather than catch-all `anyerror`
@@ -95,9 +94,9 @@ Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "feedback:ru
 
 ## Observability
 
-- OpenTelemetry via zig-o11y/opentelemetry-sdk v0.2.0; instruments live in application/instruments.zig and are optional (telemetry disabled = `?Instruments` is null)
+- OpenTelemetry via open-telemetry/opentelemetry-zig; instruments live in application/instruments.zig and are optional (telemetry disabled = `?Instruments` is null)
 - Hot paths annotate spans with `setAttribute` only inside `if (instruments)` guards; never compute attributes when instruments is null
-- Custom OTLP exporter (telemetry.zig:57-224) injects resource attributes into ResourceSpans because the SDK doesn't propagate them; uses comptime reflection to avoid boilerplate field accessors
+- Configure the trace provider resource before creating tracers. The SDK exports service.name and service.version with the spans.
 - Counters/gauges: `jobs_scheduled`, `jobs_removed`, `rules_active`, `execution_duration_ms` (histogram)
 
 ## Common Pitfalls

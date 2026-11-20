@@ -21,10 +21,10 @@ test "job stores identifier execution and status" {
 }
 
 test "JobStatus enum values" {
-    try std.testing.expectEqual(@as(u2, 0), @intFromEnum(JobStatus.planned));
-    try std.testing.expectEqual(@as(u2, 1), @intFromEnum(JobStatus.triggered));
-    try std.testing.expectEqual(@as(u2, 2), @intFromEnum(JobStatus.executed));
-    try std.testing.expectEqual(@as(u2, 3), @intFromEnum(JobStatus.failed));
+    try std.testing.expectEqual(@as(u2, 0), @backingInt(JobStatus.planned));
+    try std.testing.expectEqual(@as(u2, 1), @backingInt(JobStatus.triggered));
+    try std.testing.expectEqual(@as(u2, 2), @backingInt(JobStatus.executed));
+    try std.testing.expectEqual(@as(u2, 3), @backingInt(JobStatus.failed));
 }
 
 test "status byte mapping" {
@@ -32,10 +32,10 @@ test "status byte mapping" {
     const expected_bytes = [_]u8{ 0, 1, 2, 3 };
 
     for (statuses, expected_bytes) |status, expected| {
-        const byte: u8 = @intFromEnum(status);
+        const byte: u8 = @backingInt(status);
         try std.testing.expectEqual(expected, byte);
 
-        const roundtrip: JobStatus = @enumFromInt(byte);
+        const roundtrip: JobStatus = @fromBackingInt(@as(u2, @intCast(byte)));
         try std.testing.expectEqual(status, roundtrip);
     }
 }

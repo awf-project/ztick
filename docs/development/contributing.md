@@ -46,7 +46,7 @@ zig build test
 Enforce code style:
 
 ```bash
-zig fmt .
+make fmt
 ```
 
 ### 6. Commit
@@ -197,7 +197,7 @@ Then open a pull request on GitHub with a clear description of your changes.
 ## Before Submitting a PR
 
 - [ ] All tests pass: `zig build test`
-- [ ] Code is formatted: `zig fmt . && git diff --check`
+- [ ] Code is formatted: `make fmt && git diff --check`
 - [ ] Commit messages follow convention
 - [ ] Documentation updated (if user-facing change)
 - [ ] Feature branch is up-to-date with `main`

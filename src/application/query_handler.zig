@@ -50,10 +50,10 @@ pub const QueryHandler = struct {
             },
             .get => |args| {
                 const job = self.job_storage.get(args.identifier) orelse {
-                    const msg = try std.fmt.allocPrint(self.allocator, "job \"{s}\" does not exist", .{args.identifier});
+                    const msg = try self.allocator.print("job \"{s}\" does not exist", .{args.identifier});
                     return Response{ .request = request, .success = false, .error_code = .not_found, .error_message = msg };
                 };
-                const body = try std.fmt.allocPrint(self.allocator, "{s} {d}", .{ @tagName(job.status), job.execution });
+                const body = try self.allocator.print("{s} {d}", .{ @tagName(job.status), job.execution });
                 return Response{ .request = request, .success = true, .body = body };
             },
             .query => |args| {
@@ -76,14 +76,14 @@ pub const QueryHandler = struct {
             },
             .remove => |args| blk: {
                 if (!self.job_storage.delete(args.identifier)) {
-                    const msg = try std.fmt.allocPrint(self.allocator, "job \"{s}\" does not exist", .{args.identifier});
+                    const msg = try self.allocator.print("job \"{s}\" does not exist", .{args.identifier});
                     return Response{ .request = request, .success = false, .error_code = .not_found, .error_message = msg };
                 }
                 break :blk true;
             },
             .remove_rule => |args| blk: {
                 if (!self.rule_storage.delete(args.identifier)) {
-                    const msg = try std.fmt.allocPrint(self.allocator, "rule \"{s}\" does not exist", .{args.identifier});
+                    const msg = try self.allocator.print("rule \"{s}\" does not exist", .{args.identifier});
                     return Response{ .request = request, .success = false, .error_code = .not_found, .error_message = msg };
                 }
                 break :blk true;

@@ -1,20 +1,22 @@
 const std = @import("std");
 
-fn link_openssl(step: *std.Build.Step.Compile) void {
-    step.root_module.link_libc = true;
-    step.root_module.linkSystemLibrary("ssl", .{});
-    step.root_module.linkSystemLibrary("crypto", .{});
-}
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Link OpenSSL only when tls_context.zig is present; plaintext-only builds remain zero-dependency.
-    const tls_enabled = blk: {
-        b.build_root.handle.access(b.graph.io, "src/infrastructure/tls_context.zig", .{}) catch break :blk false;
-        break :blk true;
-    };
+    // Track the optional TLS source so adding or removing it invalidates the build configuration.
+    const tls_path = "src/infrastructure/tls_context.zig";
+    b.dependOnFileMetadata(b.path(tls_path));
+    const openssl = if (b.root.access(b.graph.io, tls_path, .{})) |_| blk: {
+        const translator = @import("translate_c").Translator.init(b.dependency("translate_c", .{}), .{
+            .name = "openssl",
+            .c_source_file = b.path("src/infrastructure/openssl.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_system_libs = &.{ .{ .name = "ssl" }, .{ .name = "crypto" } },
+        });
+        break :blk translator.mod;
+    } else |_| null;
 
     const amqp_int = b.option(bool, "amqp-integration", "Run AMQP integration tests against a real broker") orelse false;
     const redis_int = b.option(bool, "redis-integration", "Run Redis integration tests against a real broker") orelse false;
@@ -30,15 +32,13 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", zon.version);
     const build_options_module = build_options.createModule();
 
-    // OpenTelemetry SDK dependency (ADR-0004)
-    // Decision: pass .{} — Zig 0.16 propagates optimize/target automatically;
-    // passing them explicitly fails when the dependency's build.zig doesn't declare those options.
-    const otel_dep = b.dependency("opentelemetry", .{});
+    // The SDK exposes a release switch and selects safe mode for optimized builds (ADR-0004).
+    const otel_dep = b.dependency("opentelemetry", .{ .target = target, .release = optimize != .debug });
     const otel_module = otel_dep.module("sdk");
 
     // zig-cli dependency (sam701/zig-cli) for argument parsing, --version,
     // --help, and subcommand dispatch.
-    const cli_dep = b.dependency("cli", .{});
+    const cli_dep = b.dependency("cli", .{ .target = target, .optimize = optimize });
     const cli_module = cli_dep.module("cli");
 
     // Helper to register the standard module imports on a freshly-created module.
@@ -73,14 +73,12 @@ pub fn build(b: *std.Build) void {
     // Workaround: glibc 2.43+r22 ships .sframe with R_X86_64_PC64 relocations
     // that Zig's self-hosted linker cannot handle (ziglang/zig#31272)
     exe.use_llvm = true;
-    if (tls_enabled) link_openssl(exe);
+    if (openssl) |mod| exe.root_module.addImport("openssl", mod);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run ztick");
     run_step.dependOn(&run_cmd.step);
 
@@ -103,7 +101,9 @@ pub fn build(b: *std.Build) void {
         deps.install(layer_module);
         const layer_test = b.addTest(.{ .root_module = layer_module });
         layer_test.use_llvm = true;
-        if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(layer_test);
+        if (std.mem.eql(u8, layer.name, "test-infrastructure")) {
+            if (openssl) |mod| layer_test.root_module.addImport("openssl", mod);
+        }
         const run_layer_test = b.addRunArtifact(layer_test);
         test_step.dependOn(&run_layer_test.step);
         const step = b.step(layer.name, layer.desc);
@@ -118,7 +118,7 @@ pub fn build(b: *std.Build) void {
     deps.install(main_test_module);
     const main_tests = b.addTest(.{ .root_module = main_test_module });
     main_tests.use_llvm = true;
-    if (tls_enabled) link_openssl(main_tests);
+    if (openssl) |mod| main_tests.root_module.addImport("openssl", mod);
     const run_main_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_main_tests.step);
 
@@ -133,7 +133,7 @@ pub fn build(b: *std.Build) void {
         .root_module = functional_module,
     });
     functional_test.use_llvm = true;
-    if (tls_enabled) link_openssl(functional_test);
+    if (openssl) |mod| functional_test.root_module.addImport("openssl", mod);
     const run_functional = b.addRunArtifact(functional_test);
     run_functional.step.dependOn(b.getInstallStep());
     const functional_step = b.step("test-functional", "Run functional tests");
@@ -145,11 +145,12 @@ pub fn build(b: *std.Build) void {
     test_all_step.dependOn(&run_functional.step);
 
     // Format check
-    const fmt = b.addFmt(.{ .paths = &.{"src"} });
+    const fmt_paths = b.pathList(&.{ "build.zig", "build.zig.zon", "src" });
+    const fmt = b.addFmt(.{ .paths = fmt_paths });
     const fmt_step = b.step("fmt", "Format source files");
     fmt_step.dependOn(&fmt.step);
 
-    const fmt_check = b.addFmt(.{ .paths = &.{"src"}, .check = true });
+    const fmt_check = b.addFmt(.{ .paths = fmt_paths, .check = true });
     const fmt_check_step = b.step("fmt-check", "Check source formatting");
     fmt_check_step.dependOn(&fmt_check.step);
 
@@ -159,7 +160,7 @@ pub fn build(b: *std.Build) void {
         const san_module = b.createModule(.{
             .root_source_file = b.path(layer.path),
             .target = target,
-            .optimize = .Debug,
+            .optimize = .debug,
             .sanitize_c = .full,
             .sanitize_thread = true,
         });
@@ -167,7 +168,9 @@ pub fn build(b: *std.Build) void {
         san_module.addEmbedPath(b.path("."));
         const san_test = b.addTest(.{ .root_module = san_module });
         san_test.use_llvm = true;
-        if (tls_enabled and std.mem.eql(u8, layer.name, "test-infrastructure")) link_openssl(san_test);
+        if (std.mem.eql(u8, layer.name, "test-infrastructure")) {
+            if (openssl) |mod| san_test.root_module.addImport("openssl", mod);
+        }
         const run_san_test = b.addRunArtifact(san_test);
         sanitize_step.dependOn(&run_san_test.step);
     }
@@ -175,27 +178,27 @@ pub fn build(b: *std.Build) void {
     const san_main_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = .debug,
         .sanitize_c = .full,
         .sanitize_thread = true,
     });
     deps.install(san_main_module);
     const san_main_tests = b.addTest(.{ .root_module = san_main_module });
     san_main_tests.use_llvm = true;
-    if (tls_enabled) link_openssl(san_main_tests);
+    if (openssl) |mod| san_main_tests.root_module.addImport("openssl", mod);
     sanitize_step.dependOn(&b.addRunArtifact(san_main_tests).step);
     // functional sanitizer tests
     const san_func_module = b.createModule(.{
         .root_source_file = b.path("src/functional_tests.zig"),
         .target = target,
-        .optimize = .Debug,
+        .optimize = .debug,
         .sanitize_c = .full,
         .sanitize_thread = true,
     });
     deps.install(san_func_module);
     const san_func_test = b.addTest(.{ .root_module = san_func_module });
     san_func_test.use_llvm = true;
-    if (tls_enabled) link_openssl(san_func_test);
+    if (openssl) |mod| san_func_test.root_module.addImport("openssl", mod);
     const run_san_func = b.addRunArtifact(san_func_test);
     run_san_func.step.dependOn(b.getInstallStep());
     sanitize_step.dependOn(&run_san_func.step);
