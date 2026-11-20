@@ -12,18 +12,6 @@
       "path": ".zpm/kb/feedback",
       "scope": "project",
       "mode": "rw"
-    },
-    {
-      "name": "migration_zig016",
-      "path": ".zpm/kb/migration_zig016",
-      "scope": "project",
-      "mode": "rw"
-    },
-    {
-      "name": "pr_feature_f024_zig_0152_0160_migration",
-      "path": ".zpm/kb/pr_feature_f024_zig_0152_0160_migration",
-      "scope": "project",
-      "mode": "rw"
     }
   ]
 }

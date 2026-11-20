@@ -92,8 +92,12 @@ next-env.d.ts
 # Tower local indexes and daemon state; keep config.toml and extension definitions versionable.
 /.tower/db/
 /.tower/ast/
+/.tower/agent_memory/
+/.tower/semantic_context/
 /.tower/traces/
 /.tower/daemon.log
 /.tower/daemon.lock
 /.tower/daemon.sock
 /.tower/daemon.pid
+/.tower/daemon.owner
+/.tower/daemon.owner.lock

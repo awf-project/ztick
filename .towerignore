@@ -1,4 +1,5 @@
-# Tower indexing is independent of Git. Keep source, documentation and fixtures visible.
+# tower index ignore — authoritative, independent of .gitignore.
+# Same syntax as .gitignore. Negate with ! to re-include a path.
 
 # Zig build output
 zig-out/
@@ -9,6 +10,8 @@ zig-pkg/
 *.a
 
 # Generated site and package output
+target/
+vendor/
 node_modules/
 npm-cache/
 dist/
@@ -35,6 +38,7 @@ test_timing
 *.swo
 
 # Local environment and private keys
+secrets/
 .env
 .env.*
 *.env

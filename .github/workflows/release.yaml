@@ -84,8 +84,6 @@ jobs:
             runner: ubuntu-latest
           - target: linux-arm64
             runner: ubuntu-24.04-arm
-          - target: darwin-arm64
-            runner: macos-latest
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
@@ -97,14 +95,6 @@ jobs:
       - name: Install OpenSSL (Linux)
         if: startsWith(matrix.target, 'linux-')
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
-
-      - name: Install OpenSSL (macOS)
-        if: startsWith(matrix.target, 'darwin-')
-        run: |
-          brew install openssl@3
-          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
-          echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib" >> "$GITHUB_ENV"
-          echo "C_INCLUDE_PATH=$(brew --prefix openssl@3)/include" >> "$GITHUB_ENV"
 
       - name: Build release binary
         run: zig build -Doptimize=ReleaseSafe

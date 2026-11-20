@@ -1157,7 +1157,6 @@ pub fn main(init: std.process.Init) !void {
     runtime_log_level = log_level_to_std(cfg.log_level);
     std.log.info("config: {s}", .{config_path orelse "default"});
     std.log.info("log level: {s}", .{@tagName(cfg.log_level)});
-    std.log.info("listening on {s}", .{cfg.controller_listen});
 
     const telemetry_providers = try infrastructure_telemetry.setup(allocator, cfg.telemetry, init.environ_map, init.io);
     defer if (telemetry_providers) |p| p.shutdown();

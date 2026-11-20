@@ -157,6 +157,7 @@ pub const TcpServer = struct {
         // Publish the fd to the signal handler's atomic so it can close the
         // socket to unblock accept() on SIGINT/SIGTERM.
         if (self.signal_listen_fd) |sig_fd| sig_fd.store(raw_fd, .release);
+        std.log.info("listening on {f}", .{server.socket.address});
 
         var next_client_id: u128 = 0;
 

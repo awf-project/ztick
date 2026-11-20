@@ -1,18 +1,18 @@
 ## Architecture Rules
 
-Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "rule(Id, architecture, Desc, Prio, Src)" --memory feedback`
+Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "feedback:rule(Id, architecture, Desc, Prio, Src)" --memory feedback`
 
 ## Performance Principles
 
-Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "rule(Id, architecture, Desc, Prio, Src)" --memory feedback` (performance rules use `architecture` category with high priority for hot paths)
+Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "feedback:rule(Id, architecture, Desc, Prio, Src)" --memory feedback` (performance rules use `architecture` category with high priority for hot paths)
 
 ## Memory & Allocators
 
-Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "rule(Id, architecture, Desc, Prio, Src)" --memory feedback` (memory rules use `architecture` category)
+Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "feedback:rule(Id, architecture, Desc, Prio, Src)" --memory feedback` (memory rules use `architecture` category)
 
 ## Concurrency
 
-Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "rule(Id, architecture, Desc, Prio, Src)" --memory feedback` (concurrency rules use `architecture` category)
+Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "feedback:rule(Id, architecture, Desc, Prio, Src)" --memory feedback` (concurrency rules use `architecture` category)
 
 ## Protocol (TCP)
 
@@ -102,15 +102,15 @@ Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "rule(Id, ar
 
 ## Common Pitfalls
 
-Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "rule(Id, pitfall, Desc, Prio, Src)" --memory feedback`
+Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "feedback:rule(Id, pitfall, Desc, Prio, Src)" --memory feedback`
 
 ## Test Conventions
 
-Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "rule(Id, test, Desc, Prio, Src)" --memory feedback`
+Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "feedback:rule(Id, test, Desc, Prio, Src)" --memory feedback`
 
 ## Review Standards
 
-Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "rule(Id, review, Desc, Prio, Src)" --memory feedback`
+Stored in ZPM feedback segment. Query with: `zpm query-logic --goal "feedback:rule(Id, review, Desc, Prio, Src)" --memory feedback`
 
 ## ZPM Project Memory
 
@@ -124,33 +124,38 @@ This project uses ZPM memory segments as its knowledge base. **Query ZPM before 
 | `feedback` | Learned rules from past implementations/reviews — queryable by file pattern | auto |
 | `pr_<branch>` | PR tracking: TODOs, stubs, mocks, blocking issues, completion gate | per-implementation |
 
+ZPM 0.4.4 loads the default schema from `.zpm/kb/knowledge.pl`. Local decisions and observations are replayed from `.zpm/data/journal.wal`. The versioned feedback journal uses the Prolog module `feedback`. For both reads and writes, select the segment with `--memory feedback` and qualify its predicates with `feedback:`. MCP uses the same goal and the `memory` argument.
+
 ### PR tracking — during implementation
 
 ```bash
-# Query unresolved issues (derived predicates)
-zpm query-logic --goal "unresolved_todo(Id, File, Line, Desc)" --memory pr_<branch>
-zpm query-logic --goal "unresolved_stub(Id, File, Symbol)" --memory pr_<branch>
-zpm query-logic --goal "unresolved_mock(Id, File, Symbol)" --memory pr_<branch>
-zpm query-logic --goal "unresolved_not_impl(Id, File, Desc)" --memory pr_<branch>
+# Select the mounted segment for this PR (see zpm list-memories).
+pr_memory=pr_feature_example
 
-# Mark issues resolved
-zpm remember-fact --fact "resolved(todo, Id)" --memory pr_<branch>
-zpm remember-fact --fact "resolved(stub, Id)" --memory pr_<branch>
+# Query unresolved issues (derived predicates)
+zpm query-logic --goal "unresolved_todo(Id, File, Line, Desc)" --memory "$pr_memory"
+zpm query-logic --goal "unresolved_stub(Id, File, Symbol)" --memory "$pr_memory"
+zpm query-logic --goal "unresolved_mock(Id, File, Symbol)" --memory "$pr_memory"
+zpm query-logic --goal "unresolved_not_impl(Id, File, Desc)" --memory "$pr_memory"
+
+# Mark an issue resolved using the concrete ID returned by the query
+zpm remember-fact --fact "resolved(todo, todo_001)" --memory "$pr_memory"
+zpm remember-fact --fact "resolved(stub, stub_001)" --memory "$pr_memory"
 
 # Check PR readiness
-zpm query-logic --goal "pr_ready" --memory pr_<branch>
-zpm query-logic --goal "blocking_issue(Id, Type, File, Desc)" --memory pr_<branch>
+zpm query-logic --goal "pr_ready" --memory "$pr_memory"
+zpm query-logic --goal "blocking_issue(Id, Type, File, Desc)" --memory "$pr_memory"
 ```
 
 ### Read before acting
 
 ```bash
 # What decisions exist about this area?
-zpm query-logic --goal "decision(Id, What, Why)" --memory default
+zpm query-logic --goal "decision(Id, What, Why, TradeOff)" --memory default
 # What feedback rules apply to files I'm touching?
-zpm query-logic --goal "rule(Id, Cat, Desc, Prio, Src)" --memory feedback
+zpm query-logic --goal "feedback:rule(Id, Cat, Desc, Prio, Src)" --memory feedback
 # What rules apply specifically to a file/directory?
-zpm query-logic --goal "applicable(RuleId, 'src/path/file.ext')" --memory feedback
+zpm query-logic --goal "feedback:effective_rules(['src/application/scheduler.zig'], RuleIds)" --memory feedback
 # What ADRs are active?
 zpm query-logic --goal "current_decision(Id, Decision)" --memory default
 # Any architecture violations?
@@ -160,16 +165,16 @@ zpm query-logic --goal "integrity_violation(Kind, File)" --memory default
 ### Write as you work
 
 ```bash
-# Observation: discovered something non-obvious
-zpm remember-fact --fact "observation(id, Category, 'Description', 'YYYY-MM-DD')" --memory default
+# Replace the example values with the observation to record
+zpm remember-fact --fact "observation(observation_id, quirk, 'Description', 'YYYY-MM-DD')" --memory default
 # Categories: pattern | convention | quirk | dependency | performance
 
 # Decision: made an architectural choice
 zpm remember-fact --fact "decision(id, 'What', 'Why', 'Trade-off')" --memory default
 
 # Feedback rule: a mistake teaches a reusable lesson
-zpm remember-fact --fact "rule(rule_id, Category, 'Imperative rule', Priority, Source)" --memory feedback
-zpm remember-fact --fact "trigger(rule_id, 'pattern', Scope)" --memory feedback
+zpm remember-fact --fact "feedback:rule(rule_id, review, 'Imperative rule', high, pr_review)" --memory feedback
+zpm remember-fact --fact "feedback:trigger(rule_id, 'src/application/', directory)" --memory feedback
 # Categories: architecture | pitfall | test | review | style
 # Priority: high | medium | low — Scope: file | directory | project
 ```
@@ -182,16 +187,16 @@ zpm remember-fact --fact "trigger(rule_id, 'pattern', Scope)" --memory feedback
 
 ### Architecture Rules
 
-Query: `zpm query-logic --goal "rule(Id, architecture, Desc, Prio, Src)" --memory feedback`
+Query: `zpm query-logic --goal "feedback:rule(Id, architecture, Desc, Prio, Src)" --memory feedback`
 
 ### Test Conventions
 
-Query: `zpm query-logic --goal "rule(Id, test, Desc, Prio, Src)" --memory feedback`
+Query: `zpm query-logic --goal "feedback:rule(Id, test, Desc, Prio, Src)" --memory feedback`
 
 ### Common Pitfalls
 
-Query: `zpm query-logic --goal "rule(Id, pitfall, Desc, Prio, Src)" --memory feedback`
+Query: `zpm query-logic --goal "feedback:rule(Id, pitfall, Desc, Prio, Src)" --memory feedback`
 
 ### Review Standards
 
-Query: `zpm query-logic --goal "rule(Id, review, Desc, Prio, Src)" --memory feedback`
+Query: `zpm query-logic --goal "feedback:rule(Id, review, Desc, Prio, Src)" --memory feedback`
