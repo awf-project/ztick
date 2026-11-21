@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-21
+
 ### Changed
 
 - Building ztick now requires Zig 0.17.1. The build generates OpenSSL bindings with translate-c and uses the official OpenTelemetry Zig SDK for OTLP exports.
