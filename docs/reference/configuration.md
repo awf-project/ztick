@@ -59,7 +59,7 @@ TCP server configuration.
 - By convention, use port `5678` for plaintext and port `5679` for TLS to avoid confusion between encrypted and unencrypted endpoints
 - **Important**: When using authentication, TLS is **strongly recommended** to prevent tokens from being transmitted in plaintext
 - Requires `libssl-dev` (Debian/Ubuntu) or equivalent on the build machine
-- See [README TLS section](../../README.md#tls) for certificate generation instructions
+- See [README TLS section](https://github.com/awf-project/ztick/blob/main/README.md#tls) for certificate generation instructions
 
 ### `[http]`
 
@@ -76,7 +76,7 @@ HTTP REST API server configuration. This section is optional; omit it to disable
 
 **HTTP Server Notes:**
 - The HTTP API is optional and disabled by default. To enable it, add an `[http]` section with a `listen` address.
-- The HTTP server handles multiple concurrent requests by spawning a dedicated thread per connection (thread-per-connection model, [F022](../../.specify/implementation/F022/))
+- The HTTP server handles multiple concurrent requests by spawning a dedicated thread per connection (thread-per-connection model, F022)
 - All HTTP endpoints require Bearer token authentication (same tokens as TCP protocol via `auth_file`)
 - Public endpoints `/health` and `/openapi.json` do not require authentication
 - The HTTP server shares the same scheduler and storage as the TCP server—both protocols interact with the same data

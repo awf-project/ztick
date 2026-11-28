@@ -6,7 +6,7 @@ The ztick HTTP API provides a RESTful interface for managing scheduled jobs and 
 
 ## OpenAPI Specification
 
-The complete API contract is defined in **[openapi.json](../../src/infrastructure/openapi.json)**, written in OpenAPI v3.1.1 format. The spec is colocated with the HTTP server that embeds it, and is also served live at `GET /openapi.json`. You can import it into:
+The complete API contract is defined in **[openapi.json](https://github.com/awf-project/ztick/blob/main/src/infrastructure/openapi.json)**, written in OpenAPI v3.1.1 format. The spec is colocated with the HTTP server that embeds it, and is also served live at `GET /openapi.json`. You can import it into:
 
 - **Swagger Editor** — https://editor.swagger.io/ (paste the raw JSON)
 - **Postman** — File → Import → paste `openapi.json`
@@ -24,7 +24,7 @@ listen = "127.0.0.1:5680"     # HTTP API port (separate from TCP)
 
 ## Concurrency Model
 
-The HTTP server spawns a dedicated thread per accepted connection, enabling parallel request processing without head-of-line blocking. This concurrency model ([F022](../../.specify/implementation/F022/)):
+The HTTP server spawns a dedicated thread per accepted connection, enabling parallel request processing without head-of-line blocking. This concurrency model (F022):
 
 - **Thread-per-connection**: Each HTTP request is handled in its own thread, allowing multiple clients to make requests simultaneously
 - **Atomic connection tracking**: An atomic counter tracks active connections, enabling safe shutdown without a global mutex
