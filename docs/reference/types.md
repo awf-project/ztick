@@ -4,7 +4,7 @@ title: "Data Types Reference"
 
 Complete specification of all core ztick data types.
 
-> **HTTP API Users**: These Zig types correspond directly to the HTTP API schemas defined in [openapi.json](../../src/infrastructure/openapi.json) and documented in the [HTTP API Reference](http-api.md). The HTTP API uses the field names shown in the "HTTP Schema" sections below.
+> **HTTP API Users**: These Zig types correspond directly to the HTTP API schemas defined in [openapi.json](https://github.com/awf-project/ztick/blob/main/src/infrastructure/openapi.json) and documented in the [HTTP API Reference](http-api.md). The HTTP API uses the field names shown in the "HTTP Schema" sections below.
 
 ## Core Types
 

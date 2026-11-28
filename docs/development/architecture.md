@@ -58,7 +58,7 @@ pub const Job = struct {
 
 **Key property**: Depends only on Domain. No I/O or side effects.
 
-**Performance note**: `JobStorage` uses `std.PriorityQueue` ordered by execution time for sub-linear insertion and sorted retrieval ([F021](../../.specify/implementation/F021/)). This ensures scheduling throughput scales to thousands of jobs without linear scan overhead.
+**Performance note**: `JobStorage` uses `std.PriorityQueue` ordered by execution time for sub-linear insertion and sorted retrieval (F021). This ensures scheduling throughput scales to thousands of jobs without linear scan overhead.
 
 **Example**: Scheduler tick loop
 ```zig
@@ -82,8 +82,8 @@ pub fn tick(self: *Scheduler, now: i64) !void {
 - `Encoder`/`Logfile` — Binary persistence (read/write jobs and rules)
 - `Parser` — Line protocol parsing
 - `Telemetry` — OpenTelemetry SDK initialization and OTLP export ([ADR-0004](../ADR/0004-opentelemetry-sdk-dependency.md))
-- `Channel` — Thread-safe bounded FIFO with `drain()` for single-lock batch consumption and optional wake notification ([F021](../../.specify/implementation/F021/))
-- `Clock` — Event-driven tick scheduling with condition-variable wakeup and framerate enforcement ([F021](../../.specify/implementation/F021/))
+- `Channel` — Thread-safe bounded FIFO with `drain()` for single-lock batch consumption and optional wake notification (F021)
+- `Clock` — Event-driven tick scheduling with condition-variable wakeup and framerate enforcement (F021)
 
 **Key property**: Depends on Domain and Application. Handles all I/O.
 
@@ -106,7 +106,7 @@ pub const TcpServer = struct {
 };
 ```
 
-**Concurrency Pattern** ([F022](../../.specify/implementation/F022/)): Both TcpServer and HttpServer use an identical detached-thread pattern for handling concurrent connections:
+**Concurrency Pattern** (F022): Both TcpServer and HttpServer use an identical detached-thread pattern for handling concurrent connections:
 
 1. **Accept loop** increments an atomic counter and spawns a detached thread per accepted connection
 2. **Worker thread** processes the request and decrements the counter on exit (via `defer`)
@@ -261,7 +261,7 @@ test "scheduler processes job from query to executed" {
 
 ## Performance Optimizations
 
-### Database Thread Throughput ([F021](../../.specify/implementation/F021/))
+### Database Thread Throughput (F021)
 
 The database thread processes incoming job requests and triggers scheduled jobs. Three optimizations ensure it remains the throughput leader at scale:
 
@@ -288,7 +288,7 @@ The database thread processes incoming job requests and triggers scheduled jobs.
 
 See [Building the Project](building.md#performance-profiling) for benchmark instructions.
 
-### HTTP Server Concurrency ([F022](../../.specify/implementation/F022/))
+### HTTP Server Concurrency (F022)
 
 The HTTP server spawns a dedicated thread per accepted connection, mirroring the TCP server's detached-thread pattern:
 

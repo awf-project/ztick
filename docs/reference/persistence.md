@@ -422,4 +422,4 @@ With 10,000 jobs and 100 rules, expect ~300 KB logfile without compression.
 
 - **[Data Types](types.md)** — Structure of Job and Rule types
 - **[Configuration](configuration.md)** — fsync_on_persist and framerate settings
-- **[Reference](README.md)** — Overview of all reference docs
+- **[Reference](./)** — Overview of all reference docs
