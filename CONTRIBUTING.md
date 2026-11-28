@@ -97,7 +97,7 @@ All pull requests must pass quality checks before merge.
 - CI pipeline shows all checks passing
 - No linter warnings or errors
 - New code includes tests
-- Documentation updated if behavior changes
+- Update the [ztick guides](https://docs.awf-project.ai/ztick/) in the shared documentation repository when behavior changes.
 
 ### Commit Messages
 
@@ -135,7 +135,6 @@ src/
 ├── application/     # State machines, storage, use cases
 ├── infrastructure/  # IO adapters (TCP, persistence, telemetry)
 └── interfaces/      # CLI, config parsing
-docs/                # ADRs, user guides, reference
 example/             # Example configuration files
 ```
 

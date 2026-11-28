@@ -36,20 +36,11 @@ dump.rdb
 test_debug_log.db
 test_timing
 
-npm-cache/
-
 .grepai/
 .specify/
 
 # Git worktrees
 .worktrees/
-
-# Hugo site
-site/node_modules/
-site/public/
-site/resources/
-site/.hugo_build.lock
-site/hugo_stats.json
 
 # Added by awf project-onboard
 node_modules/

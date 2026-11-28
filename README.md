@@ -13,7 +13,6 @@ Periodic schedulers (cron, systemd timers) trigger work at fixed intervals regar
 - Append-only logfile persistence with binary framing and background compression; in-memory mode for ephemeral runs
 - TOML configuration; OpenTelemetry traces and metrics over OTLP/HTTP
 - Offline `dump` subcommand to inspect logfiles (text/JSON, compact, follow)
-- Documentation site with Hugo/Thulite (Doks) and GitHub Pages auto-deployment
 
 ## Quick Start
 
@@ -70,19 +69,13 @@ docker compose down
 
 ## Documentation
 
-Browse the documentation online at **https://awf-project.github.io/ztick/** or in the [`docs/`](docs/) directory:
+The [ztick documentation](https://docs.awf-project.ai/ztick/) covers installation, operation, and development.
 
-- [Tutorials](docs/tutorials/) — Build, run, and verify your first instance
-- [User Guide](docs/user-guide/) — Jobs, rules, authentication, configuration, monitoring
-- [Reference](docs/reference/) — Configuration schema, HTTP API, native protocol, persistence format
-- [Development](docs/development/) — Architecture, build, contributing
-- [ADR](docs/ADR/) — Architecture Decision Records
-
-To preview the documentation site locally:
-
-```bash
-cd site && npm ci && npm run dev
-```
+- [Tutorials](https://docs.awf-project.ai/ztick/tutorials/) — Build, run, and verify your first instance
+- [User Guide](https://docs.awf-project.ai/ztick/user-guide/) — Jobs, rules, authentication, configuration, monitoring
+- [Reference](https://docs.awf-project.ai/ztick/reference/) — Configuration schema, HTTP API, native protocol, persistence format
+- [Development](https://docs.awf-project.ai/ztick/development/) — Architecture, building, and contributing
+- [Architecture Decision Records](https://docs.awf-project.ai/ztick/adr/)
 
 ## License
 

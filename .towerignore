@@ -9,20 +9,16 @@ zig-pkg/
 *.o
 *.a
 
-# Generated site and package output
+# Generated build and package output
 target/
 vendor/
 node_modules/
-npm-cache/
 dist/
 build/
 out/
 coverage/
 playwright-report/
 test-results/
-site/public/
-site/resources/
-site/hugo_stats.json
 *.tsbuildinfo
 
 # Runtime data and temporary files (do not exclude the test/ source directory)
